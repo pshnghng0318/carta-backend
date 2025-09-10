@@ -6,6 +6,7 @@
 
 #include "Casacore.h"
 
+#include <filesystem>
 #include <regex>
 
 #include <casacore/casa/OS/File.h>
@@ -73,6 +74,12 @@ CARTA::FileType FolderImageType(const std::string& folder_path, std::string& mes
     CARTA::FileType carta_type(CARTA::FileType::UNKNOWN);
     casacore::File input_file(folder_path);
     if (input_file.isRegular()) {
+        return carta_type;
+    }
+
+    // Check for Zarr format first
+    if (IsZarrFile(folder_path)) {
+        carta_type = CARTA::FileType::ZARR;
         return carta_type;
     }
 
@@ -269,4 +276,25 @@ void NormalizeUnit(casacore::String& unit) {
  */
 bool IsGildasUnit(const casacore::String& unit) {
     return std::regex_match(unit, GILDAS_REGEX);
+}
+
+namespace fs = std::filesystem;
+
+inline bool ends_with(const std::string& str, const std::string& suffix) {
+    return str.size() >= suffix.size() &&
+           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
+bool IsZarrFile(const std::string& path) {
+    if (fs::is_directory(path) && ends_with(path, ".zarr")) {
+        return true;
+    }
+
+    if (fs::exists(path)) {
+        if (ends_with(path, ".zarray") || ends_with(path, ".zmetadata")) {
+            return true;
+        }
+    }
+
+    return false;
 }

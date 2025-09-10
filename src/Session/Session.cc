@@ -555,6 +555,13 @@ bool Session::OnOpenFile(const CARTA::OpenFile& message, uint32_t request_id, bo
                     if (has_mipmaps) {
                         feature_flags |= CARTA::FileFeatureFlags::MIP_DATASET;
                     }
+                } else if (file_info.type() == CARTA::FileType::ZARR) {
+                    feature_flags |= CARTA::FileFeatureFlags::ROTATED_DATASET;
+                    feature_flags |= CARTA::FileFeatureFlags::CUBE_HISTOGRAMS;
+                    feature_flags |= CARTA::FileFeatureFlags::CHANNEL_HISTOGRAMS;
+                    if (has_mipmaps) {
+                        feature_flags |= CARTA::FileFeatureFlags::MIP_DATASET;
+                    }
                 }
 
                 ack.set_file_feature_flags(feature_flags);

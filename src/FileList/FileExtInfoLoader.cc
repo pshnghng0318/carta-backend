@@ -22,6 +22,7 @@
 
 #include "../ImageData/CartaFitsImage.h"
 #include "../ImageData/CartaHdf5Image.h"
+// #include "../ImageData/CartaZarrImage.h"
 #include "FileList/FitsHduList.h"
 #include "Logger/Logger.h"
 #include "Util/Casacore.h"
@@ -188,6 +189,18 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                     CartaHdf5Image* hdf5_image = dynamic_cast<CartaHdf5Image*>(image.get());
                     casacore::Vector<casacore::String> headers = hdf5_image->FitsHeaderStrings();
                     AddEntriesFromHeaderStrings(headers, hdu, extended_info);
+                // } else if (image_type == "CartaZarrImage") {
+                //     // CartaZarrImage doesn't have FITS headers like other formats
+                //     // Use the general FITS header conversion method
+                //     casacore::ImageFITSHeaderInfo fhi;
+                //     casacore::String error_string;
+                //     if (GetFITSHeader(image, hdu, fhi, error_string)) {
+                //         FitsHeaderInfoToHeaderEntries(fhi, extended_info);
+                //         use_image_for_entries = true;
+                //     } else {
+                //         message = error_string;
+                //         return false;
+                //     }
                 } else {
                     // Get image headers in FITS format using casacore ImageHeaderToFITS
                     casacore::ImageFITSHeaderInfo fhi;

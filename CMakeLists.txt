@@ -108,7 +108,6 @@ endif ()
 
 FIND_PACKAGE(HDF5 REQUIRED COMPONENTS CXX)
 FIND_PACKAGE(Protobuf REQUIRED)
-INCLUDE_DIRECTORIES(${PROTOBUF_INCLUDE_DIR})
 
 if (Protobuf_VERSION VERSION_GREATER_EQUAL "4.25.3")
     FIND_PACKAGE(absl REQUIRED)
@@ -187,6 +186,12 @@ add_subdirectory(third-party/nlohmann_json)
 set(nlohmann_json_VERSION "v3.11.3")
 add_subdirectory(third-party/json-schema-validator)
 
+include_directories("/Users/pshuang/carta_build/carta-backend/tensorstore")
+include_directories("/Users/pshuang/carta_build/carta-backend/tensorstore/tensorstore")
+include_directories("/Users/pshuang/carta_build/carta-backend/tensorstore/_deps/riegeli-src")
+link_directories("/Users/pshuang/carta_build/carta-backend/tensorstore")
+
+
 set(LINK_LIBS
         ${LINK_LIBS}
         carta-protobuf
@@ -244,6 +249,8 @@ set(SOURCE_FILES
         src/ImageData/Hdf5Loader.cc
         src/ImageData/PolarizationCalculator.cc
         src/ImageData/StokesFilesConnector.cc
+        #src/ImageData/CartaZarrImage.cc
+        #src/ImageData/ZarrLoader.cc
         src/ImageFitting/ImageFitter.cc
         src/ImageFitting/InitialValueCalculator.cc
         src/ImageGenerators/MomentGenerator.cc
@@ -291,12 +298,25 @@ add_executable(carta_backend ${SOURCE_FILES})
 
 add_dependencies(carta_backend carta-schemas)
 
+file(GLOB TENSORSTORE_LIBS "${CMAKE_SOURCE_DIR}/tensorstore/*.a")
+
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     list(REMOVE_ITEM LINK_LIBS uuid)
-    target_link_libraries(carta_backend uv ${LINK_LIBS})
+    target_link_libraries(carta_backend
+        PRIVATE
+            ${TENSORSTORE_LIBS}
+            protobuf
+            uv
+            ${LINK_LIBS}
+            nlohmann_json::nlohmann_json)
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-    target_link_libraries(carta_backend ${LINK_LIBS})
+    target_link_libraries(carta_backend
+        PRIVATE
+            ${TENSORSTORE_LIBS}
+            protobuf
+            ${LINK_LIBS}
+            nlohmann_json::nlohmann_json)
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 
 if (CartaUserFolderPrefix)

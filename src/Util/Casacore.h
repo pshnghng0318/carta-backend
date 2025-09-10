@@ -102,4 +102,13 @@ void NormalizeUnit(casacore::String& unit);
  */
 bool IsGildasUnit(const casacore::String& unit);
 
+/**
+ * @brief Check if the given path is a Zarr file or directory.
+ *
+ * @param[in] path The file or directory path to check.
+ *
+ * @return `true` if the path is a Zarr file/directory.
+ */
+bool IsZarrFile(const std::string& path);
+
 #endif // CARTA_SRC_UTIL_CASACORE_H_

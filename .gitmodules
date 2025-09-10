@@ -44,3 +44,6 @@
 	path = third-party/uSockets
 	url = https://github.com/uNetworking/uSockets.git
 	shallow = true
+[submodule "tensorstore"]
+	path = tensorstore
+	url = https://github.com/google/tensorstore.git
