@@ -249,8 +249,8 @@ set(SOURCE_FILES
         src/ImageData/Hdf5Loader.cc
         src/ImageData/PolarizationCalculator.cc
         src/ImageData/StokesFilesConnector.cc
-        #src/ImageData/CartaZarrImage.cc
-        #src/ImageData/ZarrLoader.cc
+        src/ImageData/CartaZarrImage.cc
+        src/ImageData/ZarrLoader.cc
         src/ImageFitting/ImageFitter.cc
         src/ImageFitting/InitialValueCalculator.cc
         src/ImageGenerators/MomentGenerator.cc

@@ -24,7 +24,7 @@
 #include "ImagePtrLoader.h"
 #include "MiriadLoader.h"
 #include "PolarizationCalculator.h"
-//#include "ZarrLoader.h"
+#include "ZarrLoader.h"
 
 using namespace carta;
 
@@ -36,10 +36,10 @@ FileLoader* FileLoader::GetLoader(const std::string& filename, const std::string
         return new FitsLoader(filename, true);
     } else if (IsRemoteHttpFile(filename)) {
         return new FitsLoader(filename, false, true);
-    } 
-    // else if (IsZarrFile(filename)) {
-    //     return new ZarrLoader(filename);
-    // }
+    } else if (IsZarrFile(filename)) {
+        // casacore::ImageOpener did not support zarr format
+        return new ZarrLoader(filename);
+    }
 
     switch (CasacoreImageType(filename)) {
         case casacore::ImageOpener::AIPSPP:
