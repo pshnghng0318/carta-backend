@@ -191,10 +191,22 @@ void FileListHandler::GetFileList(CARTA::FileListResponse& file_list_response, c
                         FileInfoLoader info_loader = FileInfoLoader(full_path, CARTA::FileType::UNKNOWN);
                         info_loader.FillFileInfo(file_info);
                     } else if (cc_file.isDirectory(true) && cc_file.isExecutable()) {
-                        auto directory_info = file_list_response.add_subdirectories();
-                        directory_info->set_name(name_only);
-                        directory_info->set_date(cc_file.modifyTime());
-                        // skip item count
+                        // Check if directory is a ZARR file
+                        std::string message;
+                        CARTA::FileType file_type = FolderImageType(full_path, message);
+                        if (file_type == CARTA::FileType::ZARR) {
+                            // Add as a ZARR file
+                            auto& file_info = *file_list_response.add_files();
+                            file_info.set_name(name_only);
+                            FileInfoLoader info_loader = FileInfoLoader(full_path, file_type);
+                            info_loader.FillFileInfo(file_info);
+                        } else {
+                            // Add as directory
+                            auto directory_info = file_list_response.add_subdirectories();
+                            directory_info->set_name(name_only);
+                            directory_info->set_date(cc_file.modifyTime());
+                            // skip item count
+                        }
                     }
                 } else {
                     try {

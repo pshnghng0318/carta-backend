@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.20)
 project(carta_backend)
 
 include_directories(src)
@@ -108,16 +108,12 @@ endif ()
 
 FIND_PACKAGE(HDF5 REQUIRED COMPONENTS CXX)
 FIND_PACKAGE(Protobuf REQUIRED)
-INCLUDE_DIRECTORIES(${PROTOBUF_INCLUDE_DIR})
 
 if (Protobuf_VERSION VERSION_GREATER_EQUAL "4.25.3")
-    FIND_PACKAGE(absl REQUIRED)
+    # Use TensorStore's Abseil libraries instead of system ones to avoid conflicts
     set(PROTOBUF_LIBRARY
-            ${PROTOBUF_LIBRARY}
-            absl_hash
-            absl_log_internal_message
-            absl_log_internal_nullguard)
-    message(STATUS "Newer protobuf version (${Protobuf_VERSION}) includes abseil libraries")
+            ${PROTOBUF_LIBRARY})
+    message(STATUS "Newer protobuf version (${Protobuf_VERSION}) will use TensorStore's abseil libraries")
 endif ()
 
 FIND_PACKAGE(Threads)
@@ -154,6 +150,7 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     INCLUDE_DIRECTORIES(/usr/local/opt/libomp/include)
     LINK_DIRECTORIES(/usr/local/lib)
     LINK_DIRECTORIES(/usr/local/opt)
+    # Use system abseil libraries to match protobuf
     LINK_DIRECTORIES(/opt/homebrew/lib)
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 
@@ -175,6 +172,121 @@ include_directories(${CMAKE_SOURCE_DIR}/third-party/pugixml/src)
 #spdlog
 add_subdirectory(third-party/spdlog)
 
+# JSON schemas
+add_subdirectory(schemas)
+
+# nlohmann/json
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+set(JSON_Install OFF CACHE INTERNAL "")
+add_subdirectory(third-party/nlohmann_json)
+
+# json-schema-validator
+set(nlohmann_json_VERSION "v3.11.3")
+add_subdirectory(third-party/json-schema-validator)
+
+# TensorStore configuration
+set(TENSORSTORE_ROOT "${CMAKE_SOURCE_DIR}/tensorstore")
+set(TENSORSTORE_BUILD_ROOT "${TENSORSTORE_ROOT}/build")
+
+# TensorStore include directories  
+include_directories("${TENSORSTORE_ROOT}")
+include_directories("${TENSORSTORE_ROOT}/tensorstore")
+include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/re2-src")
+include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/riegeli-src")
+include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/absl-src")
+include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/half-src/include")
+
+# Include TensorStore absl headers for protobuf compatibility
+include_directories(BEFORE "${TENSORSTORE_ROOT}/_deps/absl-src")
+
+# Use system libraries instead of TensorStore static libraries
+find_package(PkgConfig REQUIRED)
+
+# Use system absl and other dependencies
+set(CMAKE_PREFIX_PATH "/opt/homebrew;${CMAKE_PREFIX_PATH}")
+find_library(ABSL_BASE_LIB absl_base PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_STRINGS_LIB absl_strings PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_STRINGS_INTERNAL_LIB absl_strings_internal PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_STATUS_LIB absl_status PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_STATUSOR_LIB absl_statusor PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_HASH_LIB absl_hash PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_LOG_INTERNAL_MESSAGE_LIB absl_log_internal_message PATHS /opt/homebrew/lib)
+find_library(ABSL_LOG_INTERNAL_CONDITIONS_LIB absl_log_internal_conditions PATHS /opt/homebrew/lib)
+find_library(ABSL_LOG_SEVERITY_LIB absl_log_severity PATHS /opt/homebrew/lib)
+
+# Additional critical absl libraries for TensorStore linking
+find_library(ABSL_CORD_LIB absl_cord PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_CORD_INTERNAL_LIB absl_cord_internal PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_CORDZ_FUNCTIONS_LIB absl_cordz_functions PATHS /opt/homebrew/lib)
+find_library(ABSL_CORDZ_HANDLE_LIB absl_cordz_handle PATHS /opt/homebrew/lib)
+find_library(ABSL_CORDZ_INFO_LIB absl_cordz_info PATHS /opt/homebrew/lib)
+find_library(ABSL_CORDZ_SAMPLE_TOKEN_LIB absl_cordz_sample_token PATHS /opt/homebrew/lib)
+find_library(ABSL_CRC32C_LIB absl_crc32c PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_CRC_INTERNAL_LIB absl_crc_internal PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_CRC_CORD_STATE_LIB absl_crc_cord_state PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_CRC_CPU_DETECT_LIB absl_crc_cpu_detect PATHS /opt/homebrew/lib)
+find_library(ABSL_SYNCHRONIZATION_LIB absl_synchronization PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_TIME_LIB absl_time PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_CIVIL_TIME_LIB absl_civil_time PATHS /opt/homebrew/lib)
+find_library(ABSL_TIME_ZONE_LIB absl_time_zone PATHS /opt/homebrew/lib)
+find_library(ABSL_INT128_LIB absl_int128 PATHS /opt/homebrew/lib)
+find_library(ABSL_RAW_LOGGING_INTERNAL_LIB absl_raw_logging_internal PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_LOG_INTERNAL_CHECK_OP_LIB absl_log_internal_check_op PATHS /opt/homebrew/lib)
+find_library(ABSL_LOG_INTERNAL_GLOBALS_LIB absl_log_internal_globals PATHS /opt/homebrew/lib)
+find_library(ABSL_THROW_DELEGATE_LIB absl_throw_delegate PATHS /opt/homebrew/lib REQUIRED)
+find_library(ABSL_MALLOC_INTERNAL_LIB absl_malloc_internal PATHS /opt/homebrew/lib)
+find_library(ABSL_SPINLOCK_WAIT_LIB absl_spinlock_wait PATHS /opt/homebrew/lib)
+find_library(ABSL_RAW_HASH_SET_LIB absl_raw_hash_set PATHS /opt/homebrew/lib)
+find_library(ABSL_HASHTABLEZ_SAMPLER_LIB absl_hashtablez_sampler PATHS /opt/homebrew/lib)
+find_library(ABSL_CITY_LIB absl_city PATHS /opt/homebrew/lib)
+find_library(ABSL_STR_FORMAT_INTERNAL_LIB absl_str_format_internal PATHS /opt/homebrew/lib)
+
+# TensorStore link directories - use bazel-bin path
+link_directories("${TENSORSTORE_ROOT}/bazel-bin/tensorstore")
+
+# Automatically collect all TensorStore library files
+file(GLOB_RECURSE TENSORSTORE_ALL_LIBS_FILES "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/*.a")
+
+# Collect external dependencies from TensorStore Bazel build
+file(GLOB_RECURSE TENSORSTORE_EXTERNAL_DEPS "${TENSORSTORE_ROOT}/bazel-bin/external/*.a")
+
+# Sort the libraries to ensure consistent linking order
+list(SORT TENSORSTORE_ALL_LIBS_FILES)
+list(SORT TENSORSTORE_EXTERNAL_DEPS)
+
+# Display found libraries for debugging
+list(LENGTH TENSORSTORE_ALL_LIBS_FILES TENSORSTORE_COUNT)
+list(LENGTH TENSORSTORE_EXTERNAL_DEPS EXTERNAL_COUNT)
+message(STATUS "Found ${TENSORSTORE_COUNT} TensorStore libraries")
+message(STATUS "Found ${EXTERNAL_COUNT} external dependency libraries")
+foreach(lib ${TENSORSTORE_ALL_LIBS_FILES})
+    get_filename_component(lib_name ${lib} NAME)
+    message(STATUS "  TensorStore lib: ${lib_name}")
+endforeach()
+
+# Add external dependencies from TensorStore build (re2, riegeli, absl, etc.)
+set(TENSORSTORE_EXTERNAL_LIBS
+    ${TENSORSTORE_EXTERNAL_DEPS}
+)
+
+# Ensure critical TensorStore main library is explicitly identified
+set(TENSORSTORE_MAIN_LIB "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/libtensorstore.a")
+
+# Additional dependencies that TensorStore might need
+if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
+    find_library(COREFOUNDATION_LIBRARY CoreFoundation)
+    find_library(SECURITY_LIBRARY Security)
+    set(TENSORSTORE_SYSTEM_LIBS ${COREFOUNDATION_LIBRARY} ${SECURITY_LIBRARY})
+endif()
+
+# Create complete TensorStore library list with system dependencies
+set(TENSORSTORE_ALL_LIBS
+    ${TENSORSTORE_ALL_LIBS_FILES}
+    ${TENSORSTORE_EXTERNAL_LIBS}
+    ${TENSORSTORE_SYSTEM_LIBS}
+)
+
+
 set(LINK_LIBS
         ${LINK_LIBS}
         carta-protobuf
@@ -183,10 +295,12 @@ set(LINK_LIBS
         uuid
         z
         zfp
-        zstd
+        /opt/homebrew/lib/libzstd.dylib
         cfitsio
-        wcs
+        /opt/homebrew/lib/libwcs.dylib
         gsl
+        nlohmann_json::nlohmann_json
+        nlohmann_json_schema_validator
         casa_casa
         casa_coordinates
         casa_tables
@@ -199,7 +313,9 @@ set(LINK_LIBS
         casa_imageanalysis
         ${OpenMP_CXX_LIBRARIES}
         ${HDF5_LIBRARIES}
-        ${CMAKE_THREAD_LIBS_INIT})
+        ${CMAKE_THREAD_LIBS_INIT}
+        # Add TensorStore libraries and all dependencies
+        ${TENSORSTORE_ALL_LIBS})
 
 set(SOURCE_FILES
         ${SOURCE_FILES}
@@ -225,18 +341,23 @@ set(SOURCE_FILES
         src/ImageData/FileInfo.cc
         src/ImageData/FileLoader.cc
         src/ImageData/FitsLoader.cc
+        src/ImageData/FitsUtil.cc
         src/ImageData/Hdf5Attributes.cc
         src/ImageData/Hdf5Loader.cc
         src/ImageData/PolarizationCalculator.cc
         src/ImageData/StokesFilesConnector.cc
+        src/ImageData/CartaZarrImage.cc
+        src/ImageData/ZarrLoader.cc
+        src/ImageFitting/ImageFitter.cc
+        src/ImageFitting/InitialValueCalculator.cc
         src/ImageGenerators/MomentGenerator.cc
         src/ImageGenerators/PvGenerator.cc
         src/ImageGenerators/PvPreviewCube.cc
         src/ImageGenerators/PvPreviewCut.cc
         src/ImageStats/Histogram.cc
         src/ImageStats/StatsCalculator.cc
-        src/Logger/Logger.cc
         src/Logger/CartaLogSink.cc
+        src/Logger/Logger.cc
         src/Main/Main.cc
         src/Main/ProgramSettings.cc
         src/Main/WebBrowser.cc
@@ -252,32 +373,45 @@ set(SOURCE_FILES
         src/Session/OnMessageTask.cc
         src/Session/Session.cc
         src/Session/SessionManager.cc
-        src/Table/Columns.cc
+        src/Table/Column.cc
         src/Table/Table.cc
         src/Table/TableController.cc
         src/Table/TableView.cc
-        src/ThreadingManager/ThreadingManager.cc
+        src/ThreadManager/ThreadManager.cc
         src/Timer/ListProgressReporter.cc
         src/Timer/Timer.cc
         src/Util/App.cc
         src/Util/Casacore.cc
         src/Util/File.cc
+        src/Util/Json.cc
         src/Util/Message.cc
+        src/Util/RemoteFiles.cc
         src/Util/Stokes.cc
         src/Util/String.cc
-        src/Util/Token.cc
-        src/ImageFitter/ImageFitter.cc
-        src/Util/RemoteFiles.cc
-        src/Util/RemoteFiles.h)
+        src/Util/Token.cc)
 
 add_definitions(-DHAVE_HDF5 -DPUGIXML_COMPACT)
 add_executable(carta_backend ${SOURCE_FILES})
+
+add_dependencies(carta_backend carta-schemas)
+
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     list(REMOVE_ITEM LINK_LIBS uuid)
-    target_link_libraries(carta_backend uv ${LINK_LIBS})
+    target_link_libraries(carta_backend
+        PRIVATE
+            protobuf
+            /opt/homebrew/lib/libuv.dylib
+            ${LINK_LIBS}
+            -Wl,-force_load,${TENSORSTORE_MAIN_LIB})
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-    target_link_libraries(carta_backend ${LINK_LIBS})
+    target_link_libraries(carta_backend
+        PRIVATE
+            protobuf
+            ${LINK_LIBS}
+            -Wl,--whole-archive
+            ${TENSORSTORE_ROOT}/_deps/absl-build/absl/hash/libabsl_hash.a
+            -Wl,--no-whole-archive)
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 
 if (CartaUserFolderPrefix)
