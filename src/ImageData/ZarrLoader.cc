@@ -5,18 +5,41 @@
 */
 
 #include "ZarrLoader.h"
+#include "CartaZarrImage.h"
 #include "Logger/Logger.h"
 
 #include <filesystem>
 
 using namespace carta;
 
-ZarrLoader::ZarrLoader(const std::string& filename) : FileLoader(filename) {}
+ZarrLoader::ZarrLoader(const std::string& filename) : FileLoader(filename) {
+    // 不在構造函數中創建 CartaZarrImage，避免重複創建
+    // 只設定預設值，等到 AllocateImage 時才真正創建
+    _num_dims = 0;
+    _has_pixel_mask = false;
+    
+    spdlog::info("ZarrLoader created for: {}", _filename);
+}
 
 void ZarrLoader::AllocateImage(const std::string& hdu) {
-    // 暫時不實現載入功能，只記錄日誌
-    spdlog::warn("Zarr image loading not yet implemented for {}", _filename);
-    _image = nullptr;
+    // 為文件瀏覽器創建基本的 CartaZarrImage
+    try {
+        _image = std::shared_ptr<casacore::ImageInterface<float>>(new CartaZarrImage(_filename));
+        
+        if (_image) {
+            // 設定 _num_dims 和 _has_pixel_mask 供 HasData 使用
+            casacore::IPosition shape = _image->shape();
+            _num_dims = shape.size();
+            _has_pixel_mask = _image->hasPixelMask();
+            
+            spdlog::info("Created CartaZarrImage: {} dims={}, has_mask={}", _filename, _num_dims, _has_pixel_mask);
+        }
+    } catch (std::exception& e) {
+        spdlog::error("Failed to create CartaZarrImage for {}: {}", _filename, e.what());
+        _image = nullptr;
+        _num_dims = 0;
+        _has_pixel_mask = false;
+    }
 }
 
 bool ZarrLoader::HasZarrArrayMetadata(const std::string& path) const {
@@ -33,7 +56,8 @@ bool ZarrLoader::HasZmetadataFile(const std::string& path) const {
 
 // FileLoader virtual function implementations
 bool ZarrLoader::HasData(FileInfo::Data ds) const {
-    return false; // 暫時不支援額外資料
+    // 使用基礎類別的 HasData 邏輯
+    return FileLoader::HasData(ds);
 }
 
 bool ZarrLoader::HasMip(int mip) const {

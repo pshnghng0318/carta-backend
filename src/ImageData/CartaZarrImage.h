@@ -10,7 +10,13 @@
 #include <casacore/images/Images/ImageInterface.h>
 #include <casacore/coordinates/Coordinates/CoordinateSystem.h>
 #include <casacore/lattices/Lattices/TiledShape.h>
+#include <nlohmann/json.hpp>
 #include <memory>
+
+// TensorStore includes
+#include "tensorstore/context.h"
+#include "tensorstore/tensorstore.h"
+#include "tensorstore/spec.h"
 
 namespace carta {
 
@@ -41,12 +47,27 @@ public:
     const casacore::Lattice<casacore::Bool>& pixelMask() const override;
     casacore::Lattice<casacore::Bool>& pixelMask() override;
 
+    // MaskedLattice implementation
+    const casacore::LatticeRegion* getRegionPtr() const override;
+    casacore::ImageInterface<float>* cloneII() const override;
+    
+    // Coordinates - required by ImageInterface
+    const casacore::CoordinateSystem& coordinates() const;
+
 private:
     casacore::CoordinateSystem _coord_sys;
     casacore::IPosition _shape;
     casacore::String _name;
     
+    // TensorStore members
+    tensorstore::Context _context;
+    tensorstore::TensorStore<> _tensorstore;  // Use default template parameters
+    bool _tensorstore_initialized = false;
+    
     void setupCoordinateSystem();
+    bool parseWCSFromZattrs(const nlohmann::json& zattrs);
+    void createMinimalCoordinateSystem();
+    void initializeTensorStore();
 };
 
 } // namespace carta
