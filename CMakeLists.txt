@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.10)
 project(carta_backend)
 
 include_directories(src)
@@ -108,6 +108,7 @@ endif ()
 
 FIND_PACKAGE(HDF5 REQUIRED COMPONENTS CXX)
 FIND_PACKAGE(Protobuf REQUIRED)
+INCLUDE_DIRECTORIES(${PROTOBUF_INCLUDE_DIR})
 
 if (Protobuf_VERSION VERSION_GREATER_EQUAL "4.25.3")
     FIND_PACKAGE(absl REQUIRED)
@@ -174,24 +175,6 @@ include_directories(${CMAKE_SOURCE_DIR}/third-party/pugixml/src)
 #spdlog
 add_subdirectory(third-party/spdlog)
 
-# JSON schemas
-add_subdirectory(schemas)
-
-# nlohmann/json
-set(JSON_BuildTests OFF CACHE INTERNAL "")
-set(JSON_Install OFF CACHE INTERNAL "")
-add_subdirectory(third-party/nlohmann_json)
-
-# json-schema-validator
-set(nlohmann_json_VERSION "v3.11.3")
-add_subdirectory(third-party/json-schema-validator)
-
-include_directories("/Users/pshuang/carta_build/carta-backend/tensorstore")
-include_directories("/Users/pshuang/carta_build/carta-backend/tensorstore/tensorstore")
-include_directories("/Users/pshuang/carta_build/carta-backend/tensorstore/_deps/riegeli-src")
-link_directories("/Users/pshuang/carta_build/carta-backend/tensorstore")
-
-
 set(LINK_LIBS
         ${LINK_LIBS}
         carta-protobuf
@@ -204,8 +187,6 @@ set(LINK_LIBS
         cfitsio
         wcs
         gsl
-        nlohmann_json::nlohmann_json
-        nlohmann_json_schema_validator
         casa_casa
         casa_coordinates
         casa_tables
@@ -244,23 +225,18 @@ set(SOURCE_FILES
         src/ImageData/FileInfo.cc
         src/ImageData/FileLoader.cc
         src/ImageData/FitsLoader.cc
-        src/ImageData/FitsUtil.cc
         src/ImageData/Hdf5Attributes.cc
         src/ImageData/Hdf5Loader.cc
         src/ImageData/PolarizationCalculator.cc
         src/ImageData/StokesFilesConnector.cc
-        src/ImageData/CartaZarrImage.cc
-        src/ImageData/ZarrLoader.cc
-        src/ImageFitting/ImageFitter.cc
-        src/ImageFitting/InitialValueCalculator.cc
         src/ImageGenerators/MomentGenerator.cc
         src/ImageGenerators/PvGenerator.cc
         src/ImageGenerators/PvPreviewCube.cc
         src/ImageGenerators/PvPreviewCut.cc
         src/ImageStats/Histogram.cc
         src/ImageStats/StatsCalculator.cc
-        src/Logger/CartaLogSink.cc
         src/Logger/Logger.cc
+        src/Logger/CartaLogSink.cc
         src/Main/Main.cc
         src/Main/ProgramSettings.cc
         src/Main/WebBrowser.cc
@@ -276,47 +252,32 @@ set(SOURCE_FILES
         src/Session/OnMessageTask.cc
         src/Session/Session.cc
         src/Session/SessionManager.cc
-        src/Table/Column.cc
+        src/Table/Columns.cc
         src/Table/Table.cc
         src/Table/TableController.cc
         src/Table/TableView.cc
-        src/ThreadManager/ThreadManager.cc
+        src/ThreadingManager/ThreadingManager.cc
         src/Timer/ListProgressReporter.cc
         src/Timer/Timer.cc
         src/Util/App.cc
         src/Util/Casacore.cc
         src/Util/File.cc
-        src/Util/Json.cc
         src/Util/Message.cc
-        src/Util/RemoteFiles.cc
         src/Util/Stokes.cc
         src/Util/String.cc
-        src/Util/Token.cc)
+        src/Util/Token.cc
+        src/ImageFitter/ImageFitter.cc
+        src/Util/RemoteFiles.cc
+        src/Util/RemoteFiles.h)
 
 add_definitions(-DHAVE_HDF5 -DPUGIXML_COMPACT)
 add_executable(carta_backend ${SOURCE_FILES})
-
-add_dependencies(carta_backend carta-schemas)
-
-file(GLOB TENSORSTORE_LIBS "${CMAKE_SOURCE_DIR}/tensorstore/*.a")
-
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     list(REMOVE_ITEM LINK_LIBS uuid)
-    target_link_libraries(carta_backend
-        PRIVATE
-            ${TENSORSTORE_LIBS}
-            protobuf
-            uv
-            ${LINK_LIBS}
-            nlohmann_json::nlohmann_json)
+    target_link_libraries(carta_backend uv ${LINK_LIBS})
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-    target_link_libraries(carta_backend
-        PRIVATE
-            ${TENSORSTORE_LIBS}
-            protobuf
-            ${LINK_LIBS}
-            nlohmann_json::nlohmann_json)
+    target_link_libraries(carta_backend ${LINK_LIBS})
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 
 if (CartaUserFolderPrefix)
