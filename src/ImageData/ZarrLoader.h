@@ -10,6 +10,9 @@
 #include "FileLoader.h"
 #include <string>
 
+// Forward declaration
+class CartaZarrImage;
+
 namespace carta {
 
 class ZarrLoader : public FileLoader {

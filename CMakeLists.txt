@@ -196,6 +196,9 @@ include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/riegeli-src")
 include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/absl-src")
 include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/half-src/include")
 
+# Include blosc headers for compression support
+include_directories("/opt/homebrew/opt/c-blosc/include")
+
 # Include TensorStore absl headers for protobuf compatibility
 include_directories(BEFORE "${TENSORSTORE_ROOT}/_deps/absl-src")
 
@@ -271,6 +274,16 @@ set(TENSORSTORE_EXTERNAL_LIBS
 
 # Ensure critical TensorStore main library is explicitly identified
 set(TENSORSTORE_MAIN_LIB "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/libtensorstore.a")
+
+# Define critical ZARR and compression libraries that must be force-loaded
+set(TENSORSTORE_FORCE_LOAD_LIBS
+    "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/driver/zarr/libblosc_compressor.a"
+    "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/driver/zarr/libzstd_compressor.a"
+    "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/internal/compression/libblosc.a"
+    "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/internal/compression/libblosc_compressor.a"
+    "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/internal/compression/libzstd_compressor.a"
+    "/opt/homebrew/opt/c-blosc/lib/libblosc.a"
+)
 
 # Additional dependencies that TensorStore might need
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
@@ -348,6 +361,30 @@ set(SOURCE_FILES
         src/ImageData/StokesFilesConnector.cc
         src/ImageData/CartaZarrImage.cc
         src/ImageData/ZarrLoader.cc
+        # Include TensorStore zarr driver to ensure registration
+        tensorstore/tensorstore/driver/zarr/driver.cc
+        tensorstore/tensorstore/driver/zarr/metadata.cc
+        tensorstore/tensorstore/driver/zarr/spec.cc
+        tensorstore/tensorstore/driver/zarr/dtype.cc
+        tensorstore/tensorstore/driver/zarr/compressor.cc
+        tensorstore/tensorstore/driver/zarr/blosc_compressor.cc
+        tensorstore/tensorstore/driver/zarr/zstd_compressor.cc
+        tensorstore/tensorstore/driver/zarr/zlib_compressor.cc
+        tensorstore/tensorstore/driver/zarr/bzip2_compressor.cc
+        # Include internal compression implementations
+        tensorstore/tensorstore/internal/compression/blosc_compressor.cc
+        tensorstore/tensorstore/internal/compression/zstd_compressor.cc
+        tensorstore/tensorstore/internal/compression/zlib_compressor.cc
+        tensorstore/tensorstore/internal/compression/bzip2_compressor.cc
+        tensorstore/tensorstore/internal/compression/json_specified_compressor.cc
+        tensorstore/tensorstore/context.cc
+        tensorstore/tensorstore/internal/concurrency_resource.cc
+        tensorstore/tensorstore/internal/data_copy_concurrency_resource.cc
+        tensorstore/tensorstore/internal/file_io_concurrency_resource.cc
+        tensorstore/tensorstore/internal/cache/cache_pool_resource.cc
+        # Include file KvStore driver for file:// URLs
+        tensorstore/tensorstore/kvstore/file/file_key_value_store.cc
+        tensorstore/tensorstore/kvstore/file/file_resource.cc
         src/ImageFitting/ImageFitter.cc
         src/ImageFitting/InitialValueCalculator.cc
         src/ImageGenerators/MomentGenerator.cc
@@ -397,12 +434,22 @@ add_dependencies(carta_backend carta-schemas)
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     list(REMOVE_ITEM LINK_LIBS uuid)
+    
+    # Prepare force-load arguments for compression libraries
+    set(FORCE_LOAD_ARGS "")
+    foreach(lib ${TENSORSTORE_FORCE_LOAD_LIBS})
+        if(EXISTS ${lib})
+            list(APPEND FORCE_LOAD_ARGS "-Wl,-force_load,${lib}")
+        endif()
+    endforeach()
+    
     target_link_libraries(carta_backend
         PRIVATE
             protobuf
             /opt/homebrew/lib/libuv.dylib
             ${LINK_LIBS}
-            -Wl,-force_load,${TENSORSTORE_MAIN_LIB})
+            -Wl,-force_load,${TENSORSTORE_MAIN_LIB}
+            ${FORCE_LOAD_ARGS})
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     target_link_libraries(carta_backend

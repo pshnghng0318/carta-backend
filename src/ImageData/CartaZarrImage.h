@@ -9,14 +9,20 @@
 
 #include <casacore/images/Images/ImageInterface.h>
 #include <casacore/coordinates/Coordinates/CoordinateSystem.h>
+#include <casacore/coordinates/Coordinates/DirectionCoordinate.h>
+#include <casacore/coordinates/Coordinates/SpectralCoordinate.h>
+#include <casacore/coordinates/Coordinates/LinearCoordinate.h>
+#include <casacore/coordinates/Coordinates/StokesCoordinate.h>
 #include <casacore/lattices/Lattices/TiledShape.h>
 #include <nlohmann/json.hpp>
 #include <memory>
 
-// TensorStore includes
+// TensorStore includes  
 #include "tensorstore/context.h"
-#include "tensorstore/tensorstore.h"
+#include "tensorstore/open.h"
+#include "tensorstore/open_mode.h"
 #include "tensorstore/spec.h"
+#include "tensorstore/tensorstore.h"
 
 namespace carta {
 
@@ -57,7 +63,9 @@ public:
 private:
     casacore::CoordinateSystem _coord_sys;
     casacore::IPosition _shape;
+    casacore::IPosition _original_zarr_shape;  // Original ZARR shape for TensorStore access
     casacore::String _name;
+    int _ndim = 2;  // Number of dimensions, default to 2D
     
     // TensorStore members
     tensorstore::Context _context;

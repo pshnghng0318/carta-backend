@@ -141,8 +141,8 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                 casacore::IPosition image_shape(image->shape());
                 unsigned int num_dim = image_shape.size();
 
-                if (num_dim < 2 || num_dim > 4) {
-                    message = "Image must be 2D, 3D or 4D.";
+                if (num_dim < 2 || num_dim > 5) {
+                    message = "Image must be 2D, 3D, 4D or 5D.";
                     return info_ok;
                 }
 
