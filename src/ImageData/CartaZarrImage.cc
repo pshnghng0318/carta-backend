@@ -7,6 +7,8 @@
 #include "CartaZarrImage.h"
 #include "Logger/Logger.h"
 
+#include <limits>
+#include <cmath>
 #include <casacore/coordinates/Coordinates/LinearCoordinate.h>
 #include <casacore/coordinates/Coordinates/DirectionCoordinate.h>
 #include <casacore/coordinates/Coordinates/SpectralCoordinate.h>
@@ -39,7 +41,6 @@ using namespace casacore;
 namespace carta {
 
 CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<float>(), _name(filename) {
-    std::cout << "[DEBUG] CartaZarrImage constructor called with filename: " << filename << std::endl;
     // Initialize TensorStore context
     _context = tensorstore::Context::Default();
     
@@ -72,8 +73,6 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
                         reordered_shape.push_back(shape_vec[4]); // m (y) - spatial 
                         reordered_shape.push_back(1);           // frequency (forced to 1 for first channel only)
                         reordered_shape.push_back(1);           // polarization (forced to 1 for first channel only)
-                        std::cout << "[DEBUG] Converted 5D ZARR [time,freq,pol,l,m] to 4D CARTA [l,m,freq,pol]: " 
-                                  << "[" << shape_vec[3] << "," << shape_vec[4] << ",1,1] (channels forced to 1)" << std::endl;
                     } else {
                         // Keep original order for non-5D cases
                         reordered_shape = shape_vec;
@@ -95,7 +94,6 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
         
         // Set _ndim based on shape
         _ndim = _shape.size();
-        std::cout << "[DEBUG] Image dimensions: " << _ndim << ", shape: " << _shape.toString() << std::endl;
         
         // Initialize TensorStore for this Zarr file
         initializeTensorStore();
@@ -115,21 +113,15 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
     
     // Set coordinate system in ImageInterface base class
     setCoordinateInfo(_coord_sys);
-    
-    std::cout << "[DEBUG] CartaZarrImage constructor completed" << std::endl;
 }
 
 void CartaZarrImage::setupCoordinateSystem() {
-    std::cout << "[DEBUG] setupCoordinateSystem() called" << std::endl;
     // Try to read coordinate system from .zattrs file
     try {
         std::filesystem::path zarr_path(_name.c_str());
         std::filesystem::path zattrs_path = zarr_path / ".zattrs";
         
-        std::cout << "[DEBUG] Checking for .zattrs file at: " << zattrs_path << std::endl;
-        
         if (std::filesystem::exists(zattrs_path)) {
-            std::cout << "[DEBUG] Reading .zattrs file" << std::endl;
             std::ifstream zattrs_file(zattrs_path);
             nlohmann::json zattrs_json;
             zattrs_file >> zattrs_json;
@@ -137,34 +129,26 @@ void CartaZarrImage::setupCoordinateSystem() {
             spdlog::info("Found .zattrs file for Zarr image: {}", _name);
             
             // Parse WCS-like coordinate information
-            std::cout << "[DEBUG] Parsing WCS from .zattrs" << std::endl;
             if (parseWCSFromZattrs(zattrs_json)) {
-                std::cout << "[DEBUG] Successfully parsed coordinate system from .zattrs" << std::endl;
                 spdlog::info("Successfully parsed coordinate system from .zattrs");
                 return;
             }
         }
     } catch (std::exception& e) {
-        std::cout << "[DEBUG] Exception in setupCoordinateSystem: " << e.what() << std::endl;
         spdlog::warn("Failed to read .zattrs for {}: {}", _name, e.what());
     }
     
     // Fallback to minimal coordinate system
-    std::cout << "[DEBUG] Creating minimal coordinate system" << std::endl;
     createMinimalCoordinateSystem();
-    std::cout << "[DEBUG] setupCoordinateSystem() completed" << std::endl;
 }
 
 bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
     try {
-        std::cout << "[DEBUG] parseWCSFromZattrs() called" << std::endl;
-        
         // Check for ZARR-style coordinate information
         bool has_array_dimensions = zattrs.contains("_ARRAY_DIMENSIONS");
         bool has_direction_info = zattrs.contains("direction") || zattrs.contains("pointing_center");
         
         if (!has_array_dimensions && !has_direction_info) {
-            std::cout << "[DEBUG] No ZARR coordinate information found" << std::endl;
             return false;
         }
         
@@ -174,18 +158,12 @@ bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
             for (const auto& dim : zattrs["_ARRAY_DIMENSIONS"]) {
                 axis_names.push_back(dim.get<std::string>());
             }
-            std::cout << "[DEBUG] Found array dimensions: ";
-            for (const auto& name : axis_names) {
-                std::cout << name << " ";
-            }
-            std::cout << std::endl;
         }
         
         // Create coordinate system based on array dimensions
         if (axis_names.size() == 5) {
             // 5D ZARR: Original was [time, frequency, polarization, l, m]
             // But we converted to CARTA 4D format: [l, m, frequency, polarization] = [x, y, freq, stokes]
-            std::cout << "[DEBUG] Creating 4D coordinate system for converted ZARR metadata" << std::endl;
             
             // Create DirectionCoordinate for l,m (spatial) axes - now first in CARTA order
             DirectionCoordinate dir_coord;
@@ -234,10 +212,8 @@ bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
                                                       inc(0), inc(1),
                                                       xform,
                                                       ref_pix(0), ref_pix(1));
-                        std::cout << "[DEBUG] Created DirectionCoordinate with RA=" << ra_rad << " DEC=" << dec_rad << std::endl;
                     }
                 } catch (const std::exception& e) {
-                    std::cout << "[DEBUG] Error parsing direction coordinates: " << e.what() << std::endl;
                     // Fall back to default DirectionCoordinate
                     dir_coord = DirectionCoordinate();
                 }
@@ -258,47 +234,38 @@ bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
             _coord_sys.addCoordinate(spec_coord);      // axis 2: frequency
             _coord_sys.addCoordinate(stokes_coord);    // axis 3: polarization
             
-            std::cout << "[DEBUG] Successfully created 4D coordinate system from 5D ZARR metadata" << std::endl;
             return true;
         }
         
         // Fallback for other dimension counts or missing info
-        std::cout << "[DEBUG] Using fallback coordinate parsing" << std::endl;
         return false;
         
     } catch (std::exception& e) {
-        std::cout << "[DEBUG] Exception in parseWCSFromZattrs: " << e.what() << std::endl;
         spdlog::warn("Error parsing WCS from .zattrs: {}", e.what());
         return false;
     }
 }
 
 void CartaZarrImage::createMinimalCoordinateSystem() {
-    std::cout << "[DEBUG] createMinimalCoordinateSystem() called with " << _ndim << " dimensions" << std::endl;
     try {
         // Create coordinate system based on actual image dimensions
         // Similar to CartaHdf5Image approach, but simplified for ZARR
         
         if (_ndim == 2) {
             // 2D image: only DirectionCoordinate (RA/DEC)
-            std::cout << "[DEBUG] Creating DirectionCoordinate for 2D image" << std::endl;
             DirectionCoordinate dir_coord;
             _coord_sys.addCoordinate(dir_coord);
-            std::cout << "[DEBUG] DirectionCoordinate added successfully for 2D image" << std::endl;
             
         } else if (_ndim == 3) {
             // 3D image: DirectionCoordinate + SpectralCoordinate
-            std::cout << "[DEBUG] Creating coordinates for 3D image" << std::endl;
             DirectionCoordinate dir_coord;
             SpectralCoordinate spec_coord;
             
             _coord_sys.addCoordinate(dir_coord);
             _coord_sys.addCoordinate(spec_coord);
-            std::cout << "[DEBUG] DirectionCoordinate and SpectralCoordinate added for 3D image" << std::endl;
             
         } else if (_ndim == 4) {
             // 4D image: DirectionCoordinate + SpectralCoordinate + StokesCoordinate
-            std::cout << "[DEBUG] Creating coordinates for 4D image" << std::endl;
             DirectionCoordinate dir_coord;
             SpectralCoordinate spec_coord;
             
@@ -313,11 +280,9 @@ void CartaZarrImage::createMinimalCoordinateSystem() {
             _coord_sys.addCoordinate(dir_coord);
             _coord_sys.addCoordinate(spec_coord);
             _coord_sys.addCoordinate(stokes_coord);
-            std::cout << "[DEBUG] All coordinates added for 4D image" << std::endl;
             
         } else {
             // For other dimensions, create a basic system with linear coordinates
-            std::cout << "[DEBUG] Creating basic coordinate system for " << _ndim << "D image" << std::endl;
             
             // Always start with DirectionCoordinate for the last 2 axes
             DirectionCoordinate dir_coord;
@@ -330,15 +295,9 @@ void CartaZarrImage::createMinimalCoordinateSystem() {
             
             // Add DirectionCoordinate for the last 2 axes
             _coord_sys.addCoordinate(dir_coord);
-            
-            std::cout << "[DEBUG] Basic coordinate system created with LinearCoordinates + DirectionCoordinate" << std::endl;
         }
-        
-        std::cout << "[DEBUG] createMinimalCoordinateSystem() completed with " << _coord_sys.nPixelAxes() 
-                  << " pixel axes for " << _ndim << "D image" << std::endl;
                   
     } catch (std::exception& e) {
-        std::cout << "[DEBUG] Exception in createMinimalCoordinateSystem: " << e.what() << std::endl;
         spdlog::error("Exception in createMinimalCoordinateSystem: {}", e.what());
         
         // Emergency fallback: just create a basic 2D system
@@ -346,20 +305,17 @@ void CartaZarrImage::createMinimalCoordinateSystem() {
             _coord_sys = CoordinateSystem();  // Reset
             DirectionCoordinate dir_coord;
             _coord_sys.addCoordinate(dir_coord);
-            std::cout << "[DEBUG] Emergency fallback: created 2D DirectionCoordinate system" << std::endl;
         } catch (...) {
-            std::cout << "[DEBUG] Even emergency fallback failed!" << std::endl;
+            // Even emergency fallback failed
         }
     }
 }
 
 void CartaZarrImage::initializeTensorStore() {
-    std::cout << "[DEBUG] initializeTensorStore() called for: " << _name << std::endl;
     try {
         // Create TensorStore spec for Zarr using the correct format
         // Handle hierarchical zarr files (check for subdirectories with .zarray)
         std::string zarr_path = _name;
-        std::cout << "[DEBUG] Initial zarr_path: " << zarr_path << std::endl;
         
         // Check if this is a hierarchical zarr (has subdirectories with .zarray)
         std::filesystem::path base_path(zarr_path);
@@ -368,15 +324,12 @@ void CartaZarrImage::initializeTensorStore() {
         // Look for common array subdirectories like SKY, DATA, etc.
         std::vector<std::string> common_array_names = {"SKY", "DATA", "ARRAY", "0"};
         bool found_array = false;
-        std::cout << "[DEBUG] Checking for array subdirectories..." << std::endl;
         
         for (const auto& array_name : common_array_names) {
             potential_array_path = base_path / array_name;
-            std::cout << "[DEBUG] Checking path: " << potential_array_path.string() << std::endl;
             if (std::filesystem::exists(potential_array_path / ".zarray")) {
                 zarr_path = potential_array_path.string();
                 found_array = true;
-                std::cout << "[DEBUG] Found Zarr array in subdirectory: " << zarr_path << std::endl;
                 spdlog::info("Found Zarr array in subdirectory: {}", zarr_path);
                 break;
             }
@@ -384,19 +337,16 @@ void CartaZarrImage::initializeTensorStore() {
         
         // If no subdirectory found, check if base path has .zarray directly
         if (!found_array && !std::filesystem::exists(base_path / ".zarray")) {
-            std::cout << "[DEBUG] ERROR: No .zarray file found in " << _name << " or its subdirectories" << std::endl;
             spdlog::error("No .zarray file found in {} or its subdirectories", _name);
             return;
         }
         
         if (!found_array) {
             zarr_path = _name;  // Use original path
-            std::cout << "[DEBUG] Using direct Zarr path: " << zarr_path << std::endl;
             spdlog::info("Using direct Zarr path: {}", zarr_path);
         }
         
         // Create TensorStore spec using the format from extract_slice.cc example
-        std::cout << "[DEBUG] Creating TensorStore spec for path: " << zarr_path << std::endl;
         nlohmann::json spec_json = {
             {"driver", "zarr2"},
             {"kvstore", {
@@ -404,20 +354,16 @@ void CartaZarrImage::initializeTensorStore() {
                 {"path", zarr_path}
             }}
         };
-        std::cout << "[DEBUG] TensorStore spec JSON: " << spec_json.dump(2) << std::endl;
         
         auto spec_result = tensorstore::Spec::FromJson(spec_json);
         if (!spec_result.ok()) {
-            std::cout << "[DEBUG] ERROR: Failed to create TensorStore spec: " << spec_result.status().ToString() << std::endl;
             spdlog::error("Failed to create TensorStore spec for {}: {}", zarr_path, spec_result.status().ToString());
             return;
         }
-        std::cout << "[DEBUG] Successfully created TensorStore spec" << std::endl;
         
         auto input_spec = spec_result.value();
         
         // Open input tensorstore and resolve the bounds using the pattern from extract_slice.cc
-        std::cout << "[DEBUG] Attempting to open TensorStore..." << std::endl;
         auto open_future = tensorstore::Open(
             input_spec, 
             _context, 
@@ -427,39 +373,27 @@ void CartaZarrImage::initializeTensorStore() {
         
         auto open_result = open_future.result();
         if (!open_result.ok()) {
-            std::cout << "[DEBUG] ERROR: Failed to open TensorStore: " << open_result.status().ToString() << std::endl;
             spdlog::error("Failed to open TensorStore for {}: {}", _name, open_result.status().ToString());
             return;
         }
         
-        std::cout << "[DEBUG] Successfully opened TensorStore!" << std::endl;
         _tensorstore = std::move(open_result).value();
         _tensorstore_initialized = true;
         
         // Verify that the data type is float32 as expected
         auto ts_dtype = _tensorstore.dtype();
-        std::cout << "[DEBUG] TensorStore data type: " << ts_dtype.name() << std::endl;
         spdlog::info("TensorStore data type: {}", ts_dtype.name());
         
         // Check if data type is float32 (TensorStore uses "float32" as the name)
         if (ts_dtype.name() != "float32") {
-            std::cout << "[DEBUG] WARNING: TensorStore data type is not float32, got: " << ts_dtype.name() << std::endl;
             spdlog::warn("TensorStore data type is not float32, got: {}", ts_dtype.name());
         }
         
-        std::cout << "[DEBUG] TensorStore initialized successfully for: " << _name << std::endl;
         spdlog::info("Successfully initialized TensorStore for {}", _name);
         
         // Verify shape matches what we read from .zarray
         auto ts_domain = _tensorstore.domain();
         auto ts_shape = ts_domain.shape();
-        std::cout << "[DEBUG] TensorStore rank: " << ts_domain.rank() << std::endl;
-        std::cout << "[DEBUG] TensorStore shape: [";
-        for (size_t i = 0; i < ts_shape.size(); ++i) {
-            if (i > 0) std::cout << ", ";
-            std::cout << ts_shape[i];
-        }
-        std::cout << "]" << std::endl;
         
         // Keep TensorStore shape as original ZARR shape but maintain our reordered shape for CARTA
         std::vector<int> actual_shape_vec;
@@ -479,14 +413,12 @@ void CartaZarrImage::initializeTensorStore() {
                 reordered_shape.push_back(actual_shape_vec[1]); // frequency
                 reordered_shape.push_back(actual_shape_vec[2]); // polarization as stokes
                 _shape = IPosition(reordered_shape);
-                std::cout << "[DEBUG] TensorStore: Converted 5D to 4D CARTA shape: " << _shape.toString() << std::endl;
             } else {
                 _shape = _original_zarr_shape;
             }
         }
         _ndim = _shape.size();
         
-        std::cout << "[DEBUG] Updated image dimensions: " << _ndim << ", shape: " << _shape.toString() << std::endl;
         spdlog::info("Updated Zarr image shape from TensorStore: {}", _shape.toString());
         
         spdlog::info("TensorStore rank: {}", ts_domain.rank());
@@ -501,7 +433,6 @@ void CartaZarrImage::initializeTensorStore() {
                     }());
         
     } catch (std::exception& e) {
-        std::cout << "[DEBUG] Exception in initializeTensorStore: " << e.what() << std::endl;
         spdlog::error("Exception in initializeTensorStore for {}: {}", _name, e.what());
         _tensorstore_initialized = false;
     }
@@ -522,18 +453,108 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
     }
     
     try {
-        // Convert casacore Slicer to TensorStore transform
         const IPosition& start = section.start();
         const IPosition& length = section.length();
         const IPosition& stride = section.stride();
         
-        std::cout << "[DEBUG] doGetSlice: slice start=" << start.toString() 
-                  << ", length=" << length.toString() 
-                  << ", stride=" << stride.toString() << std::endl;
+        // Extract channel information for caching
+        int freq_index = (start.size() > 2) ? start[2] : 0;
+        int stokes_index = (start.size() > 3) ? start[3] : 0;
         
+        // Create a unique channel identifier combining freq and stokes
+        int current_channel = freq_index * 1000 + stokes_index;  // Assuming max 1000 stokes per freq
+        
+        // Decide caching strategy based on request size
+        int req_width = length[0];
+        int req_height = length[1];
+        int full_width = _shape[0];  // CARTA width
+        int full_height = _shape[1]; // CARTA height
+        
+        // Handle special cases for 1D slices (profiles) and single point requests
+        bool is_horizontal_profile = (req_height == 1);  // Horizontal line (y-profile)
+        bool is_vertical_profile = (req_width == 1);     // Vertical line (x-profile)
+        bool is_single_point = (req_width == 1 && req_height == 1); // Single pixel request
+        bool is_1d_profile = (is_horizontal_profile || is_vertical_profile) && !is_single_point;
+        
+        // Use region cache for small requests (e.g., z-profile regions, small tiles)
+        // For 1D profiles, always use full channel cache to avoid complexity
+        // For single point requests, use direct read to avoid loading entire channel
+        bool use_region_cache = !is_1d_profile && (req_width < full_width / 4 && req_height < full_height / 4);
+        bool use_direct_read = is_single_point;  // Skip all caching for single point requests
+        
+        spdlog::debug("CACHE STRATEGY DECISION:");
+        spdlog::debug("  Request size: {}x{}, Full size: {}x{}", req_width, req_height, full_width, full_height);
+        spdlog::debug("  1D Profile detected: {} (horizontal={}, vertical={})", is_1d_profile ? "YES" : "NO", is_horizontal_profile, is_vertical_profile);
+        spdlog::debug("  Single point request: {}", is_single_point ? "YES" : "NO");
+        spdlog::debug("  Use region cache: {}", use_region_cache ? "YES" : "NO");
+        spdlog::debug("  Use direct read: {}", use_direct_read ? "YES" : "NO");
+        spdlog::debug("  Current cache status: loaded={}, channel={}, is_full={}", _channel_cache_loaded, _cached_channel, _is_full_channel_cache);
+        spdlog::debug("  Target channel: {}", current_channel);
+        
+        // For single point requests, skip all caching and read directly from TensorStore
+        if (use_direct_read) {
+            spdlog::debug("SINGLE POINT OPTIMIZATION: Reading directly from TensorStore without caching");
+            return readDirectFromTensorStore(buffer, section);
+        }
+        
+        // Check if we need to load a different channel into cache or switch cache type
+        if (!_channel_cache_loaded || _cached_channel != current_channel || 
+            (use_region_cache && _is_full_channel_cache) ||     // Want region but have full
+            (!use_region_cache && !_is_full_channel_cache)) {   // Want full but have region
+            
+            if (use_region_cache) {
+                // For small requests, load only the required region with some padding
+                int padding = std::min(100, std::min(req_width, req_height));  // Add padding for future nearby requests
+                int region_start_x = std::max(0, static_cast<int>(start[0]) - padding);
+                int region_start_y = std::max(0, static_cast<int>(start[1]) - padding);
+                int region_width = std::min(full_width - region_start_x, req_width + 2 * padding);
+                int region_height = std::min(full_height - region_start_y, req_height + 2 * padding);
+                
+                spdlog::info("Loading region cache [freq={}, stokes={}]: {}x{} at ({},{}) with padding {}", 
+                            freq_index, stokes_index, region_width, region_height, region_start_x, region_start_y, padding);
+                
+                if (!loadRegionCache(freq_index, stokes_index, region_start_x, region_start_y, region_width, region_height)) {
+                    spdlog::warn("Failed to load region cache, trying full channel cache");
+                    use_region_cache = false;  // Fall back to full channel cache
+                }
+            }
+            
+            if (!use_region_cache) {
+                spdlog::info("Loading full channel [freq={}, stokes={}] into cache for faster access", freq_index, stokes_index);
+                if (!loadChannelCache(freq_index, stokes_index)) {
+                    spdlog::warn("Failed to load channel cache, falling back to direct read");
+                    // Fall through to direct read
+                } else {
+                    // Try to get slice from cache
+                    if (getSliceFromCache(buffer, section)) {
+                        return true;
+                    }
+                    // If cache extraction failed, fall through to direct read
+                }
+            } else {
+                // Try to get slice from region cache
+                if (getSliceFromCache(buffer, section)) {
+                    return true;
+                }
+                // If cache extraction failed, fall through to direct read
+            }
+        } else {
+            // Cache is already loaded for this channel, use it
+            if (getSliceFromCache(buffer, section)) {
+                return true;
+            }
+            // If cache extraction failed, fall through to direct read
+        }
+        
+        // Direct read from TensorStore (fallback or non-first-channel)
         // Map CARTA dimensions back to original ZARR dimensions for 5D case
         IPosition zarr_start = start;
         IPosition zarr_length = length;
+        
+        spdlog::debug("COORDINATE MAPPING DEBUG:");
+        spdlog::debug("  Original CARTA request: start={}, length={}", start.toString(), length.toString());
+        spdlog::debug("  CARTA shape: {}", _shape.toString());
+        spdlog::debug("  ZARR original shape: {}", _original_zarr_shape.toString());
         
         if (_original_zarr_shape.size() == 5 && start.size() >= 2) {
             // CARTA 4D format: [l, m, freq, pol] = [x, y, freq, stokes]
@@ -541,30 +562,27 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             zarr_start.resize(5);
             zarr_length.resize(5);
             
-            // Read only the requested region from ZARR, one row at a time if needed
-            std::cout << "[DEBUG] Reading requested region directly from ZARR" << std::endl;
+            // Use actual channel indices from the request
+            int freq_index = (start.size() > 2) ? start[2] : 0;
+            int stokes_index = (start.size() > 3) ? start[3] : 0;
             
             zarr_start[0] = 0;                                      // ZARR[0]=time (always 0)
-            zarr_start[1] = 0;                                      // ZARR[1]=freq (forced to first channel)
-            zarr_start[2] = 0;                                      // ZARR[2]=pol (forced to first channel)
+            zarr_start[1] = freq_index;                             // ZARR[1]=freq (actual requested frequency)
+            zarr_start[2] = stokes_index;                           // ZARR[2]=pol (actual requested stokes)
             zarr_start[3] = start[0];                               // ZARR[3]=l (exact x start)
             zarr_start[4] = start[1];                               // ZARR[4]=m (exact y start)
             
             zarr_length[0] = 1;                                     // ZARR[0]=time (always 1)
-            zarr_length[1] = 1;                                     // ZARR[1]=freq (forced to 1 for first channel only)
-            zarr_length[2] = 1;                                     // ZARR[2]=pol (forced to 1 for first channel only)
+            zarr_length[1] = 1;                                     // ZARR[1]=freq (single frequency)
+            zarr_length[2] = 1;                                     // ZARR[2]=pol (single polarization)
             zarr_length[3] = length[0];                             // ZARR[3]=l (exact width requested)
             zarr_length[4] = length[1];                             // ZARR[4]=m (exact height requested)
             
-            std::cout << "[DEBUG] CARTA 4D request: [x=" << start[0] << ":" << (start[0] + length[0] - 1) 
-                      << ", y=" << start[1] << ":" << (start[1] + length[1] - 1)
-                      << ", freq=" << (start.size() > 2 ? start[2] : 0) << ":" << (start.size() > 2 ? start[2] + length[2] - 1 : 0)
-                      << ", stokes=" << (start.size() > 3 ? start[3] : 0) << ":" << (start.size() > 3 ? start[3] + length[3] - 1 : 0) << "]" << std::endl;
-            std::cout << "[DEBUG] Reading ZARR 5D: [time=" << zarr_start[0] << ":" << (zarr_start[0] + zarr_length[0] - 1)
-                      << ", freq=" << zarr_start[1] << ":" << (zarr_start[1] + zarr_length[1] - 1)
-                      << ", pol=" << zarr_start[2] << ":" << (zarr_start[2] + zarr_length[2] - 1)
-                      << ", l=" << zarr_start[3] << ":" << (zarr_start[3] + zarr_length[3] - 1)
-                      << ", m=" << zarr_start[4] << ":" << (zarr_start[4] + zarr_length[4] - 1) << "]" << std::endl;
+            spdlog::debug("  Mapped to ZARR 5D: start={}, length={}", zarr_start.toString(), zarr_length.toString());
+            spdlog::debug("  ZARR coordinate check: time={}, freq={}, pol={}, l=[{},{}), m=[{},{})", 
+                         zarr_start[0], zarr_start[1], zarr_start[2], 
+                         zarr_start[3], zarr_start[3] + zarr_length[3],
+                         zarr_start[4], zarr_start[4] + zarr_length[4]);
         }
         
         // Create a Box for slicing all dimensions at once
@@ -577,7 +595,6 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         }
         
         tensorstore::Box<> slice_box(box_origin, box_shape);
-        std::cout << "[DEBUG] Created slice box with " << slice_box.rank() << " dimensions" << std::endl;
         
         // Apply the box slice to the TensorStore
         auto constrained_store = _tensorstore | tensorstore::AllDims().BoxSlice(slice_box);
@@ -593,13 +610,7 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             return false;
         }
         
-        auto zarr_array = std::move(read_result.value());
-        printf("[DEBUG] Read TensorStore array with shape: [");
-        for (size_t i = 0; i < zarr_array.rank(); ++i) {
-            if (i > 0) printf(", ");
-            printf("%lld", zarr_array.shape()[i]);
-        }
-        printf("]\n");        
+        auto zarr_array = std::move(read_result.value());        
         
         // Convert TensorStore array to casacore Array with correct shape
         IPosition buffer_shape = length;
@@ -619,18 +630,7 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         size_t num_elements = buffer.nelements();
         
         // Since we now read exactly the requested region, we can copy directly
-        if (_original_zarr_shape.size() == 5) {
-            // Direct copy since we read exactly what was requested
-            std::copy(src_data, src_data + num_elements, dest_data);
-            
-            size_t req_width = length[0];
-            size_t req_height = length[1];
-            std::cout << "[DEBUG] Direct copy of " << num_elements << " elements (" << req_width << "x" << req_height << ") - exact region read" << std::endl;
-        } else {
-            // Fallback: direct copy for non-5D cases
-            std::copy(src_data, src_data + num_elements, dest_data);
-            std::cout << "[DEBUG] Copied " << num_elements << " elements directly (non-5D case)" << std::endl;
-        }
+        std::copy(src_data, src_data + num_elements, dest_data);
         
         spdlog::debug("Successfully read {} elements from Zarr file (dtype: {})", num_elements, zarr_dtype.name());
         return true;
@@ -724,6 +724,677 @@ ImageInterface<float>* CartaZarrImage::cloneII() const {
 
 const CoordinateSystem& CartaZarrImage::coordinates() const {
     return _coord_sys;
+}
+
+bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
+    if (!_tensorstore_initialized) {
+        spdlog::error("TensorStore not initialized for channel cache loading");
+        return false;
+    }
+    
+    try {
+        // For 5D ZARR, load the entire specified channel [time=0, freq=freq_channel, pol=stokes_channel, l=all, m=all]
+        if (_original_zarr_shape.size() == 5) {
+            _cache_width = _original_zarr_shape[3];   // l dimension (width)
+            _cache_height = _original_zarr_shape[4];  // m dimension (height)
+            
+            spdlog::info("Cache dimensions from ZARR shape: width={}, height={}", _cache_width, _cache_height);
+            spdlog::info("CARTA shape: [{}, {}]", _shape[0], _shape[1]);
+            spdlog::info("ZARR original shape: [{}]", fmt::join(_original_zarr_shape, ", "));
+            
+            // Create box for entire channel
+            std::vector<tensorstore::Index> box_origin = {0, freq_channel, stokes_channel, 0, 0};
+            std::vector<tensorstore::Index> box_shape = {1, 1, 1, _cache_width, _cache_height};
+            
+            spdlog::debug("CACHE LOADING COORDINATES:");
+            spdlog::debug("  ZARR 5D cache box: origin=[{},{},{},{},{}], shape=[{},{},{},{},{}]", 
+                         box_origin[0], box_origin[1], box_origin[2], box_origin[3], box_origin[4],
+                         box_shape[0], box_shape[1], box_shape[2], box_shape[3], box_shape[4]);
+            spdlog::debug("  This reads: time={}, freq={}, pol={}, l=[0,{}), m=[0,{})", 
+                         freq_channel, freq_channel, stokes_channel, _cache_width, _cache_height);
+            
+            tensorstore::Box<> cache_box(box_origin, box_shape);
+            
+            // Apply the box slice to the TensorStore
+            auto constrained_store = _tensorstore | tensorstore::AllDims().BoxSlice(cache_box);
+            if (!constrained_store.ok()) {
+                spdlog::error("Failed to create cache slice: {}", constrained_store.status().ToString());
+                return false;
+            }
+            
+            // Read entire channel data
+            auto read_result = tensorstore::Read<tensorstore::zero_origin>(constrained_store.value()).result();
+            if (!read_result.ok()) {
+                spdlog::error("Failed to read channel cache: {}", read_result.status().ToString());
+                return false;
+            }
+            
+            auto zarr_array = std::move(read_result.value());
+            
+            // Verify data type
+            if (zarr_array.dtype().name() != "float32") {
+                spdlog::error("Unexpected data type in cache: {}", zarr_array.dtype().name());
+                return false;
+            }
+            
+            // Copy data to cache
+            size_t total_elements = _cache_width * _cache_height;
+            _channel_cache.resize(total_elements);
+            
+            const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
+            std::copy(src_data, src_data + total_elements, _channel_cache.data());
+            
+            // Store the cached channel identifier
+            _cached_channel = freq_channel * 1000 + stokes_channel;
+            _cache_start_x = 0;  // Full channel cache starts at origin
+            _cache_start_y = 0;
+            _channel_cache_loaded = true;
+            _is_full_channel_cache = true;  // This is a full channel cache
+            
+            spdlog::info("Loaded channel [freq={}, stokes={}] cache: {}x{} pixels ({} MB)", 
+                        freq_channel, stokes_channel, _cache_width, _cache_height, 
+                        (total_elements * sizeof(float)) / (1024 * 1024));
+            
+            // DEBUG: Check TensorStore data layout and verify expected NaN boundaries
+            spdlog::debug("TENSORSTORE DATA LAYOUT DEBUG:");
+            spdlog::debug("  TensorStore array shape: {}", zarr_array.shape().size());
+            for (size_t i = 0; i < zarr_array.shape().size(); ++i) {
+                spdlog::debug("    Dimension {}: {}", i, zarr_array.shape()[i]);
+            }
+            
+            // Check first few and expected boundary rows specifically 
+            std::vector<int> test_rows = {0, 1, 2, 183, 184, 249, 250, 251, 252, 253};
+            for (int row : test_rows) {
+                if (row >= _cache_height) continue;
+                
+                // Sample a few columns in this row
+                std::vector<int> sample_cols = {100, 1000, 3000, 5000, 7000};
+                int nan_count = 0, finite_count = 0;
+                
+                for (int col : sample_cols) {
+                    if (col >= _cache_width) continue;
+                    
+                    size_t cache_idx = row * _cache_width + col;
+                    if (cache_idx < _channel_cache.size()) {
+                        float val = _channel_cache[cache_idx];
+                        if (std::isnan(val)) {
+                            nan_count++;
+                        } else if (std::isfinite(val)) {
+                            finite_count++;
+                        }
+                    }
+                }
+                
+                spdlog::debug("  Row {}: {}/{} NaN, {}/{} finite (expected: row<250 should be NaN)", 
+                             row, nan_count, sample_cols.size(), finite_count, sample_cols.size());
+            }
+            
+            // Sample a few key positions to understand data layout
+            spdlog::debug("CACHE DATA SAMPLING:");
+            for (int y = 0; y < std::min(5, _cache_height); y++) {
+                int x = 0;
+                int idx = y * _cache_width + x;
+                float val = _channel_cache[idx];
+                spdlog::debug("  row={}, col={}, idx={}, value={}, isNaN={}", y, x, idx, val, std::isnan(val));
+            }
+            
+            // Precise boundary analysis based on image data
+            if (_cache_height > 250) {
+                spdlog::debug("PRECISE BOUNDARY ANALYSIS:");
+                
+                // Sample multiple columns to get accurate boundary
+                std::vector<int> sample_columns = {100, 200, 500, 1000, 2000, 3000, 4000, 5000, 6000, 7000};
+                int consensus_first_row = -1;
+                int consensus_last_row = -1;
+                
+                // Check each sample column
+                for (int col : sample_columns) {
+                    if (col >= _cache_width) continue;
+                    
+                    int col_first_row = -1;
+                    int col_last_row = -1;
+                    
+                    for (int y = 0; y < _cache_height; y++) {
+                        int idx = y * _cache_width + col;
+                        float val = _channel_cache[idx];
+                        if (!std::isnan(val) && std::isfinite(val)) {
+                            if (col_first_row == -1) col_first_row = y;
+                            col_last_row = y;
+                        }
+                    }
+                    
+                    spdlog::debug("  Column {}: first_row={}, last_row={}", col, col_first_row, col_last_row);
+                    
+                    // Update consensus (use most restrictive bounds)
+                    if (col_first_row >= 0) {
+                        if (consensus_first_row == -1 || col_first_row < consensus_first_row) {
+                            consensus_first_row = col_first_row;
+                        }
+                    }
+                    if (col_last_row >= 0) {
+                        if (consensus_last_row == -1 || col_last_row > consensus_last_row) {
+                            consensus_last_row = col_last_row;
+                        }
+                    }
+                }
+                
+                // Additional detailed analysis around discovered boundaries
+                if (consensus_first_row >= 0) {
+                    spdlog::debug("DETAILED BOUNDARY EXAMINATION:");
+                    int check_start = std::max(0, consensus_first_row - 5);
+                    int check_end = std::min(_cache_height - 1, consensus_first_row + 5);
+                    
+                    for (int y = check_start; y <= check_end; y++) {
+                        // Count valid pixels in this row
+                        int valid_pixels = 0;
+                        int total_pixels = 0;
+                        for (int x = 0; x < _cache_width; x += 100) { // Sample every 100 pixels
+                            int idx = y * _cache_width + x;
+                            float val = _channel_cache[idx];
+                            if (!std::isnan(val) && std::isfinite(val)) {
+                                valid_pixels++;
+                            }
+                            total_pixels++;
+                        }
+                        float valid_ratio = (float)valid_pixels / total_pixels;
+                        spdlog::debug("    Row {}: {}/{} valid pixels ({:.1f}%)", 
+                                     y, valid_pixels, total_pixels, valid_ratio * 100);
+                    }
+                }
+                
+                spdlog::info("FINAL BOUNDARY ANALYSIS:");
+                spdlog::info("  Consensus first data row: {}", consensus_first_row);
+                spdlog::info("  Consensus last data row: {}", consensus_last_row);
+                spdlog::info("  Total data rows: {}", (consensus_first_row >= 0 && consensus_last_row >= 0) ? (consensus_last_row - consensus_first_row + 1) : 0);
+                spdlog::info("  NaN header rows: {}", consensus_first_row >= 0 ? consensus_first_row : _cache_height);
+                spdlog::info("  NaN footer rows: {}", consensus_last_row >= 0 ? (_cache_height - consensus_last_row - 1) : 0);
+                spdlog::info("  Data coverage: {:.1f}% of image height", 
+                            consensus_first_row >= 0 && consensus_last_row >= 0 ? 
+                            ((float)(consensus_last_row - consensus_first_row + 1) / _cache_height * 100) : 0.0);
+            }
+            
+            return true;
+        } else {
+            // For non-5D arrays, load the entire 2D image (ignore freq/stokes parameters)
+            _cache_width = _shape[0];
+            _cache_height = _shape[1];
+            
+            // Create box for entire image
+            std::vector<tensorstore::Index> box_origin(_original_zarr_shape.size(), 0);
+            std::vector<tensorstore::Index> box_shape;
+            for (size_t i = 0; i < _original_zarr_shape.size(); ++i) {
+                box_shape.push_back(_original_zarr_shape[i]);
+            }
+            
+            tensorstore::Box<> cache_box(box_origin, box_shape);
+            
+            auto constrained_store = _tensorstore | tensorstore::AllDims().BoxSlice(cache_box);
+            if (!constrained_store.ok()) {
+                spdlog::error("Failed to create cache slice: {}", constrained_store.status().ToString());
+                return false;
+            }
+            
+            auto read_result = tensorstore::Read<tensorstore::zero_origin>(constrained_store.value()).result();
+            if (!read_result.ok()) {
+                spdlog::error("Failed to read channel cache: {}", read_result.status().ToString());
+                return false;
+            }
+            
+            auto zarr_array = std::move(read_result.value());
+            
+            // Debug: Check array properties
+            spdlog::debug("ZARR array dtype: {}", zarr_array.dtype().name());
+            spdlog::debug("ZARR array shape: [{}]", fmt::join(zarr_array.shape(), ", "));
+            
+            size_t total_elements = _cache_width * _cache_height;
+            _channel_cache.resize(total_elements);
+            
+            // Check if data type is float32
+            if (zarr_array.dtype() != tensorstore::dtype_v<float>) {
+                spdlog::error("ZARR array dtype is not float32: {}", zarr_array.dtype().name());
+                return false;
+            }
+            
+            const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
+            
+            // Debug: Check first few values
+            spdlog::debug("First 5 ZARR values: [{}, {}, {}, {}, {}]", 
+                         src_data[0], src_data[1], src_data[2], src_data[3], src_data[4]);
+            
+            std::copy(src_data, src_data + total_elements, _channel_cache.data());
+            
+            // Debug: Check first few cached values
+            spdlog::debug("First 5 cached values: [{}, {}, {}, {}, {}]", 
+                         _channel_cache[0], _channel_cache[1], _channel_cache[2], _channel_cache[3], _channel_cache[4]);
+            
+            _cached_channel = freq_channel * 1000 + stokes_channel;
+            _channel_cache_loaded = true;
+            
+            spdlog::info("Loaded image cache: {}x{} pixels", _cache_width, _cache_height);
+            return true;
+        }
+        
+    } catch (std::exception& e) {
+        spdlog::error("Exception loading channel cache: {}", e.what());
+        return false;
+    }
+}
+
+bool CartaZarrImage::getSliceFromCache(casacore::Array<float>& buffer, const casacore::Slicer& section) {
+    if (!_channel_cache_loaded) {
+        return false;
+    }
+    
+    try {
+        const IPosition& start = section.start();
+        const IPosition& length = section.length();
+        
+        // Extract region parameters
+        int start_x = start[0];  // CARTA x = ZARR l dimension
+        int start_y = start[1];  // CARTA y = ZARR m dimension  
+        int req_width = length[0];   // Requested slice width
+        int req_height = length[1];
+        
+        // ENHANCED PARAMETER VALIDATION
+        if (req_width <= 0 || req_height <= 0) {
+            spdlog::error("Invalid request dimensions: width={}, height={}", req_width, req_height);
+            return false;
+        }
+        
+        if (_cache_width <= 0 || _cache_height <= 0) {
+            spdlog::error("Invalid cache dimensions: width={}, height={}", _cache_width, _cache_height);
+            return false;
+        }
+        
+        if (_channel_cache.empty()) {
+            spdlog::error("Cache is empty but marked as loaded");
+            return false;
+        }
+        
+        spdlog::debug("CACHE SLICE REQUEST:");
+        spdlog::debug("  Request: start_x={}, start_y={}, width={}, height={}", start_x, start_y, req_width, req_height);
+        spdlog::debug("  Cache size: {} elements, expected: {}", _channel_cache.size(), _cache_width * _cache_height);
+        
+        // Handle region cache vs full channel cache differently
+        if (_is_full_channel_cache) {
+            spdlog::debug("  Using full channel cache: {}x{}", _cache_width, _cache_height);
+        } else {
+            spdlog::debug("  Using region cache: {}x{} at ({},{}) in full image", _cache_width, _cache_height, _cache_start_x, _cache_start_y);
+            
+            // For region cache, adjust coordinates relative to cached region
+            start_x -= _cache_start_x;
+            start_y -= _cache_start_y;
+            
+            spdlog::debug("  Adjusted coordinates for region cache: start_x={}, start_y={}", start_x, start_y);
+            
+            // Check if request is completely outside region cache bounds
+            if (start_x >= _cache_width || start_y >= _cache_height || 
+                start_x + req_width <= 0 || start_y + req_height <= 0) {
+                spdlog::debug("  Request completely outside region cache bounds");
+                return false;  // Request is outside our cached region
+            }
+        }
+        
+        spdlog::debug("  Request end coordinates: end_x={}, end_y={}", start_x + req_width - 1, start_y + req_height - 1);
+        
+        // Calculate downsampling parameters
+        int full_width = _cache_width;
+        float downsample_factor = (float)full_width / req_width;
+        
+        spdlog::debug("DOWNSAMPLING PARAMETERS:");
+        spdlog::debug("  Full width: {}, Requested width: {}", full_width, req_width);
+        spdlog::debug("  Downsample factor: {:.2f}", downsample_factor);
+        spdlog::debug("  Pixels per bin: {:.2f}", downsample_factor);
+        
+        // Check if this is a problematic area - updated based on actual discovered data boundaries
+        if (start_y <= 200 && start_y + req_height > 180) {
+            spdlog::debug("  *** TRANSITION AREA: Request spans rows {}-{} which includes data transition around row 183 ***", 
+                         start_y, start_y + req_height - 1);
+        }
+        if (start_y < 183) {
+            spdlog::debug("  Header region: Request starts before row 183 (expected NaN area)");
+        }
+        if (start_y >= 183) {
+            spdlog::debug("  Data region: Request starts at/after row 183 (actual data area)");
+        }
+        
+        spdlog::debug("Boundary check: start_x={} vs cache_width={}, start_y={} vs cache_height={}", 
+                     start_x, _cache_width, start_y, _cache_height);
+        
+        // Check if request is completely outside cache bounds
+        if (start_y >= _cache_height || start_y + req_height <= 0) {
+            spdlog::warn("Cache slice completely outside bounds vertically: start_y={}, height={}, cache_height={}", 
+                        start_y, req_height, _cache_height);
+            return false;
+        }
+        
+        // Calculate valid intersection with cache bounds (vertical only, we'll handle horizontal downsampling)
+        int cache_start_y = std::max(0, start_y);
+        int cache_end_y = std::min(_cache_height, start_y + req_height);
+        int valid_height = cache_end_y - cache_start_y;
+        
+        if (valid_height <= 0) {
+            spdlog::warn("No valid intersection with cache bounds");
+            return false;
+        }
+        
+        spdlog::debug("Valid cache region: start_y={}, height={}", cache_start_y, valid_height);
+        
+        // Resize output buffer
+        buffer.resize(length);
+        float* dest_data = buffer.data();
+        
+        // Initialize entire buffer with NaN for out-of-bounds regions
+        std::fill(dest_data, dest_data + (req_width * req_height), std::numeric_limits<float>::quiet_NaN());
+        
+        // Process each row with downsampling
+        for (int y = 0; y < req_height; ++y) {
+            int src_y = start_y + y;
+            if (src_y < 0 || src_y >= _cache_height) continue; // Skip out-of-bounds rows
+            
+            // For each output column, calculate average from corresponding input pixels
+            for (int out_x = 0; out_x < req_width; ++out_x) {
+                // Calculate the range of source pixels for this output pixel
+                float src_x_start = out_x * downsample_factor;
+                float src_x_end = (out_x + 1) * downsample_factor;
+                
+                int src_x_start_int = (int)std::floor(src_x_start);
+                int src_x_end_int = (int)std::ceil(src_x_end);
+                
+                // Clamp to valid range
+                src_x_start_int = std::max(0, src_x_start_int);
+                src_x_end_int = std::min(full_width, src_x_end_int);
+                
+                float sum = 0.0f;
+                float weight_sum = 0.0f;
+                int valid_pixels = 0;
+                
+                // Average pixels in the range
+                for (int src_x = src_x_start_int; src_x < src_x_end_int; ++src_x) {
+                    // Additional safety check: ensure src_x is within cache width bounds
+                    if (src_x < 0 || src_x >= _cache_width) {
+                        spdlog::warn("src_x {} out of bounds [0, {})", src_x, _cache_width);
+                        continue;
+                    }
+                    
+                    // Calculate weight for this pixel based on overlap
+                    float weight = 1.0f;
+                    if (src_x == src_x_start_int && src_x_start > src_x) {
+                        weight = 1.0f - (src_x_start - src_x);
+                    }
+                    if (src_x == src_x_end_int - 1 && src_x_end < src_x + 1) {
+                        weight = src_x_end - src_x;
+                    }
+                    
+                    // CORRECTED: Based on actual testing, ZARR data layout requires column-major indexing
+                    // For ZARR [time, freq, pol, l, m], the cache indexing follows ZARR's internal layout
+                    // So: cache_idx = x * height + y (column-major order)
+                    size_t cache_idx = src_x * _cache_height + src_y;
+                    
+                    // Enhanced boundary validation
+                    if (cache_idx >= _channel_cache.size()) {
+                        spdlog::error("BOUNDARY VIOLATION: cache_idx {} >= cache_size {}, src_x={}, src_y={}, cache_width={}, cache_height={}", 
+                                     cache_idx, _channel_cache.size(), src_x, src_y, _cache_width, _cache_height);
+                        continue;
+                    }
+                    
+                    float val = _channel_cache[cache_idx];
+                    if (!std::isnan(val) && std::isfinite(val)) {
+                        sum += val * weight;
+                        weight_sum += weight;
+                        valid_pixels++;
+                    }
+                }
+                
+                size_t dest_idx = y * req_width + out_x;
+                
+                // Enhanced boundary validation for destination buffer
+                size_t buffer_size = req_width * req_height;
+                if (dest_idx >= buffer_size) {
+                    spdlog::error("DEST BUFFER OVERFLOW: dest_idx {} >= buffer_size {}, y={}, out_x={}, req_width={}, req_height={}", 
+                                 dest_idx, buffer_size, y, out_x, req_width, req_height);
+                    continue;
+                }
+                
+                // Set output value
+                if (weight_sum > 0.0f && valid_pixels > 0) {
+                    dest_data[dest_idx] = sum / weight_sum;
+                } else {
+                    dest_data[dest_idx] = std::numeric_limits<float>::quiet_NaN();
+                }
+            }
+        }
+        
+        // Debug: Check extracted data
+        if (req_width > 0 && req_height > 0) {
+            size_t valid_count = 0;
+            size_t nan_count = 0;
+            for (int i = 0; i < req_width * req_height; ++i) {
+                if (std::isnan(dest_data[i])) {
+                    nan_count++;
+                } else {
+                    valid_count++;
+                }
+            }
+            spdlog::debug("Downsampled data: {} valid, {} NaN pixels (factor: {:.2f})", 
+                         valid_count, nan_count, downsample_factor);
+            
+            // Special debug check for downsampled matrices
+            if (req_width > 100) {  // Only for significant width requests
+                bool first_is_nan = std::isnan(dest_data[0]);
+                bool last_is_nan = std::isnan(dest_data[req_width - 1]);
+                
+                spdlog::debug("Downsampled matrix debug: first_pixel={}, last_pixel={}", 
+                             first_is_nan ? "NaN" : std::to_string(dest_data[0]),
+                             last_is_nan ? "NaN" : std::to_string(dest_data[req_width - 1]));
+                
+                // Additional check for row position and data transition
+                spdlog::debug("Row position: y={} out of {} total rows (0-indexed)", start_y, _cache_height);
+                if (start_y >= _cache_height - 10) {
+                    spdlog::debug("→ This is near the bottom edge, NaN values are expected");
+                } else if (start_y < 183) {  // Actual data transition boundary discovered
+                    if (valid_count > 0) {
+                        spdlog::info("✓ DATA TRANSITION: Row {} has {} valid pixels - data region starting!", 
+                                    start_y, valid_count);
+                    } else {
+                        spdlog::debug("→ Row {} in header region, all NaN expected", start_y);
+                    }
+                } else {
+                    spdlog::debug("→ Row {} in main data region, expecting valid pixels", start_y);
+                    if (valid_count == 0) {
+                        spdlog::warn("Unexpected: Row {} in data region has no valid pixels", start_y);
+                    }
+                }
+                
+                // Show sample values for rows with mixed data
+                if (valid_count > 0 && nan_count > 0) {
+                    spdlog::debug("Mixed data row - showing first few valid values:");
+                    int shown = 0;
+                    for (int i = 0; i < req_width && shown < 5; ++i) {
+                        if (!std::isnan(dest_data[i])) {
+                            spdlog::debug("  pixel[{}] = {}", i, dest_data[i]);
+                            shown++;
+                        }
+                    }
+                }
+            }
+        }
+        
+        return true;
+        
+    } catch (std::exception& e) {
+        spdlog::error("Exception extracting slice from cache: {}", e.what());
+        return false;
+    }
+}
+
+bool CartaZarrImage::loadRegionCache(int freq_channel, int stokes_channel, int start_x, int start_y, int width, int height) {
+    if (!_tensorstore_initialized) {
+        spdlog::error("TensorStore not initialized for region cache loading");
+        return false;
+    }
+    
+    // Safety checks for region dimensions
+    if (width <= 0 || height <= 0) {
+        spdlog::error("Invalid region dimensions: {}x{} at ({},{})", width, height, start_x, start_y);
+        return false;
+    }
+    
+    try {
+        // For 5D ZARR, load only the specified region [time=0, freq=freq_channel, pol=stokes_channel, l=start_x:end_x, m=start_y:end_y]
+        if (_original_zarr_shape.size() == 5) {
+            // Clamp region to valid bounds
+            int max_width = _original_zarr_shape[3];   // l dimension (width)
+            int max_height = _original_zarr_shape[4];  // m dimension (height)
+            
+            start_x = std::max(0, std::min(start_x, max_width - 1));
+            start_y = std::max(0, std::min(start_y, max_height - 1));
+            width = std::min(width, max_width - start_x);
+            height = std::min(height, max_height - start_y);
+            
+            if (width <= 0 || height <= 0) {
+                spdlog::warn("Invalid region dimensions: {}x{} at ({},{})", width, height, start_x, start_y);
+                return false;
+            }
+            
+            spdlog::info("Loading region cache [freq={}, stokes={}]: {}x{} region at ({},{}) from full {}x{}", 
+                        freq_channel, stokes_channel, width, height, start_x, start_y, max_width, max_height);
+            
+            // Create box for specific region
+            std::vector<tensorstore::Index> box_origin = {0, freq_channel, stokes_channel, start_x, start_y};
+            std::vector<tensorstore::Index> box_shape = {1, 1, 1, width, height};
+            
+            spdlog::debug("REGION CACHE LOADING COORDINATES:");
+            spdlog::debug("  ZARR 5D region box: origin=[{},{},{},{},{}], shape=[{},{},{},{},{}]", 
+                         box_origin[0], box_origin[1], box_origin[2], box_origin[3], box_origin[4],
+                         box_shape[0], box_shape[1], box_shape[2], box_shape[3], box_shape[4]);
+            
+            tensorstore::Box<> cache_box(box_origin, box_shape);
+            
+            // Apply the box slice to the TensorStore
+            auto constrained_store = _tensorstore | tensorstore::AllDims().BoxSlice(cache_box);
+            if (!constrained_store.ok()) {
+                spdlog::error("Failed to create region cache slice: {}", constrained_store.status().ToString());
+                return false;
+            }
+            
+            // Read region data
+            auto read_result = tensorstore::Read<tensorstore::zero_origin>(constrained_store.value()).result();
+            if (!read_result.ok()) {
+                spdlog::error("Failed to read region cache: {}", read_result.status().ToString());
+                return false;
+            }
+            
+            auto zarr_array = std::move(read_result.value());
+            
+            // Verify data type
+            if (zarr_array.dtype().name() != "float32") {
+                spdlog::error("Unexpected data type in region cache: {}", zarr_array.dtype().name());
+                return false;
+            }
+            
+            // Copy data to cache
+            size_t total_elements = width * height;
+            _channel_cache.resize(total_elements);
+            
+            const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
+            std::copy(src_data, src_data + total_elements, _channel_cache.data());
+            
+            // Store the cached region information
+            _cached_channel = freq_channel * 1000 + stokes_channel;
+            _cache_width = width;
+            _cache_height = height;
+            _cache_start_x = start_x;
+            _cache_start_y = start_y;
+            _channel_cache_loaded = true;
+            _is_full_channel_cache = false;  // This is a region cache, not full channel
+            
+            spdlog::info("Loaded region [freq={}, stokes={}] cache: {}x{} pixels at ({},{}) ({} KB)", 
+                        freq_channel, stokes_channel, width, height, start_x, start_y,
+                        (total_elements * sizeof(float)) / 1024);
+            
+            return true;
+        }
+        
+        spdlog::warn("Region cache only supported for 5D ZARR files");
+        return false;
+        
+    } catch (std::exception& e) {
+        spdlog::error("Exception in loadRegionCache: {}", e.what());
+        return false;
+    }
+}
+
+Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slicer& section) {
+    try {
+        const IPosition& start = section.start();
+        const IPosition& length = section.length();
+        
+        // Convert CARTA coordinates to ZARR coordinates  
+        // CARTA: [x, y, freq, stokes] -> ZARR: [time, freq, pol, l, m]
+        size_t x = start[0];
+        size_t y = start[1];
+        size_t freq_index = (start.size() > 2) ? start[2] : 0;
+        size_t stokes_index = (start.size() > 3) ? start[3] : 0;
+        
+        // Create ZARR 5D coordinates
+        std::vector<tensorstore::Index> box_origin(5);
+        box_origin[0] = 0;           // time = 0
+        box_origin[1] = freq_index;  // frequency
+        box_origin[2] = stokes_index; // polarization  
+        box_origin[3] = x;           // l (spatial x)
+        box_origin[4] = y;           // m (spatial y)
+        
+        std::vector<tensorstore::Index> box_shape(5);
+        box_shape[0] = 1;  // time = 1
+        box_shape[1] = 1;  // freq = 1
+        box_shape[2] = 1;  // pol = 1
+        box_shape[3] = length[0];  // l length
+        box_shape[4] = length[1];  // m length
+        
+        spdlog::debug("DIRECT READ: TensorStore slice [time={}, freq={}, pol={}, l={}:{}, m={}:{}]",
+                     box_origin[0], box_origin[1], box_origin[2], 
+                     box_origin[3], box_origin[3] + box_shape[3] - 1,
+                     box_origin[4], box_origin[4] + box_shape[4] - 1);
+        
+        tensorstore::Box<> cache_box(box_origin, box_shape);
+        
+        // Apply the box slice to the TensorStore
+        auto constrained_store = _tensorstore | tensorstore::AllDims().BoxSlice(cache_box);
+        if (!constrained_store.ok()) {
+            spdlog::error("Failed to create direct read slice: {}", constrained_store.status().ToString());
+            return false;
+        }
+        
+        // Read data directly
+        auto read_result = tensorstore::Read<tensorstore::zero_origin>(constrained_store.value()).result();
+        if (!read_result.ok()) {
+            spdlog::error("Failed to read direct data: {}", read_result.status().ToString());
+            return false;
+        }
+        
+        auto zarr_array = std::move(read_result.value());
+        
+        // Verify data type
+        if (zarr_array.dtype().name() != "float32") {
+            spdlog::error("Unexpected data type in direct read: {}", zarr_array.dtype().name());
+            return false;
+        }
+        
+        // Copy data to output buffer
+        size_t total_elements = length[0] * length[1];
+        buffer.resize(length);
+        
+        const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
+        std::copy(src_data, src_data + total_elements, buffer.data());
+        
+        spdlog::debug("DIRECT READ: Successfully read {} elements for single point", total_elements);
+        return true;
+        
+    } catch (std::exception& e) {
+        spdlog::error("Exception in readDirectFromTensorStore: {}", e.what());
+        return false;
+    }
 }
 
 } // namespace carta

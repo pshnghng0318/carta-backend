@@ -72,10 +72,26 @@ private:
     tensorstore::TensorStore<> _tensorstore;  // Use default template parameters
     bool _tensorstore_initialized = false;
     
+    // Channel cache for fast access - now supports region-based caching
+    std::vector<float> _channel_cache;     // Cached data for current region
+    bool _channel_cache_loaded = false;    // Whether cache is loaded
+    int _cached_channel = 0;               // Which channel is cached (default: first channel)
+    int _cache_width = 0;                  // Width of cached data
+    int _cache_height = 0;                 // Height of cached data
+    int _cache_start_x = 0;                // Start X coordinate of cached region
+    int _cache_start_y = 0;                // Start Y coordinate of cached region
+    bool _is_full_channel_cache = false;   // Whether cache contains full channel or just a region
+    
     void setupCoordinateSystem();
     bool parseWCSFromZattrs(const nlohmann::json& zattrs);
     void createMinimalCoordinateSystem();
     void initializeTensorStore();
+    
+    // Channel cache methods - now support region-based caching
+    bool loadChannelCache(int freq_channel = 0, int stokes_channel = 0);
+    bool loadRegionCache(int freq_channel, int stokes_channel, int start_x, int start_y, int width, int height);
+    casacore::Bool readDirectFromTensorStore(casacore::Array<float>& buffer, const casacore::Slicer& section);
+    bool getSliceFromCache(casacore::Array<float>& buffer, const casacore::Slicer& section);
 };
 
 } // namespace carta
