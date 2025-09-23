@@ -1330,29 +1330,83 @@ Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slice
         const IPosition& start = section.start();
         const IPosition& length = section.length();
         
-        // Convert CARTA coordinates to ZARR coordinates  
-        // CARTA: [x, y, freq, stokes] -> ZARR: [time, freq, pol, l, m]
-        size_t x = start[0];
-        size_t y = start[1];
-        size_t freq_index = (start.size() > 2) ? start[2] : 0;
-        size_t stokes_index = (start.size() > 3) ? start[3] : 0;
+        // CRITICAL FIX: Handle coordinate mapping based on actual section dimensions
+        // The issue is that ZarrLoader is passing coordinates in ZARR order already!
+        // We need to map the incoming slicer coordinates correctly
         
-        // Create ZARR 5D coordinates
-        std::vector<tensorstore::Index> box_origin(5);
-        box_origin[0] = 0;           // time = 0
-        box_origin[1] = freq_index;  // frequency
-        box_origin[2] = stokes_index; // polarization  
-        box_origin[3] = x;           // l (spatial x)
-        box_origin[4] = y;           // m (spatial y)
+        spdlog::debug("readDirectFromTensorStore: section start={}, length={}, shape={}", 
+                     start.toString(), length.toString(), _original_zarr_shape.toString());
         
-        std::vector<tensorstore::Index> box_shape(5);
-        box_shape[0] = 1;  // time = 1
-        box_shape[1] = 1;  // freq = 1
-        box_shape[2] = 1;  // pol = 1
-        box_shape[3] = length[0];  // l length
-        box_shape[4] = length[1];  // m length
+        std::vector<tensorstore::Index> box_origin;
+        std::vector<tensorstore::Index> box_shape;
         
-        spdlog::debug("DIRECT READ: TensorStore slice [time={}, freq={}, pol={}, l={}:{}, m={}:{}]",
+        if (start.size() == 5) {
+            // 5D case: ZarrLoader already provides ZARR order [time, freq, ?, y, x]
+            box_origin.resize(5);
+            box_shape.resize(5);
+            for (int i = 0; i < 5; ++i) {
+                box_origin[i] = start[i];
+                box_shape[i] = length[i];
+            }
+        } else if (start.size() == 4) {
+            // 4D case: Map to 5D ZARR [time, freq, ?, y, x]
+            box_origin.resize(5);
+            box_shape.resize(5);
+            box_origin[0] = 0;           // time = 0
+            box_origin[1] = start[0];    // freq from ZarrLoader
+            box_origin[2] = start[1];    // ? (usually 0)
+            box_origin[3] = start[2];    // y 
+            box_origin[4] = start[3];    // x
+            box_shape[0] = 1;            // time = 1
+            box_shape[1] = length[0];    // freq length
+            box_shape[2] = length[1];    // ? length
+            box_shape[3] = length[2];    // y length
+            box_shape[4] = length[3];    // x length
+        } else if (start.size() == 3) {
+            // 3D case: Map to 5D ZARR [time, freq, ?, y, x]  
+            box_origin.resize(5);
+            box_shape.resize(5);
+            box_origin[0] = 0;           // time = 0
+            box_origin[1] = start[0];    // freq from ZarrLoader
+            box_origin[2] = 0;           // ? = 0
+            box_origin[3] = start[1];    // y
+            box_origin[4] = start[2];    // x
+            box_shape[0] = 1;            // time = 1
+            box_shape[1] = length[0];    // freq length
+            box_shape[2] = 1;            // ? = 1
+            box_shape[3] = length[1];    // y length
+            box_shape[4] = length[2];    // x length
+        } else if (start.size() == 2) {
+            // 2D case: Map to 5D ZARR [time, freq, ?, y, x] with single channel
+            box_origin.resize(5);
+            box_shape.resize(5);
+            box_origin[0] = 0;           // time = 0
+            box_origin[1] = 0;           // freq = 0 (first channel)
+            box_origin[2] = 0;           // ? = 0
+            box_origin[3] = start[0];    // y
+            box_origin[4] = start[1];    // x
+            box_shape[0] = 1;            // time = 1
+            box_shape[1] = 1;            // freq = 1 (single channel)
+            box_shape[2] = 1;            // ? = 1
+            box_shape[3] = length[0];    // y length
+            box_shape[4] = length[1];    // x length
+        } else {
+            spdlog::error("readDirectFromTensorStore: Unsupported section dimensions: {}", start.size());
+            return false;
+        }
+        
+        // Validate coordinates against ZARR bounds
+        for (size_t i = 0; i < box_origin.size(); ++i) {
+            if (box_origin[i] < 0 || 
+                (i < _original_zarr_shape.size() && box_origin[i] + box_shape[i] > _original_zarr_shape[i])) {
+                spdlog::error("readDirectFromTensorStore: Coordinate {} out of bounds: origin={}, shape={}, max={}", 
+                             i, box_origin[i], box_shape[i], 
+                             i < _original_zarr_shape.size() ? _original_zarr_shape[i] : -1);
+                return false;
+            }
+        }
+        
+        spdlog::debug("DIRECT READ: TensorStore slice [time={}, freq={}, ?={}, y={}:{}, x={}:{}]",
                      box_origin[0], box_origin[1], box_origin[2], 
                      box_origin[3], box_origin[3] + box_shape[3] - 1,
                      box_origin[4], box_origin[4] + box_shape[4] - 1);
@@ -1382,13 +1436,16 @@ Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slice
         }
         
         // Copy data to output buffer
-        size_t total_elements = length[0] * length[1];
+        size_t total_elements = 1;
+        for (int i = 0; i < length.size(); ++i) {
+            total_elements *= length[i];
+        }
         buffer.resize(length);
         
         const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
         std::copy(src_data, src_data + total_elements, buffer.data());
         
-        spdlog::debug("DIRECT READ: Successfully read {} elements for single point", total_elements);
+        spdlog::debug("DIRECT READ: Successfully read {} elements (shape={})", total_elements, length.toString());
         return true;
         
     } catch (std::exception& e) {

@@ -59,6 +59,9 @@ public:
     
     // Coordinates - required by ImageInterface
     const casacore::CoordinateSystem& coordinates() const;
+    
+    // Public method for direct TensorStore access (needed for optimized small region reads)
+    casacore::Bool readDirectFromTensorStore(casacore::Array<float>& buffer, const casacore::Slicer& section);
 
 private:
     casacore::CoordinateSystem _coord_sys;
@@ -90,7 +93,6 @@ private:
     // Channel cache methods - now support region-based caching
     bool loadChannelCache(int freq_channel = 0, int stokes_channel = 0);
     bool loadRegionCache(int freq_channel, int stokes_channel, int start_x, int start_y, int width, int height);
-    casacore::Bool readDirectFromTensorStore(casacore::Array<float>& buffer, const casacore::Slicer& section);
     bool getSliceFromCache(casacore::Array<float>& buffer, const casacore::Slicer& section);
 };
 
