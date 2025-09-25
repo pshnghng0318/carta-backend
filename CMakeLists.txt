@@ -450,6 +450,7 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
             ${LINK_LIBS}
             -Wl,-force_load,${TENSORSTORE_MAIN_LIB}
             ${FORCE_LOAD_ARGS})
+            
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     target_link_libraries(carta_backend
@@ -459,6 +460,7 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
             -Wl,--whole-archive
             ${TENSORSTORE_ROOT}/_deps/absl-build/absl/hash/libabsl_hash.a
             -Wl,--no-whole-archive)
+            
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 
 if (CartaUserFolderPrefix)
