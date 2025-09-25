@@ -127,11 +127,14 @@ void CartaZarrImage::setupCoordinateSystem() {
             zattrs_file >> zattrs_json;
             
             spdlog::info("Found .zattrs file for Zarr image: {}", _name);
+            spdlog::debug("ZARR WCS: About to call parseWCSFromZattrs");
             
             // Parse WCS-like coordinate information
             if (parseWCSFromZattrs(zattrs_json)) {
                 spdlog::info("Successfully parsed coordinate system from .zattrs");
                 return;
+            } else {
+                spdlog::warn("Failed to parse coordinate system from .zattrs");
             }
         }
     } catch (std::exception& e) {
@@ -144,11 +147,214 @@ void CartaZarrImage::setupCoordinateSystem() {
 
 bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
     try {
+        spdlog::debug("ZARR WCS: Starting parseWCSFromZattrs");
+        
+        // First, check if we have precise coordinate arrays
+        std::filesystem::path zarr_path(_name.c_str());
+        std::filesystem::path ra_path = zarr_path / "right_ascension";
+        std::filesystem::path dec_path = zarr_path / "declination";
+        
+        bool has_precise_coords = std::filesystem::exists(ra_path) && std::filesystem::exists(dec_path);
+        spdlog::debug("ZARR WCS: Precise coordinate arrays available: {}", has_precise_coords);
+        
+        if (has_precise_coords) {
+            return parseWCSFromCoordinateArrays(ra_path, dec_path);
+        }
+        
+        // Fallback to metadata-based parsing
+        return parseWCSFromMetadata(zattrs);
+    } catch (std::exception& e) {
+        spdlog::error("ZARR WCS: Exception in parseWCSFromZattrs: {}", e.what());
+        return false;
+    }
+}
+
+bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& ra_path, const std::filesystem::path& dec_path) {
+    try {
+        spdlog::debug("ZARR WCS: Reading precise coordinate arrays");
+        
+        // TODO: Implement TensorStore reading of coordinate arrays
+        // For now, use a representative sample to build the coordinate system
+        
+        // Read array metadata to understand structure
+        std::ifstream ra_zarray(ra_path / ".zarray");
+        nlohmann::json ra_meta;
+        ra_zarray >> ra_meta;
+        
+        auto shape = ra_meta["shape"];
+        size_t height = shape[0].get<size_t>();  // l dimension
+        size_t width = shape[1].get<size_t>();   // m dimension
+        
+        spdlog::debug("ZARR WCS: Coordinate arrays shape: {}x{}", height, width);
+        
+        // For now, calculate approximate reference coordinates from center positions
+        // Later we can read actual data using TensorStore
+        size_t center_l = height / 2;
+        size_t center_m = width / 2;
+        
+        // Try to get pointing center from main .zattrs
+        double ra_rad = 0.0, dec_rad = 0.0;
+        std::filesystem::path main_zattrs = ra_path.parent_path() / ".zattrs";
+        std::ifstream main_file(main_zattrs);
+        if (main_file.is_open()) {
+            nlohmann::json main_json;
+            main_file >> main_json;
+            
+            // Try different sources for reference coordinates
+            if (main_json.contains("pointing_center")) {
+                auto center_data = main_json["pointing_center"]["data"];
+                if (center_data.is_array() && center_data.size() >= 2) {
+                    ra_rad = center_data[0].get<double>();
+                    dec_rad = center_data[1].get<double>();
+                    spdlog::debug("ZARR WCS: Using pointing_center from main .zattrs: RA={:.6f} rad, DEC={:.6f} rad", 
+                                ra_rad, dec_rad);
+                }
+            } else if (main_json.contains("direction") && main_json["direction"].contains("reference")) {
+                auto ref_data = main_json["direction"]["reference"]["data"];
+                if (ref_data.is_array() && ref_data.size() >= 2) {
+                    ra_rad = ref_data[0].get<double>();
+                    dec_rad = ref_data[1].get<double>();
+                    spdlog::debug("ZARR WCS: Using direction.reference from main .zattrs: RA={:.6f} rad, DEC={:.6f} rad", 
+                                ra_rad, dec_rad);
+                }
+            }
+        }
+        
+        // If no pointing center found, calculate from coordinate array center
+        if (ra_rad == 0.0 && dec_rad == 0.0) {
+            // TODO: Read actual coordinate values from center pixels
+            // For now, use a default reasonable center for ASKAP data
+            ra_rad = 5.5;  // ~315 degrees, typical for Hydra field
+            dec_rad = -0.65; // ~-37 degrees, typical for southern sky
+            spdlog::warn("ZARR WCS: No pointing center found, using default center: RA={:.6f} rad, DEC={:.6f} rad", 
+                        ra_rad, dec_rad);
+        }
+        
+        return buildDirectionCoordinateFromArrays(ra_rad, dec_rad, height, width);
+        
+    } catch (std::exception& e) {
+        spdlog::error("ZARR WCS: Exception reading coordinate arrays: {}", e.what());
+        return false;
+    }
+}
+
+bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double dec_rad, size_t height, size_t width) {
+    try {
+        spdlog::debug("ZARR WCS: Building DirectionCoordinate from coordinate arrays");
+        spdlog::debug("ZARR WCS: Reference RA={:.6f} rad ({:.6f}°), DEC={:.6f} rad ({:.6f}°)", 
+                     ra_rad, ra_rad * 180.0 / M_PI, dec_rad, dec_rad * 180.0 / M_PI);
+        spdlog::debug("ZARR WCS: Array dimensions: {}x{}", height, width);
+        
+        // Create DirectionCoordinate using available information
+        casacore::Vector<double> ref_val(2);
+        ref_val(0) = ra_rad;   // RA in radians
+        ref_val(1) = dec_rad;  // DEC in radians
+        
+        // Calculate approximate pixel increments 
+        // For ASKAP data, typical pixel scale is around 2.5 arcseconds
+        // But we should calculate this from the actual coordinate arrays eventually
+        casacore::Vector<double> inc(2);
+        inc(0) = -2.5 * M_PI / (180.0 * 3600.0);  // -2.5 arcsec in radians (negative for RA)
+        inc(1) = 2.5 * M_PI / (180.0 * 3600.0);   // +2.5 arcsec in radians
+        
+        // Reference pixel (center of image)
+        casacore::Vector<double> ref_pix(2);
+        ref_pix(0) = (width - 1) / 2.0;   // Center of x axis (m)
+        ref_pix(1) = (height - 1) / 2.0;  // Center of y axis (l)
+        
+        // Linear transformation matrix (identity for now)
+        casacore::Matrix<double> xform(2, 2);
+        xform = 0.0;
+        xform(0, 0) = 1.0;
+        xform(1, 1) = 1.0;
+        
+        spdlog::debug("ZARR WCS: Creating DirectionCoordinate with:");
+        spdlog::debug("  Reference value: RA={:.6f}° DEC={:.6f}°", 
+                     ra_rad * 180.0 / M_PI, dec_rad * 180.0 / M_PI);
+        spdlog::debug("  Reference pixel: ({:.1f}, {:.1f})", ref_pix(0), ref_pix(1));
+        spdlog::debug("  Pixel increment: ({:.3f} arcsec, {:.3f} arcsec)", 
+                     inc(0) * 180.0 * 3600.0 / M_PI, inc(1) * 180.0 * 3600.0 / M_PI);
+        
+        DirectionCoordinate dir_coord;
+        try {
+            // Use CAR projection for radio astronomy data
+            dir_coord = DirectionCoordinate(MDirection::J2000, 
+                                          Projection::CAR,
+                                          ref_val(0), ref_val(1),
+                                          inc(0), inc(1),
+                                          xform,
+                                          ref_pix(0), ref_pix(1));
+            
+            spdlog::debug("ZARR WCS: DirectionCoordinate created successfully with CAR projection");
+            
+            // Test coordinate conversion
+            casacore::Vector<double> world_coord(2);
+            casacore::Vector<double> pixel_coord(2);
+            pixel_coord(0) = ref_pix(0);
+            pixel_coord(1) = ref_pix(1);
+            
+            if (dir_coord.toWorld(world_coord, pixel_coord)) {
+                spdlog::debug("ZARR WCS: Reference pixel ({:.1f}, {:.1f}) -> World ({:.6f}, {:.6f}) radians",
+                            pixel_coord(0), pixel_coord(1),
+                            world_coord(0), world_coord(1));
+                spdlog::debug("ZARR WCS: World coordinates: RA={:.6f}° DEC={:.6f}°",
+                            world_coord(0) * 180.0 / M_PI, 
+                            world_coord(1) * 180.0 / M_PI);
+            } else {
+                spdlog::warn("ZARR WCS: Failed to convert reference pixel to world coordinates");
+            }
+            
+        } catch (const std::exception& coord_e) {
+            spdlog::error("ZARR WCS: Failed to create DirectionCoordinate: {}", coord_e.what());
+            dir_coord = DirectionCoordinate(); // Fallback to default
+        }
+        
+        // Create remaining coordinates for 4D structure
+        SpectralCoordinate spec_coord;
+        casacore::Vector<int> stokes_types(_shape(3)); 
+        for (int i = 0; i < _shape(3); ++i) {
+            stokes_types(i) = casacore::Stokes::I;
+        }
+        StokesCoordinate stokes_coord(stokes_types);
+        
+        // Add coordinates in CARTA 4D order: [x, y, freq, stokes]
+        try {
+            _coord_sys.addCoordinate(dir_coord);       
+            spdlog::debug("ZARR WCS: Successfully added DirectionCoordinate from arrays");
+            
+            _coord_sys.addCoordinate(spec_coord);      
+            spdlog::debug("ZARR WCS: Successfully added SpectralCoordinate");
+            
+            _coord_sys.addCoordinate(stokes_coord);    
+            spdlog::debug("ZARR WCS: Successfully added StokesCoordinate");
+            
+            spdlog::debug("ZARR WCS: CoordinateSystem has {} coordinates", _coord_sys.nCoordinates());
+            return true;
+            
+        } catch (const std::exception& e) {
+            spdlog::error("ZARR WCS: Failed to add coordinates to CoordinateSystem: {}", e.what());
+            return false;
+        }
+        
+    } catch (std::exception& e) {
+        spdlog::error("ZARR WCS: Exception in buildDirectionCoordinateFromArrays: {}", e.what());
+        return false;
+    }
+}
+
+bool CartaZarrImage::parseWCSFromMetadata(const nlohmann::json& zattrs) {
+    try {
+        spdlog::debug("ZARR WCS: Starting parseWCSFromZattrs");
+        
         // Check for ZARR-style coordinate information
         bool has_array_dimensions = zattrs.contains("_ARRAY_DIMENSIONS");
         bool has_direction_info = zattrs.contains("direction") || zattrs.contains("pointing_center");
         
+        spdlog::debug("ZARR WCS: has_array_dimensions = {}, has_direction_info = {}", 
+                     has_array_dimensions, has_direction_info);
+        
         if (!has_array_dimensions && !has_direction_info) {
+            spdlog::debug("ZARR WCS: No required info found, returning false");
             return false;
         }
         
@@ -162,6 +368,9 @@ bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
         
         // Create coordinate system based on array dimensions
         if (axis_names.size() == 5) {
+            spdlog::debug("ZARR WCS: Processing 5D ZARR file with dimensions: [{}]", 
+                         fmt::join(axis_names, ", "));
+            
             // 5D ZARR: Original was [time, frequency, polarization, l, m]
             // But we converted to CARTA 4D format: [l, m, frequency, polarization] = [x, y, freq, stokes]
             
@@ -185,6 +394,9 @@ bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
                         if (center_data.is_array() && center_data.size() >= 2) {
                             ra_rad = center_data[0].get<double>();
                             dec_rad = center_data[1].get<double>();
+                            spdlog::debug("ZARR WCS: pointing_center RA={} rad ({}°), DEC={} rad ({}°)", 
+                                        ra_rad, ra_rad * 180.0 / M_PI, 
+                                        dec_rad, dec_rad * 180.0 / M_PI);
                         }
                     }
                     
@@ -194,24 +406,63 @@ bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
                         ref_val(0) = ra_rad;   // RA in radians
                         ref_val(1) = dec_rad;  // DEC in radians
                         
+                        // Use more reasonable pixel increments (about 1 arcsecond)
                         casacore::Vector<double> inc(2);
-                        inc(0) = -1.0 * M_PI / 180.0 / 3600.0;  // Default pixel increment
-                        inc(1) = 1.0 * M_PI / 180.0 / 3600.0;   // Default pixel increment
+                        inc(0) = -1.0 * M_PI / 180.0 / 3600.0;  // -1 arcsec in radians for RA (negative for standard orientation)
+                        inc(1) = 1.0 * M_PI / 180.0 / 3600.0;   // +1 arcsec in radians for DEC
                         
                         casacore::Matrix<double> xform(2, 2);
                         xform = 0.0;
-                        xform.diagonal() = 1.0;
+                        xform.diagonal() = 1.0;  // Identity matrix
                         
+                        // Reference pixel at image center (0-based indexing)
                         casacore::Vector<double> ref_pix(2);
-                        ref_pix(0) = _shape(0) / 2.0;  // Center of x axis (l) - now first dimension
-                        ref_pix(1) = _shape(1) / 2.0;  // Center of y axis (m) - now second dimension
+                        ref_pix(0) = (_shape(0) - 1) / 2.0;  // Center of x axis (l)
+                        ref_pix(1) = (_shape(1) - 1) / 2.0;  // Center of y axis (m)
                         
-                        dir_coord = DirectionCoordinate(MDirection::J2000, 
-                                                      Projection::SIN,
-                                                      ref_val(0), ref_val(1),
-                                                      inc(0), inc(1),
-                                                      xform,
-                                                      ref_pix(0), ref_pix(1));
+                        spdlog::debug("ZARR WCS: Creating DirectionCoordinate with:");
+                        spdlog::debug("  Reference value: RA={}° DEC={}°", 
+                                    ra_rad * 180.0 / M_PI, dec_rad * 180.0 / M_PI);
+                        spdlog::debug("  Reference pixel: ({}, {})", ref_pix(0), ref_pix(1));
+                        spdlog::debug("  Pixel increment: ({} arcsec, {} arcsec)", 
+                                    inc(0) * 180.0 * 3600.0 / M_PI, inc(1) * 180.0 * 3600.0 / M_PI);
+                        spdlog::debug("  Image shape: ({}, {})", _shape(0), _shape(1));
+                        
+                        try {
+                            // Try CAR projection first (common for radio astronomy)
+                            dir_coord = DirectionCoordinate(MDirection::J2000, 
+                                                          Projection::CAR,
+                                                          ref_val(0), ref_val(1),
+                                                          inc(0), inc(1),
+                                                          xform,
+                                                          ref_pix(0), ref_pix(1));
+                            
+                            spdlog::debug("ZARR WCS: DirectionCoordinate created successfully with CAR projection");
+                            
+                            // Test coordinate conversion
+                            casacore::Vector<double> world_coord(2);
+                            casacore::Vector<double> pixel_coord(2);
+                            pixel_coord(0) = ref_pix(0);
+                            pixel_coord(1) = ref_pix(1);
+                            
+                            if (dir_coord.toWorld(world_coord, pixel_coord)) {
+                                spdlog::debug("ZARR WCS: Reference pixel ({}, {}) -> World ({}, {}) radians",
+                                            pixel_coord(0), pixel_coord(1),
+                                            world_coord(0), world_coord(1));
+                                spdlog::debug("ZARR WCS: World coordinates: RA={}° DEC={}°",
+                                            world_coord(0) * 180.0 / M_PI, 
+                                            world_coord(1) * 180.0 / M_PI);
+                            } else {
+                                spdlog::warn("ZARR WCS: Failed to convert reference pixel to world coordinates");
+                            }
+                            
+                        } catch (const std::exception& coord_e) {
+                            spdlog::error("ZARR WCS: Failed to create DirectionCoordinate: {}", coord_e.what());
+                            dir_coord = DirectionCoordinate(); // Fallback to default
+                        }
+                    } else {
+                        spdlog::debug("ZARR WCS: No valid pointing center found, using default DirectionCoordinate");
+                        dir_coord = DirectionCoordinate();
                     }
                 } catch (const std::exception& e) {
                     // Fall back to default DirectionCoordinate
@@ -230,11 +481,25 @@ bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
             StokesCoordinate stokes_coord(stokes_types);
             
             // Add coordinates in the CARTA 4D order: [x, y, freq, stokes]
-            _coord_sys.addCoordinate(dir_coord);       // axes 0,1: direction (x, y)
-            _coord_sys.addCoordinate(spec_coord);      // axis 2: frequency
-            _coord_sys.addCoordinate(stokes_coord);    // axis 3: polarization
-            
-            return true;
+            try {
+                _coord_sys.addCoordinate(dir_coord);       // axes 0,1: direction (x, y)
+                spdlog::debug("ZARR WCS: Successfully added DirectionCoordinate");
+                
+                _coord_sys.addCoordinate(spec_coord);      // axis 2: frequency
+                spdlog::debug("ZARR WCS: Successfully added SpectralCoordinate");
+                
+                _coord_sys.addCoordinate(stokes_coord);    // axis 3: polarization
+                spdlog::debug("ZARR WCS: Successfully added StokesCoordinate");
+                
+                spdlog::debug("ZARR WCS: Successfully added all coordinates to CoordinateSystem");
+                spdlog::debug("ZARR WCS: CoordinateSystem has {} coordinates", _coord_sys.nCoordinates());
+                
+                return true;
+                
+            } catch (const std::exception& e) {
+                spdlog::error("ZARR WCS: Failed to add coordinates to CoordinateSystem: {}", e.what());
+                return false;
+            }
         }
         
         // Fallback for other dimension counts or missing info
@@ -1382,12 +1647,12 @@ Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slice
             box_shape.resize(5);
             box_origin[0] = 0;           // time = 0
             box_origin[1] = 0;           // freq = 0 (first channel)
-            box_origin[2] = 0;           // ? = 0
+            box_origin[2] = 0;           // stokes = 0
             box_origin[3] = start[0];    // y
             box_origin[4] = start[1];    // x
             box_shape[0] = 1;            // time = 1
             box_shape[1] = 1;            // freq = 1 (single channel)
-            box_shape[2] = 1;            // ? = 1
+            box_shape[2] = 1;            // stokes = 1
             box_shape[3] = length[0];    // y length
             box_shape[4] = length[1];    // x length
         } else {

@@ -87,6 +87,9 @@ private:
     
     void setupCoordinateSystem();
     bool parseWCSFromZattrs(const nlohmann::json& zattrs);
+    bool parseWCSFromCoordinateArrays(const std::filesystem::path& ra_path, const std::filesystem::path& dec_path);
+    bool parseWCSFromMetadata(const nlohmann::json& zattrs);
+    bool buildDirectionCoordinateFromArrays(double ra_rad, double dec_rad, size_t height, size_t width);
     void createMinimalCoordinateSystem();
     void initializeTensorStore();
     
