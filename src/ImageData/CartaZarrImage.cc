@@ -137,6 +137,26 @@ void CartaZarrImage::setupCoordinateSystem() {
                 spdlog::warn("Failed to parse coordinate system from .zattrs");
             }
         }
+
+        // // Frequency
+        // std::filesystem::path zattrs_freq_path = zarr_path / "frequency/.zattrs";
+
+        // if (std::filesystem::exists(zattrs_freq_path)) {
+        //     std::ifstream zattrs_freq_file(zattrs_freq_path);
+        //     nlohmann::json zattrs_freq_json;
+        //     zattrs_freq_file >> zattrs_freq_json;
+
+        //     spdlog::info("Found frequency/.zattrs file for Zarr image: {}", _name);
+        //     spdlog::debug("ZARR WCS: About to call parseFreqFromZattrs");
+
+        //     // Parse frequency information
+        //     if (parseFreqFromZattrs(zattrs_freq_json)) {
+        //         spdlog::info("Successfully parsed frequency information from .zattrs");
+        //         return;
+        //     } else {
+        //         spdlog::warn("Failed to parse frequency information from .zattrs");
+        //     }
+        // }
     } catch (std::exception& e) {
         spdlog::warn("Failed to read .zattrs for {}: {}", _name, e.what());
     }
@@ -153,12 +173,13 @@ bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
         std::filesystem::path zarr_path(_name.c_str());
         std::filesystem::path ra_path = zarr_path / "right_ascension";
         std::filesystem::path dec_path = zarr_path / "declination";
+        std::filesystem::path freq_path = zarr_path / "frequency";
         
         bool has_precise_coords = std::filesystem::exists(ra_path) && std::filesystem::exists(dec_path);
         spdlog::debug("ZARR WCS: Precise coordinate arrays available: {}", has_precise_coords);
         
         if (has_precise_coords) {
-            return parseWCSFromCoordinateArrays(ra_path, dec_path);
+            return parseWCSFromCoordinateArrays(ra_path, dec_path, freq_path);
         }
         
         // Fallback to metadata-based parsing
@@ -169,7 +190,7 @@ bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
     }
 }
 
-bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& ra_path, const std::filesystem::path& dec_path) {
+bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& ra_path, const std::filesystem::path& dec_path, const std::filesystem::path& freq_path) {
     try {
         spdlog::debug("ZARR WCS: Reading precise coordinate arrays");
         
@@ -229,16 +250,87 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
             spdlog::warn("ZARR WCS: No pointing center found, using default center: RA={:.6f} rad, DEC={:.6f} rad", 
                         ra_rad, dec_rad);
         }
-        
-        return buildDirectionCoordinateFromArrays(ra_rad, dec_rad, height, width);
-        
+
+        // Frequency handling - assume single channel for now
+        std::ifstream freq_zarray(freq_path / ".zarray");
+        nlohmann::json freq_meta;
+        freq_zarray >> freq_meta;
+
+        auto freq_shape = freq_meta["shape"];
+        size_t depth = freq_shape[0].get<size_t>();  // channel numbers
+
+        spdlog::debug("ZARR FREQ COOR: Frequency arrays shape: {}x{}", depth);
+
+        // For now, calculate approximate reference frequencies from center positions
+        // Later we can read actual data using TensorStore
+        size_t center_freq_channel = depth / 2;
+
+        // Try to get frequency center from main .zattrs
+        double freq_hz = 0.0;
+        std::filesystem::path main_freq_zattrs = freq_path.parent_path() / ".zattrs";
+        std::ifstream main_freq_file(main_freq_zattrs);
+        if (main_freq_file.is_open()) {
+            nlohmann::json main_freq_json;
+            main_freq_file >> main_freq_json;
+
+            // Try different sources for reference frequencies
+            if (main_freq_json.contains("frequency")) {
+                auto freq_data = main_freq_json["frequency"]["data"];
+                if (freq_data.is_array() && freq_data.size() >= 1) {
+                    freq_hz = freq_data[0].get<double>();
+                    spdlog::debug("ZARR WCS: Using frequency from main .zattrs: FREQ={:.6f} Hz",
+                                freq_hz);
+                }
+            }
+        }
+
+        // If no frequency center found, calculate from frequency array center
+        if (freq_hz == 0.0) {
+            // TODO: Read actual frequency values from center pixels
+            // For now, use a default reasonable center for ASKAP data
+            freq_hz = 1.0e9;  // ~1 GHz, typical for ASKAP data
+            spdlog::warn("ZARR WCS: No frequency center found, using default center: FREQ={:.6f} Hz",
+                        freq_hz);
+        }
+
+        return buildDirectionCoordinateFromArrays(ra_rad, dec_rad, freq_hz, height, width, depth);
+
     } catch (std::exception& e) {
         spdlog::error("ZARR WCS: Exception reading coordinate arrays: {}", e.what());
         return false;
     }
 }
 
-bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double dec_rad, size_t height, size_t width) {
+// bool parseFreqFromZattrs(const nlohmann::json& zattrs) {
+//     try {
+//         spdlog::debug("ZARR FREQ: Starting parseFreqFromZattrs");
+
+//         if (zattrs.contains("reference") && zattrs["reference"]["units"].is_string()) {
+//             std::string refFreq_unit = zattrs["reference"]["units"].get<std::string>();
+//             spdlog::debug("ZARR FREQ: Frequency unit of Reference from .zattrs: {}", refFreq_unit);
+//             std::string refFreq_value = zattrs["reference"]["data"].get<std::string>();
+//             spdlog::debug("ZARR FREQ: Frequency value of Reference from .zattrs: {}", refFreq_value);
+//         }
+
+//         if (zattrs.contains("rest") && zattrs["rest"]["units"].is_string()) {
+//             std::string restFreq_unit = zattrs["rest"]["units"].get<std::string>();
+//             spdlog::debug("ZARR FREQ: Frequency unit of Rest from .zattrs: {}", restFreq_unit);
+//             std::string restFreq_value = zattrs["rest"]["data"].get<std::string>();
+//             spdlog::debug("ZARR FREQ: Frequency value of Rest from .zattrs: {}", restFreq_value);
+//         }
+
+        
+        
+//         spdlog::warn("ZARR FREQ: No valid frequency data found in .zattrs");
+//         return false;
+        
+//     } catch (std::exception& e) {
+//         spdlog::error("ZARR FREQ: Exception in parseFreqFromZattrs: {}", e.what());
+//         return false;
+//     }
+// }
+
+bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double dec_rad, double freq_hz, size_t height, size_t width, size_t depth) {
     try {
         spdlog::debug("ZARR WCS: Building DirectionCoordinate from coordinate arrays");
         spdlog::debug("ZARR WCS: Reference RA={:.6f} rad ({:.6f}°), DEC={:.6f} rad ({:.6f}°)", 
@@ -268,7 +360,7 @@ bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double de
         xform(0, 0) = 1.0;
         xform(1, 1) = 1.0;
         
-        spdlog::debug("ZARR WCS: Creating DirectionCoordinate with:");
+        spdlog::debug("ZARR WCS: From Arrays Creating DirectionCoordinate with:");
         spdlog::debug("  Reference value: RA={:.6f}° DEC={:.6f}°", 
                      ra_rad * 180.0 / M_PI, dec_rad * 180.0 / M_PI);
         spdlog::debug("  Reference pixel: ({:.1f}, {:.1f})", ref_pix(0), ref_pix(1));
@@ -276,6 +368,7 @@ bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double de
                      inc(0) * 180.0 * 3600.0 / M_PI, inc(1) * 180.0 * 3600.0 / M_PI);
         
         DirectionCoordinate dir_coord;
+        SpectralCoordinate spec_coord;
         try {
             // Use CAR projection for radio astronomy data
             dir_coord = DirectionCoordinate(MDirection::J2000, 
@@ -308,9 +401,28 @@ bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double de
             spdlog::error("ZARR WCS: Failed to create DirectionCoordinate: {}", coord_e.what());
             dir_coord = DirectionCoordinate(); // Fallback to default
         }
+
+        // Create SpectralCoordinate
+
+        try {
+            // Try default values for now
+            double rest_freq = 1420405751.786; // in Hz
+            double spectral_crval = freq_hz; // Reference frequency in Hz
+            double spectral_cdelt = 0.1e6; // 0.1 MHz channel width (placeholder)
+            double spectral_crpix = (depth - 1) / 2.0 + 1; // 1-based pixel
+            // Use casacore MFrequency type for the SpectralCoordinate constructor
+            casacore::MFrequency::Types frequency_type = casacore::MFrequency::TOPO; // default to TOPO
+
+            spec_coord = SpectralCoordinate(frequency_type, spectral_crval, spectral_cdelt, spectral_crpix, rest_freq);
+
+            spdlog::debug("ZARR FREQ COOR: SpectralCoordinate created successfully");
+            
+        } catch (const std::exception& coord_e) {
+            spdlog::error("ZARR FREQ COOR: Failed to create SpectralCoordinate: {}", coord_e.what());
+            spec_coord = SpectralCoordinate(); // Fallback to default
+        }
         
-        // Create remaining coordinates for 4D structure
-        SpectralCoordinate spec_coord;
+        // Create StokesCoordinate - assume single polarization (I) for now
         casacore::Vector<int> stokes_types(_shape(3)); 
         for (int i = 0; i < _shape(3); ++i) {
             stokes_types(i) = casacore::Stokes::I;
@@ -420,7 +532,7 @@ bool CartaZarrImage::parseWCSFromMetadata(const nlohmann::json& zattrs) {
                         ref_pix(0) = (_shape(0) - 1) / 2.0;  // Center of x axis (l)
                         ref_pix(1) = (_shape(1) - 1) / 2.0;  // Center of y axis (m)
                         
-                        spdlog::debug("ZARR WCS: Creating DirectionCoordinate with:");
+                        spdlog::debug("ZARR WCS: From Meta Data Creating DirectionCoordinate with:");
                         spdlog::debug("  Reference value: RA={}° DEC={}°", 
                                     ra_rad * 180.0 / M_PI, dec_rad * 180.0 / M_PI);
                         spdlog::debug("  Reference pixel: ({}, {})", ref_pix(0), ref_pix(1));
@@ -472,7 +584,78 @@ bool CartaZarrImage::parseWCSFromMetadata(const nlohmann::json& zattrs) {
             
             // Create SpectralCoordinate for frequency axis (now 3rd dimension in 4D)
             SpectralCoordinate spec_coord;
-            
+            bool spec_built = false;
+            std::string spec_unit = "Hz";
+            double spec_rest = 0.0;
+            size_t nchan = (_shape.size() > 2) ? static_cast<size_t>(_shape(2)) : 1;
+
+            // Prefer reading frequency metadata from frequency/.zattrs (FITS-like handling)
+            try {
+                std::filesystem::path zarr_base(_name.c_str());
+                std::filesystem::path freq_zattrs = zarr_base / "frequency" / ".zattrs";
+                if (std::filesystem::exists(freq_zattrs)) {
+                    spdlog::debug("ZARR WCS: Found frequency/.zattrs at {}", freq_zattrs.string());
+                    std::ifstream f(freq_zattrs);
+                    if (f.is_open()) {
+                        nlohmann::json freq_json;
+                        f >> freq_json;
+
+                        // If explicit frequency array provided
+                        if (freq_json.contains("data") && freq_json["data"].is_array()) {
+                            try {
+                                auto arr = freq_json["data"];
+                                size_t m = arr.size();
+                                casacore::Vector<casacore::Double> vals(m);
+                                for (size_t i = 0; i < m; ++i) vals(i) = arr[i].get<double>();
+                                spec_unit = freq_json.contains("unit") ? freq_json["unit"].get<std::string>() : spec_unit;
+                                if (freq_json.contains("rest_frequency")) spec_rest = freq_json["rest_frequency"].get<double>();
+                                spec_coord = SpectralCoordinate(MFrequency::TOPO, vals, spec_unit, spec_rest);
+                                spec_built = true;
+                                spdlog::info("ZARR WCS: Built SpectralCoordinate from frequency/.zattrs (data) nchan={}", m);
+                            } catch (const std::exception& e) {
+                                spdlog::warn("ZARR WCS: Failed to build spectral coord from frequency.data: {}", e.what());
+                            }
+                        }
+
+                        // If not explicit, try reference + increment form (linear axis)
+                        if (!spec_built && freq_json.contains("reference") && freq_json.contains("increment")) {
+                            try {
+                                double refval = 0.0, cdelt = 0.0;
+                                auto refj = freq_json["reference"]; 
+                                auto incj = freq_json["increment"];
+                                // Accept either scalar or array forms
+                                if (refj.is_object() && refj.contains("data")) {
+                                    auto rdata = refj["data"];
+                                    refval = rdata.is_array() && rdata.size() > 0 ? rdata[0].get<double>() : rdata.get<double>();
+                                } else if (refj.is_number()) {
+                                    refval = refj.get<double>();
+                                }
+                                if (incj.is_object() && incj.contains("data")) {
+                                    auto idata = incj["data"];
+                                    cdelt = idata.is_array() && idata.size() > 0 ? idata[0].get<double>() : idata.get<double>();
+                                } else if (incj.is_number()) {
+                                    cdelt = incj.get<double>();
+                                }
+
+                                casacore::Vector<casacore::Double> vals(static_cast<int>(nchan));
+                                for (size_t i = 0; i < nchan; ++i) vals(i) = refval + static_cast<double>(i) * cdelt;
+                                spec_unit = freq_json.contains("unit") ? freq_json["unit"].get<std::string>() : spec_unit;
+                                if (freq_json.contains("rest_frequency")) spec_rest = freq_json["rest_frequency"].get<double>();
+                                spec_coord = SpectralCoordinate(MFrequency::TOPO, vals, spec_unit, spec_rest);
+                                spec_built = true;
+                                spdlog::info("ZARR WCS: Built SpectralCoordinate from frequency/.zattrs (reference+increment) nchan={}", nchan);
+                            } catch (const std::exception& e) {
+                                spdlog::warn("ZARR WCS: Failed to build spectral coord from frequency.reference/increment: {}", e.what());
+                            }
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                spdlog::warn("ZARR WCS: Error reading frequency/.zattrs: {}", e.what());
+            }
+
+            // If not built, leave spec_coord default and fallback will be applied later
+
             // Create StokesCoordinate for polarization axis (now 4th dimension in 4D)
             casacore::Vector<int> stokes_types(_shape(3)); // Use actual polarization dimension size
             for (int i = 0; i < _shape(3); ++i) {
@@ -1652,7 +1835,7 @@ Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slice
             box_origin[4] = start[1];    // x
             box_shape[0] = 1;            // time = 1
             box_shape[1] = 1;            // freq = 1 (single channel)
-            box_shape[2] = 1;            // stokes = 1
+            box_shape[2] = 1;            // ? = 1
             box_shape[3] = length[0];    // y length
             box_shape[4] = length[1];    // x length
         } else {
