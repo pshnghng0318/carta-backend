@@ -62,6 +62,7 @@ public:
     
     // Public method for direct TensorStore access (needed for optimized small region reads)
     casacore::Bool readDirectFromTensorStore(casacore::Array<float>& buffer, const casacore::Slicer& section);
+    casacore::Bool readPixelFromTensorStore(casacore::Array<float>& buffer, const casacore::Slicer& section);
 
 private:
     casacore::CoordinateSystem _coord_sys;

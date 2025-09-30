@@ -7,6 +7,8 @@
 #include "CartaZarrImage.h"
 #include "Logger/Logger.h"
 
+#include "Util/Casacore.h"
+
 #include <limits>
 #include <cmath>
 #include <casacore/coordinates/Coordinates/LinearCoordinate.h>
@@ -128,6 +130,145 @@ void CartaZarrImage::setupCoordinateSystem() {
             
             spdlog::info("Found .zattrs file for Zarr image: {}", _name);
             spdlog::debug("ZARR WCS: About to call parseWCSFromZattrs");
+
+            // Try to read brightness unit from .zattrs (top-level or SKY/.zattrs)
+            try {
+                std::string found_bunit;
+
+                // Common keys: BUNIT, bunit, units, brightness_unit
+                if (zattrs_json.contains("BUNIT") && zattrs_json["BUNIT"].is_string()) {
+                    found_bunit = zattrs_json["BUNIT"].get<std::string>();
+                } else if (zattrs_json.contains("bunit") && zattrs_json["bunit"].is_string()) {
+                    found_bunit = zattrs_json["bunit"].get<std::string>();
+                } else if (zattrs_json.contains("units") && zattrs_json["units"].is_string()) {
+                    found_bunit = zattrs_json["units"].get<std::string>();
+                } else if (zattrs_json.contains("brightness_unit") && zattrs_json["brightness_unit"].is_string()) {
+                    found_bunit = zattrs_json["brightness_unit"].get<std::string>();
+                }
+
+                // If not found at top-level, check SKY/.zattrs (common convention for derived arrays)
+                if (found_bunit.empty()) {
+                    std::filesystem::path zarr_path(_name.c_str());
+                    std::filesystem::path sky_zattrs = zarr_path / "SKY" / ".zattrs";
+                    if (std::filesystem::exists(sky_zattrs)) {
+                        try {
+                            std::ifstream sky_file(sky_zattrs);
+                            nlohmann::json sky_json;
+                            sky_file >> sky_json;
+                            if (sky_json.contains("units") && sky_json["units"].is_string()) {
+                                found_bunit = sky_json["units"].get<std::string>();
+                            } else if (sky_json.contains("BUNIT") && sky_json["BUNIT"].is_string()) {
+                                found_bunit = sky_json["BUNIT"].get<std::string>();
+                            } else if (sky_json.contains("bunit") && sky_json["bunit"].is_string()) {
+                                found_bunit = sky_json["bunit"].get<std::string>();
+                            }
+                        } catch (const std::exception& e) {
+                            spdlog::debug("ZARR UNIT: Failed to read SKY/.zattrs: {}", e.what());
+                        }
+                    }
+                }
+
+                if (!found_bunit.empty()) {
+                    casacore::String bunit_str(found_bunit);
+                    NormalizeUnit(bunit_str);
+                    if (casacore::UnitVal::check(bunit_str)) {
+                        // Set image brightness unit
+                        setUnits(casacore::Unit(bunit_str));
+                        spdlog::info("ZARR UNIT: Set image brightness unit from .zattrs: {}", bunit_str);
+                    } else {
+                        spdlog::warn("ZARR UNIT: Found brightness unit '{}' in .zattrs but failed to normalize/check", found_bunit);
+                    }
+                }
+            } catch (const std::exception& e) {
+                spdlog::warn("ZARR UNIT: Exception while parsing .zattrs for brightness unit: {}", e.what());
+            }
+
+            // Try to read restoring beam from BEAM zarr array if present
+            try {
+                std::filesystem::path beam_array = zarr_path / "BEAM";
+                std::filesystem::path beam_zarray = beam_array / ".zarray";
+                if (std::filesystem::exists(beam_zarray)) {
+                    spdlog::info("Found BEAM array for Zarr image: {}", beam_array.string());
+
+                    // Build TensorStore spec for BEAM array
+                    nlohmann::json beam_spec_json = {
+                        {"driver", "zarr2"},
+                        {"kvstore", { {"driver", "file"}, {"path", beam_array.string()} }}
+                    };
+
+                    auto beam_spec_res = tensorstore::Spec::FromJson(beam_spec_json);
+                    if (!beam_spec_res.ok()) {
+                        spdlog::warn("Failed to create TensorStore spec for BEAM: {}", beam_spec_res.status().ToString());
+                    } else {
+                        auto beam_spec = beam_spec_res.value();
+                        auto open_res = tensorstore::Open(beam_spec, _context, tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read).result();
+                        if (!open_res.ok()) {
+                            spdlog::warn("Failed to open BEAM TensorStore: {}", open_res.status().ToString());
+                        } else {
+                            auto beam_store = open_res.value();
+
+                            // Read entire BEAM array (expected to be small)
+                            auto read_res = tensorstore::Read<tensorstore::zero_origin>(beam_store).result();
+                            if (!read_res.ok()) {
+                                spdlog::warn("Failed to read BEAM array: {}", read_res.status().ToString());
+                            } else {
+                                auto beam_array_ts = std::move(read_res.value());
+
+                                // Expect last axis to be beam parameters (e.g., major, minor, pa)
+                                auto shape = beam_array_ts.shape();
+                                if (shape.size() >= 1) {
+                                    // Flatten and inspect first beam entry
+                                    size_t nelems = 1;
+                                    for (size_t i = 0; i < shape.size(); ++i) nelems *= shape[i];
+
+                                    const float* data_ptr = reinterpret_cast<const float*>(beam_array_ts.data());
+                                    if (data_ptr && nelems >= 3) {
+                                        // Interpret first 3 values as major, minor, pa (radians or as indicated in .zattrs)
+                                        double major = static_cast<double>(data_ptr[0]);
+                                        double minor = static_cast<double>(data_ptr[1]);
+                                        double pa = static_cast<double>(data_ptr[2]);
+
+                                        // Read units from BEAM/.zattrs if available (default to radians)
+                                        casacore::String beam_unit = "rad";
+                                        std::filesystem::path beam_zattrs_path = beam_array / ".zattrs";
+                                        if (std::filesystem::exists(beam_zattrs_path)) {
+                                            try {
+                                                std::ifstream bz(beam_zattrs_path);
+                                                nlohmann::json bzjson;
+                                                bz >> bzjson;
+                                                if (bzjson.contains("units") && bzjson["units"].is_string()) {
+                                                    beam_unit = bzjson["units"].get<std::string>();
+                                                }
+                                            } catch (const std::exception& e) {
+                                                spdlog::debug("Failed to parse BEAM/.zattrs units: {}", e.what());
+                                            }
+                                        }
+
+                                        try {
+                                            casacore::Quantity qmajor(major, beam_unit);
+                                            casacore::Quantity qminor(minor, beam_unit);
+                                            casacore::Quantity qpa(pa, beam_unit);
+
+                                            // Set restoring beam on image info
+                                            casacore::ImageInfo ii = imageInfo();
+                                            ii.setRestoringBeam(qmajor, qminor, qpa);
+                                            setImageInfo(ii);
+                                            spdlog::info("ZARR BEAM: Set restoring beam from BEAM array: major={} {}, minor={} {}, pa={} {}",
+                                                         qmajor.getValue(), qmajor.getUnit(), qminor.getValue(), qminor.getUnit(), qpa.getValue(), qpa.getUnit());
+                                        } catch (const std::exception& e) {
+                                            spdlog::warn("Failed to set restoring beam from BEAM array: {}", e.what());
+                                        }
+                                    } else {
+                                        spdlog::debug("BEAM array read but too small (nelems={}) to extract beam params", nelems);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                spdlog::warn("Exception while extracting BEAM from Zarr: {}", e.what());
+            }
             
             // Parse WCS-like coordinate information
             if (parseWCSFromZattrs(zattrs_json)) {
@@ -274,8 +415,8 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
             main_freq_file >> main_freq_json;
 
             // Try different sources for reference frequencies
-            if (main_freq_json.contains("frequency")) {
-                auto freq_data = main_freq_json["frequency"]["data"];
+            if (main_freq_json.contains("reference_value")) {
+                auto freq_data = main_freq_json["reference_value"]["data"];
                 if (freq_data.is_array() && freq_data.size() >= 1) {
                     freq_hz = freq_data[0].get<double>();
                     spdlog::debug("ZARR WCS: Using frequency from main .zattrs: FREQ={:.6f} Hz",
@@ -942,7 +1083,7 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         // For single point requests, skip all caching and read directly from TensorStore
         if (use_direct_read) {
             spdlog::debug("SINGLE POINT OPTIMIZATION: Reading directly from TensorStore without caching");
-            return readDirectFromTensorStore(buffer, section);
+            return readPixelFromTensorStore(buffer, section);
         }
         
         // Check if we need to load a different channel into cache or switch cache type
@@ -1789,7 +1930,7 @@ Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slice
         std::vector<tensorstore::Index> box_shape;
         
         if (start.size() == 5) {
-            // 5D case: ZarrLoader already provides ZARR order [time, freq, ?, y, x]
+            // 5D case: ZarrLoader already provides ZARR order [time, freq, stokes, y, x]
             box_origin.resize(5);
             box_shape.resize(5);
             for (int i = 0; i < 5; ++i) {
@@ -1797,35 +1938,35 @@ Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slice
                 box_shape[i] = length[i];
             }
         } else if (start.size() == 4) {
-            // 4D case: Map to 5D ZARR [time, freq, ?, y, x]
+            // 4D case: Map to 5D ZARR [time, freq, stokes, y, x]
             box_origin.resize(5);
             box_shape.resize(5);
             box_origin[0] = 0;           // time = 0
             box_origin[1] = start[0];    // freq from ZarrLoader
-            box_origin[2] = start[1];    // ? (usually 0)
+            box_origin[2] = start[1];    // stokes = 0
             box_origin[3] = start[2];    // y 
             box_origin[4] = start[3];    // x
             box_shape[0] = 1;            // time = 1
             box_shape[1] = length[0];    // freq length
-            box_shape[2] = length[1];    // ? length
+            box_shape[2] = length[1];    // stokes length
             box_shape[3] = length[2];    // y length
             box_shape[4] = length[3];    // x length
         } else if (start.size() == 3) {
-            // 3D case: Map to 5D ZARR [time, freq, ?, y, x]  
+            // 3D case: Map to 5D ZARR [time, freq, stokes, y, x]  
             box_origin.resize(5);
             box_shape.resize(5);
             box_origin[0] = 0;           // time = 0
             box_origin[1] = start[0];    // freq from ZarrLoader
-            box_origin[2] = 0;           // ? = 0
+            box_origin[2] = 0;           // stokes = 0
             box_origin[3] = start[1];    // y
             box_origin[4] = start[2];    // x
             box_shape[0] = 1;            // time = 1
             box_shape[1] = length[0];    // freq length
-            box_shape[2] = 1;            // ? = 1
+            box_shape[2] = 1;            // stokes = 1
             box_shape[3] = length[1];    // y length
             box_shape[4] = length[2];    // x length
         } else if (start.size() == 2) {
-            // 2D case: Map to 5D ZARR [time, freq, ?, y, x] with single channel
+            // 2D case: Map to 5D ZARR [time, freq, stokes, y, x] with single channel
             box_origin.resize(5);
             box_shape.resize(5);
             box_origin[0] = 0;           // time = 0
@@ -1835,7 +1976,7 @@ Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slice
             box_origin[4] = start[1];    // x
             box_shape[0] = 1;            // time = 1
             box_shape[1] = 1;            // freq = 1 (single channel)
-            box_shape[2] = 1;            // ? = 1
+            box_shape[2] = 1;            // stokes = 1
             box_shape[3] = length[0];    // y length
             box_shape[4] = length[1];    // x length
         } else {
@@ -1848,6 +1989,139 @@ Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slice
             if (box_origin[i] < 0 || 
                 (i < _original_zarr_shape.size() && box_origin[i] + box_shape[i] > _original_zarr_shape[i])) {
                 spdlog::error("readDirectFromTensorStore: Coordinate {} out of bounds: origin={}, shape={}, max={}", 
+                             i, box_origin[i], box_shape[i], 
+                             i < _original_zarr_shape.size() ? _original_zarr_shape[i] : -1);
+                return false;
+            }
+        }
+        
+        spdlog::debug("DIRECT READ: TensorStore slice [time={}, freq={}, ?={}, y={}:{}, x={}:{}]",
+                     box_origin[0], box_origin[1], box_origin[2], 
+                     box_origin[3], box_origin[3] + box_shape[3] - 1,
+                     box_origin[4], box_origin[4] + box_shape[4] - 1);
+        
+        tensorstore::Box<> cache_box(box_origin, box_shape);
+        
+        // Apply the box slice to the TensorStore
+        auto constrained_store = _tensorstore | tensorstore::AllDims().BoxSlice(cache_box);
+        if (!constrained_store.ok()) {
+            spdlog::error("Failed to create direct read slice: {}", constrained_store.status().ToString());
+            return false;
+        }
+        
+        // Read data directly
+        auto read_result = tensorstore::Read<tensorstore::zero_origin>(constrained_store.value()).result();
+        if (!read_result.ok()) {
+            spdlog::error("Failed to read direct data: {}", read_result.status().ToString());
+            return false;
+        }
+        
+        auto zarr_array = std::move(read_result.value());
+        
+        // Verify data type
+        if (zarr_array.dtype().name() != "float32") {
+            spdlog::error("Unexpected data type in direct read: {}", zarr_array.dtype().name());
+            return false;
+        }
+        
+        // Copy data to output buffer
+        size_t total_elements = 1;
+        for (int i = 0; i < length.size(); ++i) {
+            total_elements *= length[i];
+        }
+        buffer.resize(length);
+        
+        const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
+        std::copy(src_data, src_data + total_elements, buffer.data());
+        
+        spdlog::debug("DIRECT READ: Successfully read {} elements (shape={})", total_elements, length.toString());
+        return true;
+        
+    } catch (std::exception& e) {
+        spdlog::error("Exception in readDirectFromTensorStore: {}", e.what());
+        return false;
+    }
+}
+
+Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer& section) {
+    try {
+        const IPosition& start = section.start();
+        const IPosition& length = section.length();
+        
+        // CRITICAL FIX: Handle coordinate mapping based on actual section dimensions
+        // The issue is that ZarrLoader is passing coordinates in ZARR order already!
+        // We need to map the incoming slicer coordinates correctly
+        
+        spdlog::debug("readDirectFromTensorStore: section start={}, length={}, shape={}", 
+                     start.toString(), length.toString(), _original_zarr_shape.toString());
+        
+        std::vector<tensorstore::Index> box_origin;
+        std::vector<tensorstore::Index> box_shape;
+        
+        if (start.size() == 5) {
+            // 5D case: ZarrLoader already provides ZARR order [time, freq, stokes, y, x]
+            box_origin.resize(5);
+            box_shape.resize(5);
+            for (int i = 0; i < 5; ++i) {
+                box_origin[i] = start[i];
+                box_shape[i] = length[i];
+            }
+        } else if (start.size() == 4) {
+            // 4D case: incoming CARTA is typically [x, y, freq, stokes]
+            // Map CARTA [x,y,freq,stokes] -> ZARR [time=0, freq, stokes, y, x]
+            box_origin.resize(5);
+            box_shape.resize(5);
+            box_origin[0] = 0;                 // time = 0
+            box_origin[1] = start[2];          // freq
+            box_origin[2] = start[3];          // stokes
+            box_origin[3] = start[1];          // y
+            box_origin[4] = start[0];          // x
+            box_shape[0] = 1;                  // time = 1
+            box_shape[1] = length[2];          // freq length
+            box_shape[2] = length[3];          // stokes length
+            box_shape[3] = length[1];          // y length
+            box_shape[4] = length[0];          // x length
+        } else if (start.size() == 3) {
+            // 3D case: incoming CARTA [x,y,freq]
+            // Map CARTA [x,y,freq] -> ZARR [time=0, freq, stokes=0, y, x]
+            box_origin.resize(5);
+            box_shape.resize(5);
+            box_origin[0] = 0;                 // time = 0
+            box_origin[1] = start[2];          // freq
+            box_origin[2] = 0;                 // stokes = 0
+            box_origin[3] = start[1];          // y
+            box_origin[4] = start[0];          // x
+            box_shape[0] = 1;                  // time = 1
+            box_shape[1] = length[2];          // freq length
+            box_shape[2] = 1;                  // stokes = 1
+            box_shape[3] = length[1];          // y length
+            box_shape[4] = length[0];          // x length
+        } else if (start.size() == 2) {
+            // 2D case: incoming CARTA [x,y]
+            // Map CARTA [x,y] -> ZARR [time=0, freq=0, stokes=0, y, x]
+            box_origin.resize(5);
+            box_shape.resize(5);
+            box_origin[0] = 0;                 // time = 0
+            box_origin[1] = 0;                 // freq = 0
+            box_origin[2] = 0;                 // stokes = 0
+            box_origin[3] = start[1];          // y
+            box_origin[4] = start[0];          // x
+            box_shape[0] = 1;                  // time = 1
+            box_shape[1] = 1;                  // freq = 1
+            box_shape[2] = 1;                  // stokes = 1
+            box_shape[3] = length[1];          // y length
+            box_shape[4] = length[0];          // x length
+        } else {
+            spdlog::error("readPixelFromTensorStore: Unsupported section dimensions: {}", start.size());
+            return false;
+        }
+        spdlog::debug("dim = {}", start.size());
+        
+        // Validate coordinates against ZARR bounds
+        for (size_t i = 0; i < box_origin.size(); ++i) {
+            if (box_origin[i] < 0 || 
+                (i < _original_zarr_shape.size() && box_origin[i] + box_shape[i] > _original_zarr_shape[i])) {
+                spdlog::error("readPixelFromTensorStore: Coordinate {} out of bounds: origin={}, shape={}, max={}", 
                              i, box_origin[i], box_shape[i], 
                              i < _original_zarr_shape.size() ? _original_zarr_shape[i] : -1);
                 return false;
