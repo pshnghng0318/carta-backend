@@ -106,9 +106,10 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
         }
         
         casacore::IPosition shape = _image->shape();
-        int img_width = shape[0];
-        int img_height = shape[1];
-        int num_channels = (shape.size() > 1) ? shape[1] : 1;
+        // FIXED: For CARTA internal shape [x, y, freq, stokes] format:
+        int img_width = shape[0];     // x dimension  
+        int img_height = shape[1];    // y dimension
+        int num_channels = shape[2];  // freq dimension (was incorrectly shape[1])
         
         if (cursor_x < 0 || cursor_y < 0 || cursor_x >= img_width || cursor_y >= img_height) {
             spdlog::error("ZarrLoader::GetCursorSpectralData: Cursor out of bounds: ({},{}) (image: {}x{})", 
@@ -134,8 +135,8 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
                 start = casacore::IPosition(5, 0, z, 0, cursor_y, cursor_x);
                 length = casacore::IPosition(5, 1, 1, 1, 1, 1);
             } else if (shape.size() == 4) {
-                // 4D: [freq, stokes, y, x]
-                start = casacore::IPosition(4, z, 0, cursor_y, cursor_x);
+                // 4D: CARTA internal format [x, y, freq, stokes]
+                start = casacore::IPosition(4, cursor_x, cursor_y, z, 0);
                 length = casacore::IPosition(4, 1, 1, 1, 1);
             } else if (shape.size() == 3) {
                 // 3D: [freq, y, x] 
