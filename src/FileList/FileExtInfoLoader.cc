@@ -22,7 +22,7 @@
 
 #include "../ImageData/CartaFitsImage.h"
 #include "../ImageData/CartaHdf5Image.h"
-// #include "../ImageData/CartaZarrImage.h"
+#include "../ImageData/CartaZarrImage.h"
 #include "FileList/FitsHduList.h"
 #include "Logger/Logger.h"
 #include "Util/Casacore.h"
@@ -150,6 +150,19 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                 auto data_type = _loader->GetDataType();
                 auto equivalent_type = data_type; // for FITS only, for rescaled data
                 casacore::String image_type(image->imageType());
+                spdlog::debug("Image type: {}, Data type: {}, Equivalent type: {}", image_type, data_type, equivalent_type);
+                
+                // For ZARR images, ensure we get the correct data type from CartaZarrImage
+                if (image_type == "zarr") {
+                    auto zarr_data_type = image->dataType();
+                    spdlog::debug("ZARR image detected - loader data type: {}, CartaZarrImage data type: {}", data_type, zarr_data_type);
+                    if (data_type != zarr_data_type) {
+                        data_type = zarr_data_type;
+                        equivalent_type = zarr_data_type;
+                        spdlog::debug("Updated ZARR data type to: {} (equivalent: {})", data_type, equivalent_type);
+                    }
+                }
+                
                 bool use_image_for_entries(false);
                 if (image_type == "FITSImage") {
                     // casacore FitsKeywordList has incomplete header names (no n on CRVALn, CDELTn, CROTA, etc.) so read with fitsio
@@ -188,34 +201,26 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                 } else if (image_type == "CartaHdf5Image") {
                     CartaHdf5Image* hdf5_image = dynamic_cast<CartaHdf5Image*>(image.get());
                     casacore::Vector<casacore::String> headers = hdf5_image->FitsHeaderStrings();
-                    AddEntriesFromHeaderStrings(headers, hdu, extended_info);
-                // } else if (image_type == "CartaZarrImage") {
-                //     // CartaZarrImage doesn't have FITS headers like other formats
-                //     // Use the general FITS header conversion method
-                //     casacore::ImageFITSHeaderInfo fhi;
-                //     casacore::String error_string;
-                //     if (GetFITSHeader(image, hdu, fhi, error_string)) {
-                //         FitsHeaderInfoToHeaderEntries(fhi, extended_info);
-                //         use_image_for_entries = true;
-                //     } else {
-                //         message = error_string;
-                //         return false;
-                //     }
+                    AddEntriesFromHeaderStrings(headers, hdu, extended_info);    
                 } else {
                     // Get image headers in FITS format using casacore ImageHeaderToFITS
+                    spdlog::debug("Using GetFITSHeader fallback for image type: {}", image_type);
                     casacore::ImageFITSHeaderInfo fhi;
                     casacore::String error_string;
                     if (GetFITSHeader(image, hdu, fhi, error_string)) {
                         // Set header entries from ImageFITSHeaderInfo
                         FitsHeaderInfoToHeaderEntries(fhi, extended_info);
                         use_image_for_entries = true;
+                        spdlog::debug("Successfully generated FITS header for image type: {}", image_type);
                     } else {
                         message = error_string;
+                        spdlog::error("Failed to get FITS header for image type: {}, error: {}", image_type, error_string);
                         return false;
                     }
                 }
 
                 AddDataTypeEntry(extended_info, data_type, equivalent_type);
+                spdlog::debug("Added data type entry - data_type: {}, equivalent_type: {}", data_type, equivalent_type);
 
                 if (_loader->FindCoordinateAxes(message)) {
                     auto image_shape = _loader->GetShape();

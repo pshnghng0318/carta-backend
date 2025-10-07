@@ -19,6 +19,7 @@
 
 // TensorStore includes  
 #include "tensorstore/context.h"
+#include "tensorstore/data_type.h"
 #include "tensorstore/open.h"
 #include "tensorstore/open_mode.h"
 #include "tensorstore/spec.h"
@@ -73,8 +74,11 @@ private:
     
     // TensorStore members
     tensorstore::Context _context;
-    tensorstore::TensorStore<> _tensorstore;  // Use default template parameters
+    tensorstore::TensorStore<> _tensorstore;  // Explicitly specify float data type
     bool _tensorstore_initialized = false;
+    
+    // Data type information
+    casacore::DataType _actual_data_type = casacore::DataType::TpFloat; // Default to float
     
     // Channel cache for fast access - now supports region-based caching
     std::vector<float> _channel_cache;     // Cached data for current region
@@ -90,7 +94,9 @@ private:
     bool parseWCSFromZattrs(const nlohmann::json& zattrs);
     bool parseWCSFromCoordinateArrays(const std::filesystem::path& ra_path, const std::filesystem::path& dec_path, const std::filesystem::path& freq_path);
     bool parseWCSFromMetadata(const nlohmann::json& zattrs);
-    bool buildDirectionCoordinateFromArrays(double ra_rad, double dec_rad, double freq_hz, size_t height, size_t width, size_t depth);
+    bool buildDirectionCoordinateFromArrays(double ra_rad, double dec_rad, double freq_hz, 
+                                           double ra_cdelt_deg, double dec_cdelt_deg, double freq_cdelt_hz,
+                                           size_t height, size_t width, size_t depth);
     void createMinimalCoordinateSystem();
     void initializeTensorStore();
     

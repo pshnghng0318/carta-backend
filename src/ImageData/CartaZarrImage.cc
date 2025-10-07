@@ -56,6 +56,27 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
             nlohmann::json zarray_json;
             zarray_file >> zarray_json;
             
+            // Read dtype from .zarray metadata
+            if (zarray_json.contains("dtype")) {
+                std::string dtype_str = zarray_json["dtype"].get<std::string>();
+                spdlog::info("ZARR dtype: {}", dtype_str);
+                
+                // Parse ZARR dtype to casacore DataType
+                if (dtype_str == "<f4" || dtype_str == ">f4" || dtype_str == "float32") {
+                    _actual_data_type = casacore::DataType::TpFloat;
+                } else if (dtype_str == "<f8" || dtype_str == ">f8" || dtype_str == "float64") {
+                    _actual_data_type = casacore::DataType::TpDouble;
+                } else if (dtype_str == "<i4" || dtype_str == ">i4" || dtype_str == "int32") {
+                    _actual_data_type = casacore::DataType::TpInt;
+                } else if (dtype_str == "<i8" || dtype_str == ">i8" || dtype_str == "int64") {
+                    _actual_data_type = casacore::DataType::TpInt64;
+                } else {
+                    spdlog::warn("Unknown ZARR dtype {}, defaulting to float32", dtype_str);
+                    _actual_data_type = casacore::DataType::TpFloat;
+                }
+                spdlog::info("Mapped ZARR dtype {} to casacore DataType", dtype_str);
+            }
+            
             // Read shape from .zarray metadata
             if (zarray_json.contains("shape")) {
                 auto shape_array = zarray_json["shape"];
@@ -354,10 +375,7 @@ bool CartaZarrImage::parseWCSFromZattrs(const nlohmann::json& zattrs) {
 
 bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& ra_path, const std::filesystem::path& dec_path, const std::filesystem::path& freq_path) {
     try {
-        // spdlog::debug("ZARR WCS: Reading precise coordinate arrays");
-        
-        // TODO: Implement TensorStore reading of coordinate arrays
-        // For now, use a representative sample to build the coordinate system
+        spdlog::debug("ZARR WCS: Reading precise coordinate arrays from TensorStore");
         
         // Read array metadata to understand structure
         std::ifstream ra_zarray(ra_path / ".zarray");
@@ -370,50 +388,193 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
         
         // spdlog::debug("ZARR WCS: Coordinate arrays shape: {}x{}", height, width);
         
-        // For now, calculate approximate reference coordinates from center positions
-        // Later we can read actual data using TensorStore
-        size_t center_l = height / 2;
-        size_t center_m = width / 2;
+        // Read actual RA coordinate data using TensorStore
+        spdlog::info("ZARR COORDS: Reading RA coordinate array: {}x{}", height, width);
         
-        // Try to get pointing center from main .zattrs
-        double ra_rad = 0.0, dec_rad = 0.0;
-        std::filesystem::path main_zattrs = ra_path.parent_path() / ".zattrs";
-        std::ifstream main_file(main_zattrs);
-        if (main_file.is_open()) {
-            nlohmann::json main_json;
-            main_file >> main_json;
-            
-            // Try different sources for reference coordinates
-            if (main_json.contains("pointing_center")) {
-                auto center_data = main_json["pointing_center"]["data"];
-                if (center_data.is_array() && center_data.size() >= 2) {
-                    ra_rad = center_data[0].get<double>();
-                    dec_rad = center_data[1].get<double>();
-                    // spdlog::debug("ZARR WCS: Using pointing_center from main .zattrs: RA={:.6f} rad, DEC={:.6f} rad", 
-                    //             ra_rad, dec_rad);
-                }
-            } else if (main_json.contains("direction") && main_json["direction"].contains("reference")) {
-                auto ref_data = main_json["direction"]["reference"]["data"];
-                if (ref_data.is_array() && ref_data.size() >= 2) {
-                    ra_rad = ref_data[0].get<double>();
-                    dec_rad = ref_data[1].get<double>();
-                    // spdlog::debug("ZARR WCS: Using direction.reference from main .zattrs: RA={:.6f} rad, DEC={:.6f} rad", 
-                    //             ra_rad, dec_rad);
+        // Create TensorStore spec for RA array
+        nlohmann::json ra_spec = {
+            {"driver", "zarr2"},
+            {"kvstore", {{"driver", "file"}, {"path", ra_path.string()}}}
+        };
+        
+        auto ra_spec_result = tensorstore::Spec::FromJson(ra_spec);
+        if (!ra_spec_result.ok()) {
+            spdlog::error("Failed to create RA TensorStore spec: {}", ra_spec_result.status().ToString());
+            return false;
+        }
+        
+        auto ra_open = tensorstore::Open(ra_spec_result.value(), _context, 
+                                        tensorstore::OpenMode::open, 
+                                        tensorstore::ReadWriteMode::read).result();
+        if (!ra_open.ok()) {
+            spdlog::error("Failed to open RA TensorStore: {}", ra_open.status().ToString());
+            return false;
+        }
+        
+        auto ra_store = std::move(ra_open.value());
+        
+        // Sample RA coordinates to calculate pixel increment
+        // Read center row and a few sample points
+        size_t center_l = height / 2;
+        size_t sample_cols[] = {width/4, width/2, 3*width/4};
+        
+        std::vector<double> ra_samples;
+        std::vector<size_t> col_indices;
+        
+        for (size_t col : sample_cols) {
+            if (col < width) {
+                // Create slice for single pixel
+                std::vector<tensorstore::Index> origin = {static_cast<tensorstore::Index>(center_l), static_cast<tensorstore::Index>(col)};
+                std::vector<tensorstore::Index> shape = {1, 1};
+                tensorstore::Box<> slice_box(origin, shape);
+                
+                auto sliced_store = ra_store | tensorstore::AllDims().BoxSlice(slice_box);
+                if (sliced_store.ok()) {
+                    auto read_result = tensorstore::Read<tensorstore::zero_origin>(sliced_store.value()).result();
+                    if (read_result.ok()) {
+                        auto data_array = std::move(read_result.value());
+                        if (data_array.dtype().name() == "float64") {
+                            const double* data = reinterpret_cast<const double*>(data_array.data());
+                            ra_samples.push_back(data[0]);
+                            col_indices.push_back(col);
+                            spdlog::debug("RA sample at [{},{}]: {:.6f} rad ({:.6f}°)", 
+                                        center_l, col, data[0], data[0] * 180.0 / M_PI);
+                        }
+                    }
                 }
             }
         }
         
-        // If no pointing center found, calculate from coordinate array center
+        // Calculate RA pixel increment from samples
+        double ra_cdelt = 0.0;
+        if (ra_samples.size() >= 2) {
+            // Use linear fit or simple difference
+            double delta_ra = ra_samples.back() - ra_samples.front();
+            double delta_col = static_cast<double>(col_indices.back() - col_indices.front());
+            ra_cdelt = delta_ra / delta_col;  // radians per pixel
+            spdlog::info("ZARR COORDS: Calculated RA cdelt: {:.6e} rad/pix ({:.3f} arcsec/pix)", 
+                        ra_cdelt, ra_cdelt * 180.0 * 3600.0 / M_PI);
+        } else {
+            spdlog::warn("ZARR COORDS: Could not read RA samples, using default");
+            ra_cdelt = -2.5e-6;  // Default ~2.5 arcsec
+        }
+        
+        // Get reference RA value from center
+        double ra_rad = 0.0;
+        if (!ra_samples.empty()) {
+            ra_rad = ra_samples[ra_samples.size()/2];  // Use middle sample as reference
+        }
+        // Read actual DEC coordinate data using TensorStore
+        spdlog::info("ZARR COORDS: Reading DEC coordinate array: {}x{}", height, width);
+        
+        // Create TensorStore spec for DEC array
+        nlohmann::json dec_spec = {
+            {"driver", "zarr2"},
+            {"kvstore", {{"driver", "file"}, {"path", dec_path.string()}}}
+        };
+        
+        auto dec_spec_result = tensorstore::Spec::FromJson(dec_spec);
+        if (!dec_spec_result.ok()) {
+            spdlog::error("Failed to create DEC TensorStore spec: {}", dec_spec_result.status().ToString());
+            return false;
+        }
+        
+        auto dec_open = tensorstore::Open(dec_spec_result.value(), _context, 
+                                         tensorstore::OpenMode::open, 
+                                         tensorstore::ReadWriteMode::read).result();
+        if (!dec_open.ok()) {
+            spdlog::error("Failed to open DEC TensorStore: {}", dec_open.status().ToString());
+            return false;
+        }
+        
+        auto dec_store = std::move(dec_open.value());
+        
+        // Sample DEC coordinates to calculate pixel increment
+        // Read center column and a few sample points
+        size_t center_m = width / 2;
+        size_t sample_rows[] = {height/4, height/2, 3*height/4};
+        
+        std::vector<double> dec_samples;
+        std::vector<size_t> row_indices;
+        
+        for (size_t row : sample_rows) {
+            if (row < height) {
+                // Create slice for single pixel
+                std::vector<tensorstore::Index> origin = {static_cast<tensorstore::Index>(row), static_cast<tensorstore::Index>(center_m)};
+                std::vector<tensorstore::Index> shape = {1, 1};
+                tensorstore::Box<> slice_box(origin, shape);
+                
+                auto sliced_store = dec_store | tensorstore::AllDims().BoxSlice(slice_box);
+                if (sliced_store.ok()) {
+                    auto read_result = tensorstore::Read<tensorstore::zero_origin>(sliced_store.value()).result();
+                    if (read_result.ok()) {
+                        auto data_array = std::move(read_result.value());
+                        if (data_array.dtype().name() == "float64") {
+                            const double* data = reinterpret_cast<const double*>(data_array.data());
+                            dec_samples.push_back(data[0]);
+                            row_indices.push_back(row);
+                            spdlog::debug("DEC sample at [{},{}]: {:.6f} rad ({:.6f}°)", 
+                                        row, center_m, data[0], data[0] * 180.0 / M_PI);
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Calculate DEC pixel increment from samples
+        double dec_cdelt = 0.0;
+        if (dec_samples.size() >= 2) {
+            // Use linear fit or simple difference
+            double delta_dec = dec_samples.back() - dec_samples.front();
+            double delta_row = static_cast<double>(row_indices.back() - row_indices.front());
+            dec_cdelt = delta_dec / delta_row;  // radians per pixel
+            spdlog::info("ZARR COORDS: Calculated DEC cdelt: {:.6e} rad/pix ({:.3f} arcsec/pix)", 
+                        dec_cdelt, dec_cdelt * 180.0 * 3600.0 / M_PI);
+        } else {
+            spdlog::warn("ZARR COORDS: Could not read DEC samples, using default");
+            dec_cdelt = 2.5e-6;  // Default ~2.5 arcsec
+        }
+        
+        // Get reference DEC value from center
+        double dec_rad = 0.0;
+        if (!dec_samples.empty()) {
+            dec_rad = dec_samples[dec_samples.size()/2];  // Use middle sample as reference
+        }
+        
+        // Fallback to metadata if coordinate reading failed
         if (ra_rad == 0.0 && dec_rad == 0.0) {
-            // TODO: Read actual coordinate values from center pixels
-            // For now, use a default reasonable center for ASKAP data
-            ra_rad = 5.5;  // ~315 degrees, typical for Hydra field
-            dec_rad = -0.65; // ~-37 degrees, typical for southern sky
-            // spdlog::warn("ZARR WCS: No pointing center found, using default center: RA={:.6f} rad, DEC={:.6f} rad", 
-            //             ra_rad, dec_rad);
+            spdlog::warn("ZARR COORDS: Failed to read coordinate arrays, checking metadata");
+            
+            std::filesystem::path main_zattrs = ra_path.parent_path() / ".zattrs";
+            std::ifstream main_file(main_zattrs);
+            if (main_file.is_open()) {
+                nlohmann::json main_json;
+                main_file >> main_json;
+                
+                if (main_json.contains("pointing_center")) {
+                    auto center_data = main_json["pointing_center"]["data"];
+                    if (center_data.is_array() && center_data.size() >= 2) {
+                        ra_rad = center_data[0].get<double>();
+                        dec_rad = center_data[1].get<double>();
+                        spdlog::info("ZARR COORDS: Using pointing_center from metadata: RA={:.6f} rad, DEC={:.6f} rad", 
+                                    ra_rad, dec_rad);
+                    }
+                }
+            }
+            
+            if (ra_rad == 0.0 && dec_rad == 0.0) {
+                // Final fallback
+                ra_rad = 5.5;  // ~315 degrees, typical for Hydra field
+                dec_rad = -0.65; // ~-37 degrees, typical for southern sky
+                spdlog::warn("ZARR COORDS: Using default center: RA={:.6f} rad, DEC={:.6f} rad", 
+                            ra_rad, dec_rad);
+            }
         }
 
-        // Frequency handling - assume single channel for now
+        // Parse frequency coordinate array
+        double freq_cdelt = 1e6;  // Default 1 MHz
+        double freq_hz = 1.4e9;  // Default 1.4 GHz
+        
         std::ifstream freq_zarray(freq_path / ".zarray");
         nlohmann::json freq_meta;
         freq_zarray >> freq_meta;
@@ -421,44 +582,101 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
         auto freq_shape = freq_meta["shape"];
         size_t depth = freq_shape[0].get<size_t>();  // channel numbers
 
-        spdlog::debug("ZARR FREQ COOR: Frequency arrays shape: {}x{}", depth);
-
-        // For now, calculate approximate reference frequencies from center positions
-        // Later we can read actual data using TensorStore
-        size_t center_freq_channel = depth / 2;
-
-        // Try to get frequency center from main .zattrs
-        double freq_hz = 0.0;
-        std::filesystem::path main_freq_zattrs = freq_path.parent_path() / ".zattrs";
-        std::ifstream main_freq_file(main_freq_zattrs);
-        if (main_freq_file.is_open()) {
-            nlohmann::json main_freq_json;
-            main_freq_file >> main_freq_json;
-
-            // Try different sources for reference frequencies
-            if (main_freq_json.contains("reference_value")) {
-                auto freq_data = main_freq_json["reference_value"]["data"];
-                if (freq_data.is_array() && freq_data.size() >= 1) {
-                    freq_hz = freq_data[0].get<double>();
-                    // spdlog::debug("ZARR WCS: Using frequency from main .zattrs: FREQ={:.6f} Hz",
-                    //             freq_hz);
+        spdlog::info("ZARR COORDS: Reading frequency coordinate array, {} channels", depth);
+        
+        // Read actual frequency coordinate data using TensorStore
+        nlohmann::json freq_spec = {
+            {"driver", "zarr2"},
+            {"kvstore", {{"driver", "file"}, {"path", freq_path.string()}}}
+        };
+        
+        auto freq_spec_result = tensorstore::Spec::FromJson(freq_spec);
+        if (freq_spec_result.ok()) {
+            auto freq_open = tensorstore::Open(freq_spec_result.value(), _context, 
+                                             tensorstore::OpenMode::open, 
+                                             tensorstore::ReadWriteMode::read).result();
+            if (freq_open.ok()) {
+                auto freq_store = std::move(freq_open.value());
+                
+                // Read frequency samples to calculate increment
+                std::vector<double> freq_samples;
+                std::vector<size_t> freq_indices;
+                
+                // Sample a few frequency channels
+                size_t sample_channels[] = {0, depth/4, depth/2, 3*depth/4, depth-1};
+                
+                for (size_t ch : sample_channels) {
+                    if (ch < depth) {
+                        // Create slice for single frequency
+                        std::vector<tensorstore::Index> origin = {static_cast<tensorstore::Index>(ch)};
+                        std::vector<tensorstore::Index> shape = {1};
+                        tensorstore::Box<> slice_box(origin, shape);
+                        
+                        auto sliced_store = freq_store | tensorstore::AllDims().BoxSlice(slice_box);
+                        if (sliced_store.ok()) {
+                            auto read_result = tensorstore::Read<tensorstore::zero_origin>(sliced_store.value()).result();
+                            if (read_result.ok()) {
+                                auto data_array = std::move(read_result.value());
+                                if (data_array.dtype().name() == "float64") {
+                                    const double* data = reinterpret_cast<const double*>(data_array.data());
+                                    freq_samples.push_back(data[0]);
+                                    freq_indices.push_back(ch);
+                                    spdlog::debug("Frequency sample at channel {}: {:.3f} Hz ({:.3f} MHz)", 
+                                                ch, data[0], data[0] / 1e6);
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Calculate frequency increment from samples
+                if (freq_samples.size() >= 2) {
+                    double delta_freq = freq_samples.back() - freq_samples.front();
+                    double delta_ch = static_cast<double>(freq_indices.back() - freq_indices.front());
+                    freq_cdelt = delta_freq / delta_ch;  // Hz per channel
+                    freq_hz = freq_samples[0];  // First frequency as reference
+                    spdlog::info("ZARR COORDS: Calculated frequency cdelt: {:.3f} Hz/ch ({:.3f} MHz/ch)", 
+                                freq_cdelt, freq_cdelt / 1e6);
+                    spdlog::info("ZARR COORDS: Using frequency reference: {:.3f} Hz ({:.3f} MHz)", 
+                                freq_hz, freq_hz / 1e6);
+                } else {
+                    spdlog::warn("ZARR COORDS: Could not read frequency samples, trying metadata fallback");
+                    
+                    // Try to get frequency center from main .zattrs
+                    std::filesystem::path main_freq_zattrs = freq_path.parent_path() / ".zattrs";
+                    std::ifstream main_freq_file(main_freq_zattrs);
+                    if (main_freq_file.is_open()) {
+                        nlohmann::json main_freq_json;
+                        main_freq_file >> main_freq_json;
+                        
+                        if (main_freq_json.contains("spectral") && main_freq_json["spectral"].contains("reference")) {
+                            auto freq_ref_data = main_freq_json["spectral"]["reference"]["data"];
+                            if (freq_ref_data.is_array() && freq_ref_data.size() > 0) {
+                                freq_hz = freq_ref_data[0].get<double>();
+                                spdlog::info("ZARR COORDS: Using frequency reference from metadata: {:.3f} Hz ({:.3f} MHz)", 
+                                            freq_hz, freq_hz / 1e6);
+                            }
+                        }
+                    }
                 }
             }
         }
 
-        // If no frequency center found, calculate from frequency array center
-        if (freq_hz == 0.0) {
-            // TODO: Read actual frequency values from center pixels
-            // For now, use a default reasonable center for ASKAP data
-            freq_hz = 1.0e9;  // ~1 GHz, typical for ASKAP data
-            // spdlog::warn("ZARR WCS: No frequency center found, using default center: FREQ={:.6f} Hz",
-            //             freq_hz);
-        }
+        
+        // Store calculated coordinate values for use in coordinate system creation
+        double ra_deg = ra_rad * 180.0 / M_PI;
+        double dec_deg = dec_rad * 180.0 / M_PI;
+        double ra_cdelt_deg = ra_cdelt * 180.0 / M_PI;  // Convert to degrees
+        double dec_cdelt_deg = dec_cdelt * 180.0 / M_PI;  // Convert to degrees
+        
+        spdlog::info("ZARR COORDS: Final coordinate parameters:");
+        spdlog::info("  RA center: {:.6f}° (cdelt: {:.6f}°/pix)", ra_deg, ra_cdelt_deg);
+        spdlog::info("  DEC center: {:.6f}° (cdelt: {:.6f}°/pix)", dec_deg, dec_cdelt_deg);
+        spdlog::info("  FREQ reference: {:.3f} MHz (cdelt: {:.3f} MHz/ch)", freq_hz / 1e6, freq_cdelt / 1e6);
 
-        return buildDirectionCoordinateFromArrays(ra_rad, dec_rad, freq_hz, height, width, depth);
-
+        return buildDirectionCoordinateFromArrays(ra_rad, dec_rad, freq_hz, ra_cdelt_deg, dec_cdelt_deg, freq_cdelt, height, width, depth);
     } catch (std::exception& e) {
-        // spdlog::error("ZARR WCS: Exception reading coordinate arrays: {}", e.what());
+        spdlog::error("ZARR COORDS: Exception in parseWCSFromCoordinateArrays: {}", e.what());
         return false;
     }
 }
@@ -492,7 +710,9 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
 //     }
 // }
 
-bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double dec_rad, double freq_hz, size_t height, size_t width, size_t depth) {
+bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double dec_rad, double freq_hz, 
+                                                      double ra_cdelt_deg, double dec_cdelt_deg, double freq_cdelt_hz,
+                                                      size_t height, size_t width, size_t depth) {
     try {
         // spdlog::debug("ZARR WCS: Building DirectionCoordinate from coordinate arrays");
         // spdlog::debug("ZARR WCS: Reference RA={:.6f} rad ({:.6f}°), DEC={:.6f} rad ({:.6f}°)", 
@@ -504,12 +724,14 @@ bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double de
         ref_val(0) = ra_rad;   // RA in radians
         ref_val(1) = dec_rad;  // DEC in radians
         
-        // Calculate approximate pixel increments 
-        // For ASKAP data, typical pixel scale is around 2.5 arcseconds
-        // But we should calculate this from the actual coordinate arrays eventually
+        // Use calculated pixel increments from coordinate arrays
         casacore::Vector<double> inc(2);
-        inc(0) = -2.5 * M_PI / (180.0 * 3600.0);  // -2.5 arcsec in radians (negative for RA)
-        inc(1) = 2.5 * M_PI / (180.0 * 3600.0);   // +2.5 arcsec in radians
+        inc(0) = -ra_cdelt_deg * M_PI / 180.0;    // RA increment in radians (negative for RA)
+        inc(1) = dec_cdelt_deg * M_PI / 180.0;    // DEC increment in radians
+        
+        spdlog::info("ZARR WCS: Using calculated pixel increments:");
+        spdlog::info("  RA increment: {:.6e} rad ({:.3f} arcsec)", inc(0), inc(0) * 180.0 * 3600.0 / M_PI);
+        spdlog::info("  DEC increment: {:.6e} rad ({:.3f} arcsec)", inc(1), inc(1) * 180.0 * 3600.0 / M_PI);
         
         // Reference pixel (center of image)
         casacore::Vector<double> ref_pix(2);
@@ -567,17 +789,20 @@ bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double de
         // Create SpectralCoordinate
 
         try {
-            // Try default values for now
-            double rest_freq = 1420405751.786; // in Hz
-            double spectral_crval = freq_hz; // Reference frequency in Hz
-            double spectral_cdelt = 0.1e6; // 0.1 MHz channel width (placeholder)
+            // Use calculated frequency values from coordinate arrays
+            double rest_freq = 1420405751.786; // in Hz (HI line, could be updated from metadata)
+            double spectral_crval = freq_hz; // Reference frequency in Hz from coordinate arrays
+            double spectral_cdelt = freq_cdelt_hz; // Channel width from coordinate arrays
             double spectral_crpix = (depth - 1) / 2.0 + 1; // 1-based pixel
             // Use casacore MFrequency type for the SpectralCoordinate constructor
             casacore::MFrequency::Types frequency_type = casacore::MFrequency::TOPO; // default to TOPO
 
             spec_coord = SpectralCoordinate(frequency_type, spectral_crval, spectral_cdelt, spectral_crpix, rest_freq);
 
-            spdlog::debug("ZARR FREQ COOR: SpectralCoordinate created successfully");
+            spdlog::info("ZARR WCS: SpectralCoordinate created with calculated values:");
+            spdlog::info("  Reference frequency: {:.3f} MHz", spectral_crval / 1e6);
+            spdlog::info("  Channel width: {:.3f} MHz", spectral_cdelt / 1e6);
+            spdlog::info("  Reference pixel: {:.1f}", spectral_crpix);
             
         } catch (const std::exception& coord_e) {
             spdlog::error("ZARR FREQ COOR: Failed to create SpectralCoordinate: {}", coord_e.what());
@@ -978,7 +1203,8 @@ void CartaZarrImage::initializeTensorStore() {
             input_spec, 
             _context, 
             tensorstore::OpenMode::open,
-            tensorstore::ReadWriteMode::read
+            tensorstore::ReadWriteMode::read,
+            tensorstore::dtype_v<float>  // Explicitly specify float data type
         );
         
         auto open_result = open_future.result();
@@ -1053,7 +1279,7 @@ String CartaZarrImage::imageType() const {
 }
 
 DataType CartaZarrImage::dataType() const {
-    return TpFloat;
+    return _actual_data_type;
 }
 
 Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
@@ -1067,10 +1293,54 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         const IPosition& length = section.length();
         const IPosition& stride = section.stride();
         
-        // Extract channel information for caching
-        // CARTA internal coordinates are in [x, y, freq, stokes] format
-        int freq_index = (start.size() > 2) ? start[2] : 0;
-        int stokes_index = (start.size() > 3) ? start[3] : 0;
+        // CRITICAL FIX: The coordinates are being reordered somewhere before doGetSlice
+        // Based on the error pattern, we need to detect and correct this reordering
+        
+        // Add diagnostic to understand coordinate format
+        spdlog::warn("doGetSlice: COORDINATE REORDERING DEBUG - start={}, length={}", start.toString(), length.toString());
+        spdlog::warn("doGetSlice: CARTA shape={}, ZARR shape={}", _shape.toString(), _original_zarr_shape.toString());
+        
+        int freq_index, stokes_index;
+        
+        // PATTERN DETECTION: From the error logs, we can see the reordering pattern:
+        // GetChunk request: [512,4096,0,0] -> doGetSlice receives: [0,0,4096,512]
+        // This suggests: [x,y,freq,stokes] -> [freq,stokes,y,x]
+        
+        bool coordinates_reordered = false;
+        if (start.size() >= 4) {
+            // Check if this looks like the reordered pattern
+            bool zero_in_spatial_pos = (start[0] == 0 && start[1] == 0);  // x=0, y=0
+            bool large_values_in_freq_stokes = (start[2] > 1000 || start[3] > 100);  // freq or stokes position has large values
+            bool length_pattern_matches = (length.size() >= 4 && length[0] == 1 && length[1] == 1 && 
+                                          (length[2] > 1 || length[3] > 1));  // spatial lengths in freq/stokes positions
+            
+            coordinates_reordered = zero_in_spatial_pos && large_values_in_freq_stokes && length_pattern_matches;
+            
+            spdlog::warn("doGetSlice: Reordering detection - zero_spatial={}, large_freq_stokes={}, length_pattern={}, REORDERED={}",
+                        zero_in_spatial_pos, large_values_in_freq_stokes, length_pattern_matches, coordinates_reordered);
+        }
+        
+        if (coordinates_reordered) {
+            // REVERSE THE REORDERING: [freq,stokes,y,x] back to [x,y,freq,stokes]
+            spdlog::warn("doGetSlice: Detected coordinate reordering - correcting from [freq,stokes,y,x] to [x,y,freq,stokes]");
+            
+            // Based on the pattern: GetChunk [7680,2560,0,0] -> doGetSlice [0,0,2560,7680]
+            // This means: [x,y,freq,stokes] -> [freq,stokes,y,x]
+            // So to reverse: [freq,stokes,y,x] -> [x,y,freq,stokes]
+            // start=[0,0,2560,7680] represents [freq=0, stokes=0, y=2560, x=7680]
+            // We want: [x=7680, y=2560, freq=0, stokes=0]
+            
+            freq_index = start[0];    // freq from reordered position 0
+            stokes_index = start[1];  // stokes from reordered position 1
+            // Note: spatial coordinates start[2]=y, start[3]=x are in wrong positions but we'll handle this later
+            
+            spdlog::warn("doGetSlice: Corrected coordinates - freq={}, stokes={} (spatial coords will be fixed in cache lookup)", 
+                        freq_index, stokes_index);
+        } else {
+            // Normal case: assume correct CARTA [x, y, freq, stokes] format
+            freq_index = (start.size() > 2) ? start[2] : 0;
+            stokes_index = (start.size() > 3) ? start[3] : 0;
+        }
         
         // DEBUG: Track all frequency index requests to identify source of freq=128
         spdlog::warn("doGetSlice FREQ TRACKING: freq_index={}, stokes_index={}, start={}, length={}", 
@@ -1093,9 +1363,9 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         
         // Use region cache for small requests (e.g., z-profile regions, small tiles)
         // For 1D profiles, always use full channel cache to avoid complexity
-        // For single point requests, use direct read to avoid loading entire channel
+        // NEVER use direct read - spatial profiles should ALWAYS use cache system
         bool use_region_cache = !is_1d_profile && (req_width < full_width / 4 && req_height < full_height / 4);
-        bool use_direct_read = is_single_point;  // Skip all caching for single point requests
+        bool use_direct_read = false;  // DISABLED: Spatial profiles must use cache system
         
         // spdlog::debug("CACHE STRATEGY DECISION:");
         // spdlog::debug("  Request size: {}x{}, Full size: {}x{}", req_width, req_height, full_width, full_height);
@@ -1172,23 +1442,76 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         spdlog::debug("  ZARR original shape: {}", _original_zarr_shape.toString());
         
         if (_original_zarr_shape.size() == 5 && start.size() >= 4) {
-            // CARTA 4D format: [x, y, freq, stokes] 
-            // Original ZARR 5D format: [time, freq, pol, l, m] = [time, freq, stokes, y, x]
+            // CRITICAL: Use the corrected coordinates, not the original reordered ones
+            int correct_x, correct_y, correct_freq, correct_stokes;
+            
+            if (coordinates_reordered) {
+                // Use the corrected coordinates we calculated earlier
+                correct_freq = freq_index;    // Already corrected
+                correct_stokes = stokes_index; // Already corrected
+                correct_x = start[3];         // x from reordered position 3
+                correct_y = start[2];         // y from reordered position 2
+                
+                spdlog::debug("  Using corrected coordinates: x={}, y={}, freq={}, stokes={}", 
+                             correct_x, correct_y, correct_freq, correct_stokes);
+            } else {
+                // Normal case: use coordinates as-is
+                correct_x = start[0];
+                correct_y = start[1];
+                correct_freq = start[2];
+                correct_stokes = start[3];
+            }
+            
+            // Map corrected CARTA [x, y, freq, stokes] -> ZARR [time, freq, stokes, y, x]
             zarr_start.resize(5);
             zarr_length.resize(5);
             
-            // Map CARTA [x, y, freq, stokes] -> ZARR [time, freq, stokes, y, x]
-            zarr_start[0] = 0;                                      // ZARR[0]=time (always 0)
-            zarr_start[1] = (start.size() > 2) ? start[2] : 0;      // ZARR[1]=freq (from CARTA position 2)
-            zarr_start[2] = (start.size() > 3) ? start[3] : 0;      // ZARR[2]=stokes (from CARTA position 3)
-            zarr_start[3] = (start.size() > 1) ? start[1] : 0;      // ZARR[3]=y (from CARTA position 1)
-            zarr_start[4] = (start.size() > 0) ? start[0] : 0;      // ZARR[4]=x (from CARTA position 0)
+            zarr_start[0] = 0;                    // ZARR[0]=time (always 0)
+            zarr_start[1] = correct_freq;         // ZARR[1]=freq (corrected frequency)
+            zarr_start[2] = correct_stokes;       // ZARR[2]=stokes (corrected stokes)
+            zarr_start[3] = correct_y;            // ZARR[3]=y (corrected y)
+            zarr_start[4] = correct_x;            // ZARR[4]=x (corrected x)
             
-            zarr_length[0] = 1;                                     // ZARR[0]=time (always 1)
-            zarr_length[1] = (length.size() > 2) ? length[2] : 1;   // ZARR[1]=freq (freq length)
-            zarr_length[2] = (length.size() > 3) ? length[3] : 1;   // ZARR[2]=stokes (stokes length)
-            zarr_length[3] = (length.size() > 1) ? length[1] : 1;   // ZARR[3]=y (y length)
-            zarr_length[4] = (length.size() > 0) ? length[0] : 1;   // ZARR[4]=x (x length)
+            zarr_length[0] = 1;                   // ZARR[0]=time (always 1)
+            zarr_length[1] = 1;                   // ZARR[1]=freq (single frequency)
+            zarr_length[2] = 1;                   // ZARR[2]=stokes (single stokes)
+            
+            // CRITICAL: Clip lengths to stay within ZARR bounds
+            int requested_height = coordinates_reordered ? length[2] : length[1];
+            int requested_width = coordinates_reordered ? length[3] : length[0];
+            
+            // Clip y dimension (ZARR dimension 3)
+            int max_y_length = _original_zarr_shape[3] - correct_y;
+            zarr_length[3] = std::max(0, std::min(requested_height, max_y_length));
+            
+            // Clip x dimension (ZARR dimension 4) 
+            int max_x_length = _original_zarr_shape[4] - correct_x;
+            zarr_length[4] = std::max(0, std::min(requested_width, max_x_length));
+            
+            // If the request is completely outside bounds, return empty buffer
+            if (zarr_length[3] <= 0 || zarr_length[4] <= 0) {
+                spdlog::warn("Request completely outside ZARR bounds: x=[{},{}), y=[{},{}), ZARR bounds: x_max={}, y_max={}",
+                           correct_x, correct_x + requested_width,
+                           correct_y, correct_y + requested_height,
+                           _original_zarr_shape[4], _original_zarr_shape[3]);
+                
+                // Return buffer filled with NaN values to indicate invalid region
+                IPosition requested_shape = coordinates_reordered ? 
+                    IPosition(4, length[3], length[2], length[1], length[0]) :
+                    length;
+                buffer.resize(requested_shape);
+                buffer = std::numeric_limits<float>::quiet_NaN();
+                return true;
+            }
+            
+            if (zarr_length[3] != requested_height || zarr_length[4] != requested_width) {
+                spdlog::warn("  CLIPPED REQUEST: original height={} width={}, clipped height={} width={}", 
+                            requested_height, requested_width, zarr_length[3], zarr_length[4]);
+                spdlog::warn("  ZARR bounds: y_max={}, x_max={}, requested y=[{},{}), x=[{},{})", 
+                            _original_zarr_shape[3], _original_zarr_shape[4],
+                            correct_y, correct_y + requested_height,
+                            correct_x, correct_x + requested_width);
+            }
             
             spdlog::debug("  Mapped to ZARR 5D: start={}, length={}", zarr_start.toString(), zarr_length.toString());
             spdlog::debug("  ZARR coordinate check: time={}, freq={}, pol={}, l=[{},{}), m=[{},{})", 
@@ -1225,8 +1548,20 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         auto zarr_array = std::move(read_result.value());        
         
         // Convert TensorStore array to casacore Array with correct shape
-        IPosition buffer_shape = length;
-        buffer.resize(buffer_shape);
+        // IMPORTANT: Use the actual read dimensions (which may be clipped), not the original request
+        IPosition actual_read_shape;
+        if (_original_zarr_shape.size() == 5 && start.size() >= 4) {
+            // For 5D case, use the clipped dimensions
+            actual_read_shape.resize(4);
+            actual_read_shape[0] = zarr_length[4];  // width (x)
+            actual_read_shape[1] = zarr_length[3];  // height (y)
+            actual_read_shape[2] = zarr_length[1];  // freq (should be 1)
+            actual_read_shape[3] = zarr_length[2];  // stokes (should be 1)
+        } else {
+            actual_read_shape = length;
+        }
+        
+        buffer.resize(actual_read_shape);
         
         // Verify data type matches our expectation (float32)
         auto zarr_dtype = zarr_array.dtype();
@@ -1240,8 +1575,15 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         float* dest_data = buffer.data();
         
         size_t num_elements = buffer.nelements();
+        size_t zarr_elements = zarr_array.num_elements();
         
-        // Since we now read exactly the requested region, we can copy directly
+        if (num_elements != zarr_elements) {
+            spdlog::warn("Buffer size mismatch: buffer={}, zarr={}, using smaller size", 
+                        num_elements, zarr_elements);
+            num_elements = std::min(num_elements, zarr_elements);
+        }
+        
+        // Copy the actual data read
         std::copy(src_data, src_data + num_elements, dest_data);
         
         spdlog::debug("Successfully read {} elements from Zarr file (dtype: {})", num_elements, zarr_dtype.name());
@@ -1601,11 +1943,38 @@ bool CartaZarrImage::getSliceFromCache(casacore::Array<float>& buffer, const cas
         const IPosition& start = section.start();
         const IPosition& length = section.length();
         
-        // Extract region parameters
-        int start_x = start[0];  // CARTA x = ZARR l dimension
-        int start_y = start[1];  // CARTA y = ZARR m dimension  
-        int req_width = length[0];   // Requested slice width
-        int req_height = length[1];
+        // CRITICAL: Handle coordinate reordering in cache access too
+        // The same reordering that affects doGetSlice also affects cache access
+        int start_x, start_y, req_width, req_height;
+        
+        // Detect if coordinates are reordered using the same logic as doGetSlice
+        bool coordinates_reordered = false;
+        if (start.size() >= 4) {
+            bool zero_in_spatial_pos = (start[0] == 0 && start[1] == 0);
+            bool large_values_in_freq_stokes = (start[2] > 1000 || start[3] > 100);
+            bool length_pattern_matches = (length.size() >= 4 && length[0] == 1 && length[1] == 1 && 
+                                          (length[2] > 1 || length[3] > 1));
+            coordinates_reordered = zero_in_spatial_pos && large_values_in_freq_stokes && length_pattern_matches;
+        }
+        
+        if (coordinates_reordered) {
+            // Reverse the reordering: [freq,stokes,y,x] -> [x,y,freq,stokes]
+            // start=[0,0,2560,7680] represents [freq=0, stokes=0, y=2560, x=7680]
+            // We want: [x=7680, y=2560, ...]
+            start_x = start[3];      // x from reordered position 3
+            start_y = start[2];      // y from reordered position 2
+            req_width = length[3];   // width from reordered position 3
+            req_height = length[2];  // height from reordered position 2
+            
+            spdlog::debug("getSliceFromCache: Corrected spatial coordinates - x={}, y={}, width={}, height={}", 
+                         start_x, start_y, req_width, req_height);
+        } else {
+            // Normal case: assume correct CARTA [x, y, freq, stokes] format
+            start_x = start[0];      // CARTA x = ZARR l dimension
+            start_y = start[1];      // CARTA y = ZARR m dimension  
+            req_width = length[0];   // Requested slice width
+            req_height = length[1];  // Requested slice height
+        }
         
         // ENHANCED PARAMETER VALIDATION
         if (req_width <= 0 || req_height <= 0) {
@@ -2107,6 +2476,10 @@ Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer
             box_shape[2] = length[3];          // stokes length
             box_shape[3] = length[1];          // y length
             box_shape[4] = length[0];          // x length
+            
+            spdlog::debug("4D coordinate mapping: CARTA[{},{},{},{}] -> ZARR[{},{},{},{},{}]", 
+                         start[0], start[1], start[2], start[3],
+                         box_origin[0], box_origin[1], box_origin[2], box_origin[3], box_origin[4]);
         } else if (start.size() == 3) {
             // 3D case: incoming CARTA [freq,y,x] to match 4D pattern
             // Map CARTA [freq,y,x] -> ZARR [time=0, freq, stokes=0, y, x]
@@ -2147,9 +2520,16 @@ Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer
         for (size_t i = 0; i < box_origin.size(); ++i) {
             if (box_origin[i] < 0 || 
                 (i < _original_zarr_shape.size() && box_origin[i] + box_shape[i] > _original_zarr_shape[i])) {
-                spdlog::error("readPixelFromTensorStore: Coordinate {} out of bounds: origin={}, shape={}, max={}", 
+                spdlog::error("readPixelFromTensorStore: Coordinate {} out of bounds: origin={}, shape={}, max={} (ZARR dim names: [time,freq,stokes,y,x])", 
                              i, box_origin[i], box_shape[i], 
                              i < _original_zarr_shape.size() ? _original_zarr_shape[i] : -1);
+                spdlog::error("Failed mapping: box_origin=[{},{},{},{},{}], ZARR_shape=[{},{},{},{},{}]",
+                             box_origin[0], box_origin[1], box_origin[2], box_origin[3], box_origin[4],
+                             _original_zarr_shape.size() > 0 ? _original_zarr_shape[0] : -1,
+                             _original_zarr_shape.size() > 1 ? _original_zarr_shape[1] : -1,
+                             _original_zarr_shape.size() > 2 ? _original_zarr_shape[2] : -1,
+                             _original_zarr_shape.size() > 3 ? _original_zarr_shape[3] : -1,
+                             _original_zarr_shape.size() > 4 ? _original_zarr_shape[4] : -1);
                 return false;
             }
         }

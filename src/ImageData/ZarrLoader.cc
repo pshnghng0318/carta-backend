@@ -32,6 +32,10 @@ void ZarrLoader::AllocateImage(const std::string& hdu) {
             _num_dims = shape.size();
             _has_pixel_mask = _image->hasPixelMask();
             
+            // Set data type from CartaZarrImage
+            _data_type = _image->dataType();
+            spdlog::info("ZarrLoader: Set data type to {} from CartaZarrImage", _data_type);
+            
             // CRITICAL: Initialize coordinate system from the image
             _coord_sys = std::shared_ptr<casacore::CoordinateSystem>(
                 static_cast<casacore::CoordinateSystem*>(_image->coordinates().clone()));
@@ -39,7 +43,7 @@ void ZarrLoader::AllocateImage(const std::string& hdu) {
             // Set image shape for coordinate axis finding
             _image_shape = shape;
             
-            spdlog::info("Created CartaZarrImage: {} dims={}, has_mask={}", _filename, _num_dims, _has_pixel_mask);
+            spdlog::info("Created CartaZarrImage: {} dims={}, has_mask={}, data_type={}", _filename, _num_dims, _has_pixel_mask, _data_type);
         }
     } catch (std::exception& e) {
         spdlog::error("Failed to create CartaZarrImage for {}: {}", _filename, e.what());
