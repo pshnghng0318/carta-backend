@@ -1292,6 +1292,67 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         const IPosition& start = section.start();
         const IPosition& length = section.length();
         const IPosition& stride = section.stride();
+
+        spdlog::info("doGetSlice called with start={}, length={}, stride={}", 
+                    start.toString(), length.toString(), stride.toString());
+        
+        // Detect if this call is likely for histogram/statistics calculation
+        // Histogram calls typically have pattern: length=[full_width, 1, 1, 1] or similar
+        bool is_histogram_call = false;
+        if (length.size() >= 4) {
+            // Check for full-width or full-height reads with single channel/stokes
+            int spatial_dims = 0;
+            int singleton_dims = 0;
+            for (size_t i = 0; i < length.size(); ++i) {
+                if (length[i] > 100000) spatial_dims++;  // Large spatial dimension
+                else if (length[i] == 1) singleton_dims++;  // Single slice
+            }
+            spdlog::info("doGetSlice: spatial_dims={}, singleton_dims={}", spatial_dims, singleton_dims);
+            // Histogram typically reads full spatial data with single channel/stokes
+            is_histogram_call = (spatial_dims >= 1 && singleton_dims >= 2);
+        }
+        
+        // Track statistics calculation state for batch optimization
+        static bool in_statistics_mode = false;
+        static int stats_freq = -1;
+        static int stats_stokes = -1;
+        static std::chrono::time_point<std::chrono::steady_clock> stats_start_time;
+        
+        if (is_histogram_call) {
+            spdlog::info("doGetSlice: HISTOGRAM/STATISTICS CALCULATION DETECTED - start={}, length={}", start.toString(), length.toString());
+            
+            // For statistics calculation, try to optimize by preloading the entire channel
+            // This will reduce the number of individual doGetSlice calls from 4742 to much fewer
+            int current_freq = (start.size() > 2) ? start[2] : 0;
+            int current_stokes = (start.size() > 3) ? start[3] : 0;
+            
+            // Check if coordinates are reordered for statistics calls
+            if (start.size() >= 4 && start[0] == 0 && start[1] == 0) {
+                current_freq = start[0];
+                current_stokes = start[1];
+            }
+            
+            // Initialize statistics tracking
+            if (!in_statistics_mode) {
+                in_statistics_mode = true;
+                stats_freq = current_freq;
+                stats_stokes = current_stokes;
+                stats_start_time = std::chrono::steady_clock::now();
+                spdlog::info("doGetSlice: Starting STATISTICS BATCH MODE for freq={}, stokes={}", 
+                            stats_freq, stats_stokes);
+            }
+            
+            spdlog::info("doGetSlice: Statistics optimization - ensuring full channel cache for freq={}, stokes={}", 
+                        current_freq, current_stokes);
+        } else {
+            // Reset statistics mode if we're not doing histogram/stats calls anymore
+            if (in_statistics_mode) {
+                auto duration = std::chrono::steady_clock::now() - stats_start_time;
+                auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(duration).count();
+                spdlog::info("doGetSlice: STATISTICS BATCH MODE COMPLETED in {} ms", ms);
+                in_statistics_mode = false;
+            }
+        }
         
         // CRITICAL FIX: The coordinates are being reordered somewhere before doGetSlice
         // Based on the error pattern, we need to detect and correct this reordering
@@ -1364,7 +1425,8 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         // Use region cache for small requests (e.g., z-profile regions, small tiles)
         // For 1D profiles, always use full channel cache to avoid complexity
         // NEVER use direct read - spatial profiles should ALWAYS use cache system
-        bool use_region_cache = !is_1d_profile && (req_width < full_width / 4 && req_height < full_height / 4);
+        // For histogram/statistics calculation, ALWAYS use full channel cache for efficiency
+        bool use_region_cache = !is_1d_profile && !is_histogram_call && (req_width < full_width / 4 && req_height < full_height / 4);
         bool use_direct_read = false;  // DISABLED: Spatial profiles must use cache system
         
         // spdlog::debug("CACHE STRATEGY DECISION:");
@@ -1376,59 +1438,85 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         // spdlog::debug("  Current cache status: loaded={}, channel={}, is_full={}", _channel_cache_loaded, _cached_channel, _is_full_channel_cache);
         // spdlog::debug("  Target channel: {}", current_channel);
         
-        // For single point requests, skip all caching and read directly from TensorStore
-        if (use_direct_read) {
-            // spdlog::debug("SINGLE POINT OPTIMIZATION: Reading directly from TensorStore without caching");
+        // CACHE-FIRST STRATEGY (inspired by CartaFitsImage's GetDataSubset approach)
+        // CartaFitsImage always tries to avoid direct file access by using efficient data reading patterns
+        // We implement similar strategy for ZARR: prioritize cache, force cache for statistics, avoid row-by-row
+        
+        bool cache_hit = false;
+        
+        // For single point requests, still try cache first (unlike previous direct read approach)
+        if (use_direct_read && _channel_cache_loaded && _cached_channel == current_channel) {
+            spdlog::debug("ZARR doGetSlice: Single point request - trying cache first before direct TensorStore");
+            if (getSliceFromCache(buffer, section)) {
+                return true;
+            }
+            // If cache miss, fall through to TensorStore read
+            spdlog::debug("ZARR doGetSlice: Cache miss for single point, falling back to TensorStore");
             return readPixelFromTensorStore(buffer, section);
         }
         
-        // Check if we need to load a different channel into cache or switch cache type
-        if (!_channel_cache_loaded || _cached_channel != current_channel || 
-            (use_region_cache && _is_full_channel_cache) ||     // Want region but have full
-            (!use_region_cache && !_is_full_channel_cache)) {   // Want full but have region
+        // Check if current cache is suitable (similar to CartaFitsImage's _equiv_bitpix check)
+        bool cache_suitable = (_channel_cache_loaded && _cached_channel == current_channel);
+        bool cache_type_suitable = true;
+        
+        // For statistics/histogram, ensure we have full channel cache (like CartaFitsImage loads full data subset)
+        if (is_histogram_call && (!_is_full_channel_cache || !cache_suitable)) {
+            cache_type_suitable = false;
+            spdlog::debug("ZARR doGetSlice: Statistics/histogram requires full channel cache - loading now");
+        }
+        
+        // For region requests, check if we want region cache instead of full cache
+        if (!is_histogram_call && use_region_cache && (_is_full_channel_cache || !cache_suitable)) {
+            cache_type_suitable = false;
+        }
+        
+        // Load appropriate cache if needed (like CartaFitsImage's GetDataSubset template selection)
+        if (!cache_suitable || !cache_type_suitable) {
             
-            if (use_region_cache) {
-                // For small requests, load only the required region with some padding
-                int padding = std::min(100, std::min(req_width, req_height));  // Add padding for future nearby requests
+            if (use_region_cache && !is_histogram_call) {
+                // Load region cache for small requests
+                int padding = std::min(100, std::min(req_width, req_height));
                 int region_start_x = std::max(0, static_cast<int>(start[0]) - padding);
                 int region_start_y = std::max(0, static_cast<int>(start[1]) - padding);
                 int region_width = std::min(full_width - region_start_x, req_width + 2 * padding);
                 int region_height = std::min(full_height - region_start_y, req_height + 2 * padding);
                 
-                spdlog::info("Loading region cache [freq={}, stokes={}]: {}x{} at ({},{}) with padding {}", 
+                spdlog::debug("ZARR doGetSlice: Loading region cache [freq={}, stokes={}]: {}x{} at ({},{}) with padding {}",
                             freq_index, stokes_index, region_width, region_height, region_start_x, region_start_y, padding);
                 
-                if (!loadRegionCache(freq_index, stokes_index, region_start_x, region_start_y, region_width, region_height)) {
-                    spdlog::warn("Failed to load region cache, trying full channel cache");
+                if (loadRegionCache(freq_index, stokes_index, region_start_x, region_start_y, region_width, region_height)) {
+                    cache_hit = getSliceFromCache(buffer, section);
+                }
+                
+                if (!cache_hit) {
+                    spdlog::warn("ZARR doGetSlice: Region cache failed, falling back to full channel cache");
                     use_region_cache = false;  // Fall back to full channel cache
                 }
             }
             
-            if (!use_region_cache) {
-                spdlog::info("Loading full channel [freq={}, stokes={}] into cache for faster access", freq_index, stokes_index);
-                if (!loadChannelCache(freq_index, stokes_index)) {
-                    spdlog::warn("Failed to load channel cache, falling back to direct read");
-                    // Fall through to direct read
-                } else {
-                    // Try to get slice from cache
-                    if (getSliceFromCache(buffer, section)) {
-                        return true;
-                    }
-                    // If cache extraction failed, fall through to direct read
+            if (!use_region_cache || !cache_hit) {
+                // Load full channel cache (equivalent to CartaFitsImage's full data subset read)
+                spdlog::debug("ZARR doGetSlice: Loading full channel [freq={}, stokes={}] - FITS-style efficient data access",
+                            freq_index, stokes_index);
+                
+                if (loadChannelCache(freq_index, stokes_index)) {
+                    cache_hit = getSliceFromCache(buffer, section);
                 }
-            } else {
-                // Try to get slice from region cache
-                if (getSliceFromCache(buffer, section)) {
-                    return true;
+                
+                if (!cache_hit) {
+                    spdlog::warn("ZARR doGetSlice: Full channel cache failed, falling back to direct TensorStore read");
                 }
-                // If cache extraction failed, fall through to direct read
             }
         } else {
-            // Cache is already loaded for this channel, use it
-            if (getSliceFromCache(buffer, section)) {
-                return true;
-            }
-            // If cache extraction failed, fall through to direct read
+            // Cache is already loaded and suitable, use it (like CartaFitsImage using already loaded data)
+            cache_hit = getSliceFromCache(buffer, section);
+        }
+        
+        // If cache served the request successfully, return (like CartaFitsImage successful GetDataSubset)
+        if (cache_hit) {
+            spdlog::debug("ZARR doGetSlice: Successfully served {} from cache (FITS-style efficient access)",
+                         is_histogram_call ? "statistics/histogram" : "data");
+            return true;
         }
         
         // Direct read from TensorStore (fallback or non-first-channel)

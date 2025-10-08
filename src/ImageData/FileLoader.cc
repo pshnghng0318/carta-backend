@@ -389,6 +389,10 @@ bool FileLoader::GetSlice(casacore::Array<float>& data, const StokesSlicer& stok
 
             data = slice_data; // copy from reference
             return true;
+        } else if (image_type == "zarr") {
+            // Use tensorstore for slice
+            spdlog::info("Using ZARR direct doGetSlice for histogram calculation - bypassing iterator");
+            return image->doGetSlice(data, slicer);
         } else if (image_type == "RebinImage") {
             // For PV preview, image coordinate system and headers only.
             // Data is rebinned and accessed in PvPreviewCube.

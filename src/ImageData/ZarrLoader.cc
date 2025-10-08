@@ -32,10 +32,6 @@ void ZarrLoader::AllocateImage(const std::string& hdu) {
             _num_dims = shape.size();
             _has_pixel_mask = _image->hasPixelMask();
             
-            // Set data type from CartaZarrImage
-            _data_type = _image->dataType();
-            spdlog::info("ZarrLoader: Set data type to {} from CartaZarrImage", _data_type);
-            
             // CRITICAL: Initialize coordinate system from the image
             _coord_sys = std::shared_ptr<casacore::CoordinateSystem>(
                 static_cast<casacore::CoordinateSystem*>(_image->coordinates().clone()));
@@ -43,7 +39,7 @@ void ZarrLoader::AllocateImage(const std::string& hdu) {
             // Set image shape for coordinate axis finding
             _image_shape = shape;
             
-            spdlog::info("Created CartaZarrImage: {} dims={}, has_mask={}, data_type={}", _filename, _num_dims, _has_pixel_mask, _data_type);
+            spdlog::info("Created CartaZarrImage: {} dims={}, has_mask={}", _filename, _num_dims, _has_pixel_mask);
         }
     } catch (std::exception& e) {
         spdlog::error("Failed to create CartaZarrImage for {}: {}", _filename, e.what());
@@ -156,6 +152,8 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
             }
             
             casacore::Array<float> pixel_array;
+            spdlog::debug("GetCursorSpectralData: Reading channel {} with start={} length={}", 
+                         z, fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
             if (!zarr_image->doGetSlice(pixel_array, casacore::Slicer(start, length))) {
                 spdlog::error("ZarrLoader::GetCursorSpectralData: doGetSlice failed for channel {}", z);
                 return false;
@@ -509,6 +507,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             }
 
             casacore::Array<float> region_array;
+            spdlog::debug("GetRegionSpectralData: Reading channel {} with start={} length={}", 
+                         z, fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
             if (!zarr_image->doGetSlice(region_array, casacore::Slicer(start, length))) {
                 spdlog::error("ZarrLoader::GetRegionSpectralData: doGetSlice failed for channel {}", z);
                 continue;
@@ -627,6 +627,8 @@ bool ZarrLoader::GetChunk(std::vector<float>& data, int& data_width, int& data_h
         }
         
         casacore::Array<float> chunk_array;
+        spdlog::info("GetChunk: Reading chunk with start={} length={}", 
+                     fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
         if (!zarr_image->doGetSlice(chunk_array, casacore::Slicer(start, length))) {
             spdlog::error("ZarrLoader::GetChunk: doGetSlice failed");
             return false;
