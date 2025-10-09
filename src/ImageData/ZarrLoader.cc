@@ -606,21 +606,21 @@ bool ZarrLoader::GetChunk(std::vector<float>& data, int& data_width, int& data_h
         
         casacore::IPosition start, length;
         if (shape.size() == 5) {
-            // 5D ZARR: [time, freq, ?, y, x]
-            start = casacore::IPosition(5, 0, z, 0, min_y, min_x);
-            length = casacore::IPosition(5, 1, 1, 1, data_height, data_width);
+            // 5D: Use CARTA standard order [x, y, z, stokes, time] 
+            start = casacore::IPosition(5, min_x, min_y, z, stokes, 0);
+            length = casacore::IPosition(5, data_width, data_height, 1, 1, 1);
         } else if (shape.size() == 4) {
-            // 4D: [freq, ?, y, x]
-            start = casacore::IPosition(4, z, 0, min_y, min_x);
-            length = casacore::IPosition(4, 1, 1, data_height, data_width);
+            // 4D: Use CARTA standard order [x, y, z, stokes]
+            start = casacore::IPosition(4, min_x, min_y, z, stokes);
+            length = casacore::IPosition(4, data_width, data_height, 1, 1);
         } else if (shape.size() == 3) {
-            // 3D: [freq, y, x]
-            start = casacore::IPosition(3, z, min_y, min_x);
-            length = casacore::IPosition(3, 1, data_height, data_width);
+            // 3D: Use CARTA standard order [x, y, z]
+            start = casacore::IPosition(3, min_x, min_y, z);
+            length = casacore::IPosition(3, data_width, data_height, 1);
         } else if (shape.size() == 2) {
-            // 2D: [y, x]
-            start = casacore::IPosition(2, min_y, min_x);
-            length = casacore::IPosition(2, data_height, data_width);
+            // 2D: Use CARTA standard order [x, y]
+            start = casacore::IPosition(2, min_x, min_y);
+            length = casacore::IPosition(2, data_width, data_height);
         } else {
             spdlog::error("ZarrLoader::GetChunk: Unsupported number of dimensions: {}", shape.size());
             return false;

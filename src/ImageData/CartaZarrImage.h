@@ -48,6 +48,10 @@ public:
     void flush() override;
     void tempClose() override;
     void reopen() override;
+    
+    // Performance optimization methods - critical for preventing 1D slice processing
+    casacore::uInt advisedMaxPixels() const override;
+    casacore::IPosition doNiceCursorShape(casacore::uInt maxPixels) const override;
 
     // LatticeBase implementation
     casacore::Bool hasPixelMask() const override;

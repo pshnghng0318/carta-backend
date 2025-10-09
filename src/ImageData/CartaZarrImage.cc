@@ -1296,6 +1296,18 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         spdlog::info("doGetSlice called with start={}, length={}, stride={}", 
                     start.toString(), length.toString(), stride.toString());
         
+        // Detect coordinate reordering for cache logic (but don't transform coordinates)
+        bool coordinates_reordered = false;
+        if (start.size() >= 4) {
+            // Detect if coordinates are reordered based on ZARR format vs CARTA format
+            // This is used for cache logic, not coordinate transformation
+            bool zero_spatial = (start[0] == 0 && start[1] == 0);  
+            bool large_freq_stokes = (start[2] > 100 || start[3] > 10);  
+            bool spatial_lengths = (length.size() >= 4 && length[2] > 1 && length[3] > 1);
+            
+            coordinates_reordered = zero_spatial && large_freq_stokes && spatial_lengths;
+        }
+        
         // Detect if this call is likely for histogram/statistics calculation
         // Histogram calls typically have pattern: length=[full_width, 1, 1, 1] or similar
         bool is_histogram_call = false;
@@ -1367,35 +1379,12 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         // GetChunk request: [512,4096,0,0] -> doGetSlice receives: [0,0,4096,512]
         // This suggests: [x,y,freq,stokes] -> [freq,stokes,y,x]
         
-        bool coordinates_reordered = false;
-        if (start.size() >= 4) {
-            // Check if this looks like the reordered pattern
-            bool zero_in_spatial_pos = (start[0] == 0 && start[1] == 0);  // x=0, y=0
-            bool large_values_in_freq_stokes = (start[2] > 1000 || start[3] > 100);  // freq or stokes position has large values
-            bool length_pattern_matches = (length.size() >= 4 && length[0] == 1 && length[1] == 1 && 
-                                          (length[2] > 1 || length[3] > 1));  // spatial lengths in freq/stokes positions
-            
-            coordinates_reordered = zero_in_spatial_pos && large_values_in_freq_stokes && length_pattern_matches;
-            
-            spdlog::warn("doGetSlice: Reordering detection - zero_spatial={}, large_freq_stokes={}, length_pattern={}, REORDERED={}",
-                        zero_in_spatial_pos, large_values_in_freq_stokes, length_pattern_matches, coordinates_reordered);
-        }
-        
         if (coordinates_reordered) {
-            // REVERSE THE REORDERING: [freq,stokes,y,x] back to [x,y,freq,stokes]
-            spdlog::warn("doGetSlice: Detected coordinate reordering - correcting from [freq,stokes,y,x] to [x,y,freq,stokes]");
+            // After coordinate reordering, freq and stokes are now in their correct positions
+            freq_index = start[0];    // freq 
+            stokes_index = start[1];  // stokes
             
-            // Based on the pattern: GetChunk [7680,2560,0,0] -> doGetSlice [0,0,2560,7680]
-            // This means: [x,y,freq,stokes] -> [freq,stokes,y,x]
-            // So to reverse: [freq,stokes,y,x] -> [x,y,freq,stokes]
-            // start=[0,0,2560,7680] represents [freq=0, stokes=0, y=2560, x=7680]
-            // We want: [x=7680, y=2560, freq=0, stokes=0]
-            
-            freq_index = start[0];    // freq from reordered position 0
-            stokes_index = start[1];  // stokes from reordered position 1
-            // Note: spatial coordinates start[2]=y, start[3]=x are in wrong positions but we'll handle this later
-            
-            spdlog::warn("doGetSlice: Corrected coordinates - freq={}, stokes={} (spatial coords will be fixed in cache lookup)", 
+            spdlog::warn("doGetSlice: Using reordered coordinates - freq={}, stokes={}", 
                         freq_index, stokes_index);
         } else {
             // Normal case: assume correct CARTA [x, y, freq, stokes] format
@@ -1415,7 +1404,8 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         int req_height = length[1];
         int full_width = _shape[0];  // CARTA width
         int full_height = _shape[1]; // CARTA height
-        
+        spdlog::info("doGetSlice: Request size = {}x{}, Full image size = {}x{}", req_width, req_height, full_width, full_height);
+
         // Handle special cases for 1D slices (profiles) and single point requests
         bool is_horizontal_profile = (req_height == 1);  // Horizontal line (y-profile)
         bool is_vertical_profile = (req_width == 1);     // Vertical line (x-profile)
@@ -1476,8 +1466,21 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             if (use_region_cache && !is_histogram_call) {
                 // Load region cache for small requests
                 int padding = std::min(100, std::min(req_width, req_height));
-                int region_start_x = std::max(0, static_cast<int>(start[0]) - padding);
-                int region_start_y = std::max(0, static_cast<int>(start[1]) - padding);
+                
+                // Extract correct spatial coordinates based on reordering detection
+                int spatial_start_x, spatial_start_y;
+                if (coordinates_reordered) {
+                    // Reordered format: [freq, stokes, y, x] -> extract y,x as spatial coords
+                    spatial_start_x = (start.size() > 3) ? start[3] : 0;
+                    spatial_start_y = (start.size() > 2) ? start[2] : 0;
+                } else {
+                    // Normal format: [x, y, freq, stokes]
+                    spatial_start_x = start[0];
+                    spatial_start_y = start[1];
+                }
+                
+                int region_start_x = std::max(0, spatial_start_x - padding);
+                int region_start_y = std::max(0, spatial_start_y - padding);
                 int region_width = std::min(full_width - region_start_x, req_width + 2 * padding);
                 int region_height = std::min(full_height - region_start_y, req_height + 2 * padding);
                 
@@ -1537,8 +1540,8 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                 // Use the corrected coordinates we calculated earlier
                 correct_freq = freq_index;    // Already corrected
                 correct_stokes = stokes_index; // Already corrected
-                correct_x = start[3];         // x from reordered position 3
-                correct_y = start[2];         // y from reordered position 2
+                correct_x = start[2];         // x from reordered position 3
+                correct_y = start[3];         // y from reordered position 2
                 
                 spdlog::debug("  Using corrected coordinates: x={}, y={}, freq={}, stokes={}", 
                              correct_x, correct_y, correct_freq, correct_stokes);
@@ -1557,8 +1560,8 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             zarr_start[0] = 0;                    // ZARR[0]=time (always 0)
             zarr_start[1] = correct_freq;         // ZARR[1]=freq (corrected frequency)
             zarr_start[2] = correct_stokes;       // ZARR[2]=stokes (corrected stokes)
-            zarr_start[3] = correct_y;            // ZARR[3]=y (corrected y)
-            zarr_start[4] = correct_x;            // ZARR[4]=x (corrected x)
+            zarr_start[3] = correct_x;            // ZARR[3]=y (corrected y)
+            zarr_start[4] = correct_y;            // ZARR[4]=x (corrected x)
             
             zarr_length[0] = 1;                   // ZARR[0]=time (always 1)
             zarr_length[1] = 1;                   // ZARR[1]=freq (single frequency)
@@ -1569,23 +1572,25 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             int requested_width = coordinates_reordered ? length[3] : length[0];
             
             // Clip y dimension (ZARR dimension 3)
-            int max_y_length = _original_zarr_shape[3] - correct_y;
-            zarr_length[3] = std::max(0, std::min(requested_height, max_y_length));
+            int max_y_length = _original_zarr_shape[4] - correct_y;
+            zarr_length[4] = std::max(0, std::min(requested_height, max_y_length));
             
             // Clip x dimension (ZARR dimension 4) 
-            int max_x_length = _original_zarr_shape[4] - correct_x;
-            zarr_length[4] = std::max(0, std::min(requested_width, max_x_length));
+            int max_x_length = _original_zarr_shape[3] - correct_x;
+            zarr_length[3] = std::max(0, std::min(requested_width, max_x_length));
             
             // If the request is completely outside bounds, return empty buffer
             if (zarr_length[3] <= 0 || zarr_length[4] <= 0) {
                 spdlog::warn("Request completely outside ZARR bounds: x=[{},{}), y=[{},{}), ZARR bounds: x_max={}, y_max={}",
                            correct_x, correct_x + requested_width,
                            correct_y, correct_y + requested_height,
-                           _original_zarr_shape[4], _original_zarr_shape[3]);
+                           _original_zarr_shape[3], _original_zarr_shape[4]);
                 
                 // Return buffer filled with NaN values to indicate invalid region
                 IPosition requested_shape = coordinates_reordered ? 
-                    IPosition(4, length[3], length[2], length[1], length[0]) :
+                    // Which order is correct here???
+                    // IPosition(4, length[3], length[2], length[1], length[0]) :
+                    IPosition(4, length[2], length[3], length[1], length[0]) :
                     length;
                 buffer.resize(requested_shape);
                 buffer = std::numeric_limits<float>::quiet_NaN();
@@ -1689,12 +1694,19 @@ void CartaZarrImage::doPutSlice(const Array<float>& buffer, const IPosition& whe
 }
 
 Bool CartaZarrImage::doGetMaskSlice(Array<Bool>& buffer, const Slicer& section) {
-    // Stub implementation - not needed for file browser
-    return false;
+    // Get data for the section
+    Array<float> data_buffer;
+    if (!doGetSlice(data_buffer, section)) {
+        return false;
+    }
+    
+    // Create mask where finite values are true (valid), NaN/infinite values are false (invalid)
+    buffer = isFinite(data_buffer);
+    return true;
 }
 
 Bool CartaZarrImage::isMasked() const {
-    return false;
+    return true; // Enable masking to handle NaN values
 }
 
 Bool CartaZarrImage::isPersistent() const {
@@ -1741,7 +1753,7 @@ void CartaZarrImage::reopen() {
 }
 
 Bool CartaZarrImage::hasPixelMask() const {
-    return false;
+    return true; // Enable pixel mask to handle NaN values
 }
 
 const Lattice<Bool>& CartaZarrImage::pixelMask() const {
@@ -1958,6 +1970,8 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
             return true;
         } else {
             // For non-5D arrays, load the entire 2D image (ignore freq/stokes parameters)
+            spdlog::debug("Check _shape", _shape.toString());
+            spdlog::debug("Check _cache_width _cache_height", _cache_width, _cache_height);
             _cache_width = _shape[0];
             _cache_height = _shape[1];
             
@@ -2153,16 +2167,25 @@ bool CartaZarrImage::getSliceFromCache(casacore::Array<float>& buffer, const cas
         buffer.resize(length);
         float* dest_data = buffer.data();
         
-        // Initialize entire buffer with NaN for out-of-bounds regions
-        std::fill(dest_data, dest_data + (req_width * req_height), std::numeric_limits<float>::quiet_NaN());
+        // Do NOT pre-initialize with NaN - let each pixel be calculated properly
+        // Only set NaN for pixels that truly have no valid data
         
         // Process each row with downsampling
         for (int y = 0; y < req_height; ++y) {
             int src_y = start_y + y;
-            if (src_y < 0 || src_y >= _cache_height) continue; // Skip out-of-bounds rows
             
             // For each output column, calculate average from corresponding input pixels
             for (int out_x = 0; out_x < req_width; ++out_x) {
+                size_t dest_idx = y * req_width + out_x;
+                
+                // Initialize this pixel as NaN, will be overwritten if valid data is found
+                dest_data[dest_idx] = std::numeric_limits<float>::quiet_NaN();
+                
+                // Skip if source row is out of bounds
+                if (src_y < 0 || src_y >= _cache_height) {
+                    continue;
+                }
+                
                 // Calculate the range of source pixels for this output pixel
                 float src_x_start = out_x * downsample_factor;
                 float src_x_end = (out_x + 1) * downsample_factor;
@@ -2215,38 +2238,89 @@ bool CartaZarrImage::getSliceFromCache(casacore::Array<float>& buffer, const cas
                     }
                 }
                 
-                size_t dest_idx = y * req_width + out_x;
-                
-                // Enhanced boundary validation for destination buffer
-                size_t buffer_size = req_width * req_height;
-                if (dest_idx >= buffer_size) {
-                    spdlog::error("DEST BUFFER OVERFLOW: dest_idx {} >= buffer_size {}, y={}, out_x={}, req_width={}, req_height={}", 
-                                 dest_idx, buffer_size, y, out_x, req_width, req_height);
-                    continue;
-                }
-                
-                // Set output value
+                // Set output value - dest_idx already calculated and validated above
                 if (weight_sum > 0.0f && valid_pixels > 0) {
                     dest_data[dest_idx] = sum / weight_sum;
-                } else {
-                    dest_data[dest_idx] = std::numeric_limits<float>::quiet_NaN();
                 }
+                // Note: dest_data[dest_idx] already initialized to NaN if no valid data found
             }
         }
         
-        // Debug: Check extracted data
+        // Debug: Check extracted data with detailed sampling
         if (req_width > 0 && req_height > 0) {
             size_t valid_count = 0;
             size_t nan_count = 0;
+            float min_val = std::numeric_limits<float>::max();
+            float max_val = std::numeric_limits<float>::lowest();
+            
+            // // Sample first few values for debugging
+            // spdlog::debug("EXTRACTED DATA SAMPLE (first 10 pixels):");
+            // for (int i = 0; i < std::min(10, req_width * req_height); ++i) {
+            //     spdlog::debug("  pixel[{}] = {}, isNaN={}, isFinite={}", 
+            //                  i, dest_data[i], std::isnan(dest_data[i]), std::isfinite(dest_data[i]));
+            // }
+            
             for (int i = 0; i < req_width * req_height; ++i) {
                 if (std::isnan(dest_data[i])) {
                     nan_count++;
-                } else {
+                } else if (std::isfinite(dest_data[i])) {
                     valid_count++;
+                    min_val = std::min(min_val, dest_data[i]);
+                    max_val = std::max(max_val, dest_data[i]);
                 }
             }
-            // spdlog::debug("Downsampled data: {} valid, {} NaN pixels (factor: {:.2f})", 
-            //              valid_count, nan_count, downsample_factor);
+            
+            // Calculate comprehensive statistics
+            double sum = 0.0;
+            double sum_squares = 0.0;
+            double mean = 0.0;
+            double rms = 0.0;
+            double stddev = 0.0;
+            
+            if (valid_count > 0) {
+                // Calculate sum and sum of squares
+                for (int i = 0; i < req_width * req_height; ++i) {
+                    if (std::isfinite(dest_data[i])) {
+                        sum += dest_data[i];
+                        sum_squares += dest_data[i] * dest_data[i];
+                    }
+                }
+                
+                mean = sum / valid_count;
+                rms = std::sqrt(sum_squares / valid_count);
+                
+                // Calculate standard deviation
+                double variance_sum = 0.0;
+                for (int i = 0; i < req_width * req_height; ++i) {
+                    if (std::isfinite(dest_data[i])) {
+                        double diff = dest_data[i] - mean;
+                        variance_sum += diff * diff;
+                    }
+                }
+                stddev = std::sqrt(variance_sum / valid_count);
+            }
+            
+            // spdlog::debug("EXTRACTED DATA SUMMARY:");
+            // spdlog::debug("  Total pixels: {}", req_width * req_height);
+            // spdlog::debug("  Valid pixels: {}", valid_count);
+            // spdlog::debug("  NaN pixels: {}", nan_count);
+            // if (valid_count > 0) {
+            //     spdlog::debug("  Value range: [{}, {}]", min_val, max_val);
+                
+            //     // Enhanced statistics output for CARTA Statistics Widget
+            //     spdlog::info("ZARR STATISTICS CALCULATION RESULTS:");
+            //     spdlog::info("  Sum (Flux Density): {:.6e}", sum);
+            //     spdlog::info("  Mean: {:.6e}", mean);
+            //     spdlog::info("  Min: {:.6e}", min_val);
+            //     spdlog::info("  Max: {:.6e}", max_val);
+            //     spdlog::info("  RMS: {:.6e}", rms);
+            //     spdlog::info("  Std Dev: {:.6e}", stddev);
+            //     spdlog::info("  Valid Pixels: {}", valid_count);
+            //     spdlog::info("  Total Pixels: {}", req_width * req_height);
+            //     spdlog::info("  Data Coverage: {:.1f}%", (100.0 * valid_count) / (req_width * req_height));
+            // } else {
+            //     spdlog::error("NO VALID DATA EXTRACTED - ALL PIXELS ARE NaN!");
+            // }
             
             // Special debug check for downsampled matrices
             if (req_width > 100) {  // Only for significant width requests
@@ -2375,6 +2449,7 @@ bool CartaZarrImage::loadRegionCache(int freq_channel, int stokes_channel, int s
             _cache_height = height;
             _cache_start_x = start_x;
             _cache_start_y = start_y;
+            spdlog::debug("_cache_start_x={}, _cache_start_y={}, start_x={}, start_y={}", _cache_start_x, _cache_start_y, start_x, start_y);
             _channel_cache_loaded = true;
             _is_full_channel_cache = false;  // This is a region cache, not full channel
             
@@ -2668,6 +2743,32 @@ Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer
         spdlog::error("Exception in readDirectFromTensorStore: {}", e.what());
         return false;
     }
+}
+
+casacore::uInt CartaZarrImage::advisedMaxPixels() const {
+    // Return the total number of pixels in the image for memory management
+    size_t total_pixels = 1;
+    for (int i = 0; i < _shape.size(); ++i) {
+        total_pixels *= _shape[i];
+    }
+    return static_cast<casacore::uInt>(std::min(total_pixels, static_cast<size_t>(INT_MAX)));
+}
+
+casacore::IPosition CartaZarrImage::doNiceCursorShape(casacore::uInt maxPixels) const {
+    // Return a reasonable cursor shape for processing
+    casacore::IPosition cursor_shape = _shape;
+    
+    // For large images, try to limit to maxPixels
+    size_t total_pixels = cursor_shape.product();
+    if (total_pixels > maxPixels && maxPixels > 0) {
+        // For now, just return the full shape
+        // In the future, we could implement more sophisticated cursor shaping
+        cursor_shape = casacore::IPosition(_shape.size(), 1);
+        cursor_shape[0] = std::min(static_cast<casacore::Int>(maxPixels), static_cast<casacore::Int>(_shape[0]));
+        cursor_shape[1] = std::min(static_cast<casacore::Int>(maxPixels / cursor_shape[0]), static_cast<casacore::Int>(_shape[1]));
+    }
+    
+    return cursor_shape;
 }
 
 } // namespace carta
