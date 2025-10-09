@@ -1537,47 +1537,51 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             int correct_x, correct_y, correct_freq, correct_stokes;
             
             if (coordinates_reordered) {
-                // Use the corrected coordinates we calculated earlier
+                // When coordinates are reordered: [freq,stokes,y,x] instead of [x,y,freq,stokes]
                 correct_freq = freq_index;    // Already corrected
                 correct_stokes = stokes_index; // Already corrected
-                correct_x = start[2];         // x from reordered position 3
-                correct_y = start[3];         // y from reordered position 2
+                correct_x = start[3];         // x is in position 3 after reordering
+                correct_y = start[2];         // y is in position 2 after reordering
                 
-                spdlog::debug("  Using corrected coordinates: x={}, y={}, freq={}, stokes={}", 
+                spdlog::debug("  Using corrected coordinates from reordered: x={}, y={}, freq={}, stokes={}", 
                              correct_x, correct_y, correct_freq, correct_stokes);
             } else {
-                // Normal case: use coordinates as-is
+                // Normal case: use standard CARTA [x, y, freq, stokes] format
                 correct_x = start[0];
                 correct_y = start[1];
                 correct_freq = start[2];
                 correct_stokes = start[3];
+                
+                spdlog::debug("  Using standard CARTA coordinates: x={}, y={}, freq={}, stokes={}", 
+                             correct_x, correct_y, correct_freq, correct_stokes);
             }
             
-            // Map corrected CARTA [x, y, freq, stokes] -> ZARR [time, freq, stokes, y, x]
+            // Map corrected CARTA [x, y, freq, stokes] -> ZARR [time, freq, stokes, l, m]
+            // ZARR format: [time, freq, pol, l, m] where l=width(x), m=height(y)
             zarr_start.resize(5);
             zarr_length.resize(5);
             
             zarr_start[0] = 0;                    // ZARR[0]=time (always 0)
-            zarr_start[1] = correct_freq;         // ZARR[1]=freq (corrected frequency)
-            zarr_start[2] = correct_stokes;       // ZARR[2]=stokes (corrected stokes)
-            zarr_start[3] = correct_x;            // ZARR[3]=y (corrected y)
-            zarr_start[4] = correct_y;            // ZARR[4]=x (corrected x)
+            zarr_start[1] = correct_freq;         // ZARR[1]=freq
+            zarr_start[2] = correct_stokes;       // ZARR[2]=stokes  
+            zarr_start[3] = correct_x;            // ZARR[3]=l (width/x)
+            zarr_start[4] = correct_y;            // ZARR[4]=m (height/y)
             
             zarr_length[0] = 1;                   // ZARR[0]=time (always 1)
             zarr_length[1] = 1;                   // ZARR[1]=freq (single frequency)
             zarr_length[2] = 1;                   // ZARR[2]=stokes (single stokes)
             
             // CRITICAL: Clip lengths to stay within ZARR bounds
-            int requested_height = coordinates_reordered ? length[2] : length[1];
             int requested_width = coordinates_reordered ? length[3] : length[0];
+            int requested_height = coordinates_reordered ? length[2] : length[1];
             
-            // Clip y dimension (ZARR dimension 3)
-            int max_y_length = _original_zarr_shape[4] - correct_y;
-            zarr_length[4] = std::max(0, std::min(requested_height, max_y_length));
-            
-            // Clip x dimension (ZARR dimension 4) 
+            // Clip l dimension (ZARR dimension 3 = width/x)  
             int max_x_length = _original_zarr_shape[3] - correct_x;
             zarr_length[3] = std::max(0, std::min(requested_width, max_x_length));
+            
+            // Clip m dimension (ZARR dimension 4 = height/y)
+            int max_y_length = _original_zarr_shape[4] - correct_y;
+            zarr_length[4] = std::max(0, std::min(requested_height, max_y_length));
             
             // If the request is completely outside bounds, return empty buffer
             if (zarr_length[3] <= 0 || zarr_length[4] <= 0) {
@@ -1588,22 +1592,20 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                 
                 // Return buffer filled with NaN values to indicate invalid region
                 IPosition requested_shape = coordinates_reordered ? 
-                    // Which order is correct here???
-                    // IPosition(4, length[3], length[2], length[1], length[0]) :
-                    IPosition(4, length[2], length[3], length[1], length[0]) :
+                    IPosition(4, length[3], length[2], length[1], length[0]) :
                     length;
                 buffer.resize(requested_shape);
                 buffer = std::numeric_limits<float>::quiet_NaN();
                 return true;
             }
             
-            if (zarr_length[3] != requested_height || zarr_length[4] != requested_width) {
-                spdlog::warn("  CLIPPED REQUEST: original height={} width={}, clipped height={} width={}", 
-                            requested_height, requested_width, zarr_length[3], zarr_length[4]);
-                spdlog::warn("  ZARR bounds: y_max={}, x_max={}, requested y=[{},{}), x=[{},{})", 
+            if (zarr_length[3] != requested_width || zarr_length[4] != requested_height) {
+                spdlog::warn("  CLIPPED REQUEST: original width={} height={}, clipped width={} height={}", 
+                            requested_width, requested_height, zarr_length[3], zarr_length[4]);
+                spdlog::warn("  ZARR bounds: x_max={}, y_max={}, requested x=[{},{}), y=[{},{})", 
                             _original_zarr_shape[3], _original_zarr_shape[4],
-                            correct_y, correct_y + requested_height,
-                            correct_x, correct_x + requested_width);
+                            correct_x, correct_x + requested_width,
+                            correct_y, correct_y + requested_height);
             }
             
             spdlog::debug("  Mapped to ZARR 5D: start={}, length={}", zarr_start.toString(), zarr_length.toString());
@@ -1796,7 +1798,23 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
             spdlog::info("CARTA shape: [{}, {}]", _shape[0], _shape[1]);
             spdlog::info("ZARR original shape: [{}]", fmt::join(_original_zarr_shape, ", "));
             
-            // Create box for entire channel
+            // CRITICAL FIX: The freq_channel and stokes_channel parameters are CARTA coordinates
+            // We need to validate they're within ZARR bounds and map them correctly
+            spdlog::debug("CACHE LOAD: Input CARTA coordinates - freq={}, stokes={}", freq_channel, stokes_channel);
+            spdlog::debug("CACHE LOAD: ZARR bounds - freq=[0,{}), stokes=[0,{})", _original_zarr_shape[1], _original_zarr_shape[2]);
+            
+            // Validate coordinates are within ZARR bounds
+            if (freq_channel < 0 || freq_channel >= _original_zarr_shape[1]) {
+                spdlog::error("CACHE LOAD: Frequency index {} out of range [0,{})", freq_channel, _original_zarr_shape[1]);
+                return false;
+            }
+            
+            if (stokes_channel < 0 || stokes_channel >= _original_zarr_shape[2]) {
+                spdlog::error("CACHE LOAD: Stokes index {} out of range [0,{})", stokes_channel, _original_zarr_shape[2]);
+                return false;
+            }
+            
+            // Create box for entire channel - freq_channel and stokes_channel are already correct ZARR coordinates
             std::vector<tensorstore::Index> box_origin = {0, freq_channel, stokes_channel, 0, 0};
             std::vector<tensorstore::Index> box_shape = {1, 1, 1, _cache_width, _cache_height};
             

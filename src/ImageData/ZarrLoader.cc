@@ -230,7 +230,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         casacore::IPosition shape = _image->shape();
         int img_width = shape[0];
         int img_height = shape[1];
-        int num_channels = (shape.size() > 1) ? shape[1] : 1;
+        int num_channels = (shape.size() > 2) ? shape[2] : 1;  // FIXED: Use shape[2] for frequency dimension
 
         if (shape.size() > 3 && (stokes < 0 || stokes >= shape[3])) {
             spdlog::error("ZarrLoader::GetRegionSpectralData: Stokes {} out of bounds (max: {})", stokes, shape[3] - 1);
@@ -267,21 +267,21 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             
             casacore::IPosition start, length;
             if (shape.size() == 5) {
-                // 5D ZARR: [time, freq, ?, y, x] -> 讀取 [time, freq_range, ?, y_range, x_range]
-                start = casacore::IPosition(5, 0, z_start, 0, y_min, x_min);
-                length = casacore::IPosition(5, 1, profile_size, 1, region_height, region_width);
+                // 5D: Use CARTA standard order [x, y, freq, stokes, time] 
+                start = casacore::IPosition(5, x_min, y_min, z_start, stokes, 0);
+                length = casacore::IPosition(5, region_width, region_height, profile_size, 1, 1);
             } else if (shape.size() == 4) {
-                // 4D: [freq, ?, y, x]
-                start = casacore::IPosition(4, z_start, 0, y_min, x_min);
-                length = casacore::IPosition(4, profile_size, 1, region_height, region_width);
+                // 4D: Use CARTA standard order [x, y, freq, stokes]
+                start = casacore::IPosition(4, x_min, y_min, z_start, stokes);
+                length = casacore::IPosition(4, region_width, region_height, profile_size, 1);
             } else if (shape.size() == 3) {
-                // 3D: [freq, y, x]
-                start = casacore::IPosition(3, z_start, y_min, x_min);
-                length = casacore::IPosition(3, profile_size, region_height, region_width);
+                // 3D: Use CARTA standard order [x, y, freq]
+                start = casacore::IPosition(3, x_min, y_min, z_start);
+                length = casacore::IPosition(3, region_width, region_height, profile_size);
             } else if (shape.size() == 2) {
-                // 2D: [y, x]
-                start = casacore::IPosition(2, y_min, x_min);
-                length = casacore::IPosition(2, region_height, region_width);
+                // 2D: Use CARTA standard order [x, y]
+                start = casacore::IPosition(2, x_min, y_min);
+                length = casacore::IPosition(2, region_width, region_height);
             } else {
                 spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
                 return false;
@@ -300,13 +300,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                             profile_size, region_width, region_height);
                 spdlog::info("DIRECT READ: Mask shape = [{}], origin = [{}]", 
                             fmt::join(mask_shape.asStdVector(), ", "), fmt::join(origin.asStdVector(), ", "));
-                
-                spdlog::warn("DIRECT READ: ZARR shape is [time={}, freq={}, ?={}, y={}, x={}]", 
-                            shape.size() > 0 ? shape[0] : 0,
-                            shape.size() > 1 ? shape[1] : 0, 
-                            shape.size() > 2 ? shape[2] : 0,
-                            shape.size() > 3 ? shape[3] : 0,
-                            shape.size() > 4 ? shape[4] : 0);
                 
                 if (full_region_array.size() > 0) {
                     const float* data_ptr = full_region_array.data();
@@ -441,8 +434,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                                         } else {
                                             debug_linear_index = y * region_width + x;
                                         }
-                                        spdlog::info("DIRECT READ: Pixel[{},{},{}] = {} (valid #{} for channel {}) linear_idx={}", 
-                                                    x, y, z, value, valid_count, z, debug_linear_index);
+                                        // spdlog::info("DIRECT READ: Pixel[{},{},{}] = {} (valid #{} for channel {}) linear_idx={}", 
+                                        //             x, y, z, value, valid_count, z, debug_linear_index);
                                     }
                                 }
                             }
@@ -481,70 +474,94 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             }
         }
 
-        for (int z = z_start; z <= z_end; ++z) {
-            if (z >= num_channels) break;
+        // Read all channels at once for maximum efficiency
+        casacore::IPosition start, length;
+        if (shape.size() == 5) {
+            // 5D: Use CARTA standard order [x, y, freq, stokes, time] 
+            start = casacore::IPosition(5, x_min, y_min, z_start, stokes, 0);
+            length = casacore::IPosition(5, region_width, region_height, profile_size, 1, 1);
+        } else if (shape.size() == 4) {
+            // 4D: Use CARTA standard order [x, y, freq, stokes]
+            start = casacore::IPosition(4, x_min, y_min, z_start, stokes);
+            length = casacore::IPosition(4, region_width, region_height, profile_size, 1);
+        } else if (shape.size() == 3) {
+            // 3D: Use CARTA standard order [x, y, freq]
+            start = casacore::IPosition(3, x_min, y_min, z_start);
+            length = casacore::IPosition(3, region_width, region_height, profile_size);
+        } else if (shape.size() == 2) {
+            // 2D: Use CARTA standard order [x, y]
+            start = casacore::IPosition(2, x_min, y_min);
+            length = casacore::IPosition(2, region_width, region_height);
+        } else {
+            spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
+            return false;
+        }
 
-            casacore::IPosition start, length;
-            if (shape.size() == 5) {
-                // 5D ZARR: [time, freq, ?, y, x]
-                start = casacore::IPosition(5, 0, z, 0, y_min, x_min);
-                length = casacore::IPosition(5, 1, 1, 1, region_height, region_width);
-            } else if (shape.size() == 4) {
-                // 4D: [freq, ?, y, x]
-                start = casacore::IPosition(4, z, 0, y_min, x_min);
-                length = casacore::IPosition(4, 1, 1, region_height, region_width);
-            } else if (shape.size() == 3) {
-                // 3D: [freq, y, x]
-                start = casacore::IPosition(3, z, y_min, x_min);
-                length = casacore::IPosition(3, 1, region_height, region_width);
-            } else if (shape.size() == 2) {
-                // 2D: [y, x]
-                start = casacore::IPosition(2, y_min, x_min);
-                length = casacore::IPosition(2, region_height, region_width);
-            } else {
-                spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
-                return false;
-            }
+        casacore::Array<float> full_array;
+        spdlog::info("GetRegionSpectralData: Reading ALL {} channels at once with start={} length={}", 
+                     profile_size, fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
+        
+        if (!zarr_image->doGetSlice(full_array, casacore::Slicer(start, length))) {
+            spdlog::error("ZarrLoader::GetRegionSpectralData: doGetSlice failed for full spectral range [{}-{}]", z_start, z_end);
+            return false;
+        }
 
-            casacore::Array<float> region_array;
-            spdlog::debug("GetRegionSpectralData: Reading channel {} with start={} length={}", 
-                         z, fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
-            if (!zarr_image->doGetSlice(region_array, casacore::Slicer(start, length))) {
-                spdlog::error("ZarrLoader::GetRegionSpectralData: doGetSlice failed for channel {}", z);
-                continue;
-            }
-
+        // Process all channels from the single read
+        const float* data_ptr = full_array.data();
+        casacore::IPosition array_shape = full_array.shape();
+        
+        spdlog::info("GetRegionSpectralData: Successfully read full array of shape [{}], size={}", 
+                     fmt::join(array_shape.asStdVector(), ","), full_array.size());
+        
+        for (int z = 0; z < profile_size; ++z) {
             double sum = 0.0;
             int valid_count = 0;
             
-            auto region_iter = region_array.begin();
             for (int y = 0; y < region_height; ++y) {
                 for (int x = 0; x < region_width; ++x) {
                     int mask_x = x;
                     int mask_y = y;
                     if (mask_x < mask_shape[0] && mask_y < mask_shape[1] && mask(casacore::IPosition(2, mask_x, mask_y))) {
-                        float value = *region_iter;
-                        if (std::isfinite(value)) {
-                            sum += value;
-                            valid_count++;
+                        
+                        // Calculate linear index in full array
+                        size_t linear_index;
+                        if (array_shape.size() == 5) {
+                            // [x, y, freq, stokes, time] 
+                            linear_index = x + y * region_width + z * region_width * region_height;
+                        } else if (array_shape.size() == 4) {
+                            // [x, y, freq, stokes]
+                            linear_index = x + y * region_width + z * region_width * region_height;
+                        } else if (array_shape.size() == 3) {
+                            // [x, y, freq]
+                            linear_index = x + y * region_width + z * region_width * region_height;
+                        } else {
+                            // 2D: [x, y]
+                            linear_index = x + y * region_width;
+                        }
+                        
+                        if (linear_index < full_array.size()) {
+                            float value = data_ptr[linear_index];
+                            if (std::isfinite(value)) {
+                                sum += value;
+                                valid_count++;
+                            }
                         }
                     }
-                    ++region_iter;
                 }
             }
 
             if (valid_count > 0) {
-                profile_data[z - z_start] = sum / valid_count;
+                profile_data[z] = sum / valid_count;
             } else {
-                profile_data[z - z_start] = std::numeric_limits<double>::quiet_NaN();
+                profile_data[z] = std::numeric_limits<double>::quiet_NaN();
             }
-            
-            progress = static_cast<float>(z - z_start + 1) / profile_size;
         }
+        
+        progress = 1.0;  // Complete since we read everything at once
 
         results[CARTA::StatsType::Mean] = profile_data;
         
-        spdlog::debug("GetRegionSpectralData: Successfully calculated spectral profile for region {}x{} across {} channels", 
+        spdlog::info("GetRegionSpectralData: Successfully calculated spectral profile for region {}x{} across {} channels (SINGLE READ)", 
                      region_width, region_height, profile_size);
         
         return true;
