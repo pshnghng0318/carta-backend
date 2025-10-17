@@ -42,6 +42,13 @@ public:
     bool GetChunk(std::vector<float>& data, int& data_width, int& data_height,
         int min_x, int min_y, int z, int stokes, std::mutex& image_mutex) override;
         
+    // Override GetSlice for ZARR-specific optimizations
+    bool GetSlice(casacore::Array<float>& data, const StokesSlicer& stokes_slicer);
+    
+    // Optimized method for reading large spectral ranges at once
+    bool GetSpectralDataOptimized(std::vector<float>& data, int stokes, int x, int y, 
+                                 int z_start, int z_end, std::mutex& image_mutex);
+        
     const casacore::IPosition GetStatsDataShape(FileInfo::Data ds) override;
     std::unique_ptr<casacore::ArrayBase> GetStatsData(FileInfo::Data ds) override;
 

@@ -122,29 +122,30 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
             return false;
         }
         
-        spdlog::debug("GetCursorSpectralData: Reading Z profile for point ({},{}) stokes={}, {} channels", 
-                     cursor_x, cursor_y, stokes, num_channels);
+        spdlog::debug("GetCursorSpectralData: Reading {} channels one by one for point ({},{}) stokes={}", 
+                     num_channels, cursor_x, cursor_y, stokes);
         
         data.resize(num_channels);
         
+        // Read each channel individually
         for (int z = 0; z < num_channels; ++z) {
             casacore::IPosition start, length;
             
             if (shape.size() == 5) {
-                // 5D ZARR: [time, freq, stokes, y, x]
-                start = casacore::IPosition(5, 0, z, 0, cursor_y, cursor_x);
+                // 5D ZARR: [time, freq, stokes, x, y] - read single channel for single pixel
+                start = casacore::IPosition(5, 0, z, stokes, cursor_x, cursor_y);
                 length = casacore::IPosition(5, 1, 1, 1, 1, 1);
             } else if (shape.size() == 4) {
-                // 4D: CARTA internal format [x, y, freq, stokes]
-                start = casacore::IPosition(4, cursor_x, cursor_y, z, 0);
+                // 4D: CARTA internal format [x, y, freq, stokes] - read single channel for single pixel
+                start = casacore::IPosition(4, cursor_x, cursor_y, z, stokes);
                 length = casacore::IPosition(4, 1, 1, 1, 1);
             } else if (shape.size() == 3) {
-                // 3D: [freq, y, x] 
-                start = casacore::IPosition(3, z, cursor_y, cursor_x);
+                // 3D: [x, y, freq] - read single channel for single pixel
+                start = casacore::IPosition(3, cursor_x, cursor_y, z);
                 length = casacore::IPosition(3, 1, 1, 1);
             } else if (shape.size() == 2) {
-                // 2D: [y, x]
-                start = casacore::IPosition(2, cursor_y, cursor_x);
+                // 2D: [x, y] - single channel
+                start = casacore::IPosition(2, cursor_x, cursor_y);
                 length = casacore::IPosition(2, 1, 1);
             } else {
                 spdlog::error("ZarrLoader::GetCursorSpectralData: Unsupported number of dimensions: {}", shape.size());
@@ -152,22 +153,21 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
             }
             
             casacore::Array<float> pixel_array;
-            spdlog::debug("GetCursorSpectralData: Reading channel {} with start={} length={}", 
-                         z, fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
             if (!zarr_image->doGetSlice(pixel_array, casacore::Slicer(start, length))) {
                 spdlog::error("ZarrLoader::GetCursorSpectralData: doGetSlice failed for channel {}", z);
                 return false;
             }
             
-            if (pixel_array.nelements() == 1) {
-                data[z] = pixel_array.data()[0];
-            } else {
-                spdlog::error("ZarrLoader::GetCursorSpectralData: Expected 1 element, got {}", pixel_array.nelements());
+            if (pixel_array.nelements() != 1) {
+                spdlog::error("ZarrLoader::GetCursorSpectralData: Expected 1 element for channel {}, got {}", 
+                             z, pixel_array.nelements());
                 return false;
             }
+            
+            data[z] = *pixel_array.data();
         }
         
-        spdlog::debug("GetCursorSpectralData: Successfully read {} channels for point ({},{})", 
+        spdlog::debug("GetCursorSpectralData: Successfully read {} channels one by one for point ({},{})", 
                      num_channels, cursor_x, cursor_y);
         return true;
         
@@ -193,15 +193,10 @@ bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, 
         int img_height = img_shape[1];
         int region_size = region_shape[0] * region_shape[1];
         
-        if (region_size <= 100) {
-            spdlog::info("UseRegionSpectralData: RETURNING TRUE for optimized region spectral data ({}x{} region, size: {} pixels)", 
-                         region_shape[0], region_shape[1], region_size);
-            return true;
-        } else {
-            spdlog::info("UseRegionSpectralData: RETURNING FALSE - Region {}x{} too large (size: {} pixels), using default image slicing to avoid cache issues", 
-                         region_shape[0], region_shape[1], region_size);
-            return false;
-        }
+        // Allow all region spectral operations to use optimized path to avoid full width/height reads
+        spdlog::info("UseRegionSpectralData: RETURNING TRUE for optimized region spectral data ({}x{} region, size: {} pixels)", 
+                     region_shape[0], region_shape[1], region_size);
+        return true;
     }
 
     spdlog::info("UseRegionSpectralData: RETURNING FALSE - Using default image slicing for {}x{} region", 
@@ -267,9 +262,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             
             casacore::IPosition start, length;
             if (shape.size() == 5) {
-                // 5D: Use CARTA standard order [x, y, freq, stokes, time] 
-                start = casacore::IPosition(5, x_min, y_min, z_start, stokes, 0);
-                length = casacore::IPosition(5, region_width, region_height, profile_size, 1, 1);
+                // 5D ZARR: [time, freq, stokes, x, y] 
+                start = casacore::IPosition(5, 0, z_start, stokes, x_min, y_min);
+                length = casacore::IPosition(5, 1, profile_size, 1, region_width, region_height);
             } else if (shape.size() == 4) {
                 // 4D: Use CARTA standard order [x, y, freq, stokes]
                 start = casacore::IPosition(4, x_min, y_min, z_start, stokes);
@@ -286,6 +281,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
                 return false;
             }
+            spdlog::info("GetRegionSpectralData: Using 4D start={} length={}", 
+                         fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
             
             casacore::Array<float> full_region_array;
             casacore::Slicer full_slicer(start, length);
@@ -449,8 +446,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                     }
                     
                     if (z < 5 || z >= profile_size - 5 || z % 20 == 0) {
-                        spdlog::info("DIRECT READ: Channel {} - checked {} pixels, mask_true {} pixels, valid {} pixels, sum = {}, mean = {}", 
-                                    z, total_checked, mask_true_count, valid_count, sum, profile_data[z]);
+                        spdlog::info("DIRECT READ: Channel {} - checked {} pixels, mask_true {} pixels, valid {} pixels, sum = {}, mean = {} ({})", 
+                                    z, total_checked, mask_true_count, valid_count, sum, profile_data[z], 
+                                    std::isfinite(profile_data[z]) ? "FINITE" : "NaN");
                     }
                 }
                 
@@ -477,9 +475,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         // Read all channels at once for maximum efficiency
         casacore::IPosition start, length;
         if (shape.size() == 5) {
-            // 5D: Use CARTA standard order [x, y, freq, stokes, time] 
-            start = casacore::IPosition(5, x_min, y_min, z_start, stokes, 0);
-            length = casacore::IPosition(5, region_width, region_height, profile_size, 1, 1);
+            // 5D ZARR: [time, freq, stokes, x, y] 
+            start = casacore::IPosition(5, 0, z_start, stokes, x_min, y_min);
+            length = casacore::IPosition(5, 1, profile_size, 1, region_width, region_height);
         } else if (shape.size() == 4) {
             // 4D: Use CARTA standard order [x, y, freq, stokes]
             start = casacore::IPosition(4, x_min, y_min, z_start, stokes);
@@ -496,6 +494,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
             return false;
         }
+        spdlog::info("GetRegionSpectralData: Using 4D start={} length={}", 
+                         fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
 
         casacore::Array<float> full_array;
         spdlog::info("GetRegionSpectralData: Reading ALL {} channels at once with start={} length={}", 
@@ -554,6 +554,12 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 profile_data[z] = sum / valid_count;
             } else {
                 profile_data[z] = std::numeric_limits<double>::quiet_NaN();
+            }
+            
+            if (z < 5 || z >= profile_size - 5 || z % 20 == 0) {
+                spdlog::info("BATCH READ: Channel {} - region {}x{}, valid {} pixels, sum = {}, mean = {} ({})", 
+                            z, region_width, region_height, valid_count, sum, profile_data[z],
+                            std::isfinite(profile_data[z]) ? "FINITE" : "NaN");
             }
         }
         
@@ -623,9 +629,9 @@ bool ZarrLoader::GetChunk(std::vector<float>& data, int& data_width, int& data_h
         
         casacore::IPosition start, length;
         if (shape.size() == 5) {
-            // 5D: Use CARTA standard order [x, y, z, stokes, time] 
-            start = casacore::IPosition(5, min_x, min_y, z, stokes, 0);
-            length = casacore::IPosition(5, data_width, data_height, 1, 1, 1);
+            // 5D ZARR: [time, freq, stokes, x, y] 
+            start = casacore::IPosition(5, 0, z, stokes, min_x, min_y);
+            length = casacore::IPosition(5, 1, 1, 1, data_width, data_height);
         } else if (shape.size() == 4) {
             // 4D: Use CARTA standard order [x, y, z, stokes]
             start = casacore::IPosition(4, min_x, min_y, z, stokes);
@@ -675,4 +681,152 @@ const casacore::IPosition ZarrLoader::GetStatsDataShape(FileInfo::Data ds) {
 
 std::unique_ptr<casacore::ArrayBase> ZarrLoader::GetStatsData(FileInfo::Data ds) {
     return nullptr;
+}
+
+bool ZarrLoader::GetSlice(casacore::Array<float>& data, const StokesSlicer& stokes_slicer) {
+    // ZARR-optimized GetSlice implementation following Frame.cc GetSlicerData pattern
+    if (!_image) {
+        spdlog::error("ZarrLoader::GetSlice: No image available");
+        return false;
+    }
+
+    try {
+        auto zarr_image = dynamic_cast<CartaZarrImage*>(_image.get());
+        if (!zarr_image) {
+            spdlog::error("ZarrLoader::GetSlice: Image is not a CartaZarrImage");
+            return false;
+        }
+
+        casacore::Slicer slicer = stokes_slicer.slicer;
+        StokesSource stokes_source = stokes_slicer.stokes_source;
+        
+        // Resize data array if needed
+        if (data.shape() != slicer.length()) {
+            data.resize(slicer.length());
+        }
+
+        spdlog::debug("ZarrLoader::GetSlice: Slicer start={} length={}", 
+                     fmt::join(slicer.start().asStdVector(), ","), 
+                     fmt::join(slicer.length().asStdVector(), ","));
+
+        // For ZARR, directly use doGetSlice which goes through our optimized CartaZarrImage
+        // This will utilize the caching strategies we implemented in CartaZarrImage
+        bool success = zarr_image->doGetSlice(data, slicer);
+        
+        if (!success) {
+            spdlog::error("ZarrLoader::GetSlice: doGetSlice failed for slicer start={} length={}", 
+                         fmt::join(slicer.start().asStdVector(), ","),
+                         fmt::join(slicer.length().asStdVector(), ","));
+            return false;
+        }
+
+        spdlog::debug("ZarrLoader::GetSlice: Successfully read slice of size {}", data.size());
+        return true;
+
+    } catch (std::exception& e) {
+        spdlog::error("ZarrLoader::GetSlice: Exception: {}", e.what());
+        return false;
+    }
+}
+
+bool ZarrLoader::GetSpectralDataOptimized(std::vector<float>& data, int stokes, int x, int y, 
+                                         int z_start, int z_end, std::mutex& image_mutex) {
+    // Optimized method for reading large spectral ranges at once for ZARR files
+    std::lock_guard<std::mutex> lock(image_mutex);
+    
+    try {
+        if (!_image) {
+            spdlog::error("ZarrLoader::GetSpectralDataOptimized: No image available");
+            return false;
+        }
+        
+        auto zarr_image = std::dynamic_pointer_cast<CartaZarrImage>(_image);
+        if (!zarr_image) {
+            spdlog::error("ZarrLoader::GetSpectralDataOptimized: Image is not a CartaZarrImage");
+            return false;
+        }
+        
+        casacore::IPosition shape = _image->shape();
+        int img_width = shape[0];
+        int img_height = shape[1];
+        int num_channels = (shape.size() > 2) ? shape[2] : 1;
+        
+        // Validate parameters
+        if (x < 0 || y < 0 || x >= img_width || y >= img_height) {
+            spdlog::error("ZarrLoader::GetSpectralDataOptimized: Position out of bounds: ({},{}) (image: {}x{})", 
+                         x, y, img_width, img_height);
+            return false;
+        }
+        
+        if (z_start < 0 || z_end >= num_channels || z_start > z_end) {
+            spdlog::error("ZarrLoader::GetSpectralDataOptimized: Invalid z range [{},{}] (max: {})", 
+                         z_start, z_end, num_channels - 1);
+            return false;
+        }
+        
+        if (shape.size() > 3 && (stokes < 0 || stokes >= shape[3])) {
+            spdlog::error("ZarrLoader::GetSpectralDataOptimized: Stokes {} out of bounds (max: {})", stokes, shape[3] - 1);
+            return false;
+        }
+        
+        int spectral_length = z_end - z_start + 1;
+        data.resize(spectral_length);
+        
+        // Use optimized reading for large spectral ranges
+        casacore::IPosition start, length;
+        
+        if (shape.size() == 5) {
+            // 5D ZARR: [time, freq, stokes, x, y]
+            start = casacore::IPosition(5, 0, z_start, stokes, x, y);
+            length = casacore::IPosition(5, 1, spectral_length, 1, 1, 1);
+        } else if (shape.size() == 4) {
+            // 4D: [x, y, freq, stokes]
+            start = casacore::IPosition(4, x, y, z_start, stokes);
+            length = casacore::IPosition(4, 1, 1, spectral_length, 1);
+        } else if (shape.size() == 3) {
+            // 3D: [x, y, freq]
+            start = casacore::IPosition(3, x, y, z_start);
+            length = casacore::IPosition(3, 1, 1, spectral_length);
+        } else {
+            spdlog::error("ZarrLoader::GetSpectralDataOptimized: Unsupported number of dimensions: {}", shape.size());
+            return false;
+        }
+        
+        casacore::Array<float> spectral_array;
+        casacore::Slicer slicer(start, length);
+        
+        spdlog::debug("GetSpectralDataOptimized: Reading spectral range [{},{}] ({} channels) at ({},{}) with start={} length={}", 
+                     z_start, z_end, spectral_length, x, y,
+                     fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
+        
+        // Try direct TensorStore read first for better performance
+        if (zarr_image->readDirectFromTensorStore(spectral_array, slicer)) {
+            spdlog::debug("GetSpectralDataOptimized: Direct TensorStore read successful for {} channels", spectral_length);
+        } else if (zarr_image->doGetSlice(spectral_array, slicer)) {
+            spdlog::debug("GetSpectralDataOptimized: Regular doGetSlice successful for {} channels", spectral_length);
+        } else {
+            spdlog::error("ZarrLoader::GetSpectralDataOptimized: Both direct and regular read failed");
+            return false;
+        }
+        
+        if (spectral_array.nelements() != spectral_length) {
+            spdlog::error("ZarrLoader::GetSpectralDataOptimized: Expected {} elements, got {}", 
+                         spectral_length, spectral_array.nelements());
+            return false;
+        }
+        
+        // Copy data to output vector
+        const float* array_data = spectral_array.data();
+        for (int i = 0; i < spectral_length; ++i) {
+            data[i] = array_data[i];
+        }
+        
+        spdlog::debug("GetSpectralDataOptimized: Successfully read {} channels [{},{}] at position ({},{})", 
+                     spectral_length, z_start, z_end, x, y);
+        return true;
+        
+    } catch (std::exception& e) {
+        spdlog::error("ZarrLoader::GetSpectralDataOptimized: Exception: {}", e.what());
+        return false;
+    }
 }

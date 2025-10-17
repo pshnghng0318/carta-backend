@@ -16,6 +16,7 @@
 #include <casacore/lattices/Lattices/TiledShape.h>
 #include <nlohmann/json.hpp>
 #include <memory>
+#include <ctime>
 
 // TensorStore includes  
 #include "tensorstore/context.h"
@@ -92,9 +93,18 @@ private:
     int _cache_height = 0;                 // Height of cached data
     int _cache_start_x = 0;                // Start X coordinate of cached region
     int _cache_start_y = 0;                // Start Y coordinate of cached region
+    int _cache_num_freq = 1;               // Number of frequency channels in 4D cache
+    int _cache_num_stokes = 1;             // Number of stokes parameters in 4D cache
     bool _is_full_channel_cache = false;   // Whether cache contains full channel or just a region
     
+    // File modification time tracking for metadata caching
+    std::time_t _file_last_modified = 0;
+    bool _coordinate_system_initialized = false;
+    bool _frequency_type_cached = false;
+    casacore::MFrequency::Types _cached_frequency_type;
+    
     void setupCoordinateSystem();
+    bool hasFileChanged();
     bool parseWCSFromZattrs(const nlohmann::json& zattrs);
     bool parseWCSFromCoordinateArrays(const std::filesystem::path& ra_path, const std::filesystem::path& dec_path, const std::filesystem::path& freq_path);
     bool parseWCSFromMetadata(const nlohmann::json& zattrs);
@@ -104,9 +114,15 @@ private:
     void createMinimalCoordinateSystem();
     void initializeTensorStore();
     
+    // Get frequency reference frame from ZARR metadata
+    casacore::MFrequency::Types GetFrequencyType();
+    casacore::MFrequency::Types ParseFrequencyFrame(const std::string& frame_str);
+    casacore::MFrequency::Types ParseFrequencyFrameCode(int frame_code);
+    
     // Channel cache methods - now support region-based caching
     bool loadChannelCache(int freq_channel = 0, int stokes_channel = 0);
     bool loadRegionCache(int freq_channel, int stokes_channel, int start_x, int start_y, int width, int height);
+    bool load4DRegionCache(int start_x, int start_y, int width, int height, int num_freq, int num_stokes);
     bool getSliceFromCache(casacore::Array<float>& buffer, const casacore::Slicer& section);
 };
 
