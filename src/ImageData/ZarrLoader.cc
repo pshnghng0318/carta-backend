@@ -182,21 +182,27 @@ bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, 
     spdlog::info("Region shape: [{} dimensions] = [{}]", region_shape.size(), 
                  region_shape.size() >= 2 ? fmt::format("{}, {}", region_shape[0], region_shape[1]) : "N/A");
     
+    // Always use optimized path for point spectral (cursor) 
     if (region_shape.size() >= 2 && region_shape[0] == 1 && region_shape[1] == 1) {
         spdlog::info("UseRegionSpectralData: RETURNING TRUE for optimized point spectral data (1x1 region)");
         return true;
     }
 
     if (_image && region_shape.size() >= 2) {
-        casacore::IPosition img_shape = _image->shape();
-        int img_width = img_shape[0];
-        int img_height = img_shape[1];
         int region_size = region_shape[0] * region_shape[1];
+        const int SMALL_REGION_THRESHOLD = 100; // pixels
         
-        // Allow all region spectral operations to use optimized path to avoid full width/height reads
-        spdlog::info("UseRegionSpectralData: RETURNING TRUE for optimized region spectral data ({}x{} region, size: {} pixels)", 
-                     region_shape[0], region_shape[1], region_size);
-        return true;
+        // Only use loader path for very small regions to prevent cache overflow
+        if (region_size <= SMALL_REGION_THRESHOLD) {
+            spdlog::info("UseRegionSpectralData: RETURNING TRUE for small region spectral data ({}x{} region, size: {} pixels)", 
+                         region_shape[0], region_shape[1], region_size);
+            return true;
+        } else {
+            // Use RegionHandler's segmented processing for larger regions to prevent cache overflow
+            spdlog::info("UseRegionSpectralData: RETURNING FALSE for large region ({}x{} region, size: {} pixels) - using segmented processing", 
+                         region_shape[0], region_shape[1], region_size);
+            return false;
+        }
     }
 
     spdlog::info("UseRegionSpectralData: RETURNING FALSE - Using default image slicing for {}x{} region", 

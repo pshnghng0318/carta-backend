@@ -297,15 +297,6 @@ bool FileLoader::FindCoordinateAxes(std::string& message) {
     // Handle 5D images - ZARR specific axis assignment
     if (_num_dims == 5) {
         if (no_spectral && no_stokes) {
-            // For 5D ZARR files, following user specification:
-            // time_axis=1, spectral_axis=2, stokes_axis=3
-            // For shape [1,128,1,7763,4742], this maps to:
-            // axis 0: time (size 1) 
-            // axis 1: spectral (size 128)
-            // axis 2: stokes (size 1)
-            // axis 3: spatial_y (size 7763)
-            // axis 4: spatial_x (size 4742)
-            
             // Assign axes according to user specification
             spectral_axis = 1;  // time_axis=1 maps to spectral in CARTA
             stokes_axis = 2;    // spectral_axis=2 maps to stokes in CARTA  

@@ -23,6 +23,7 @@
 #include "DataStream/Compression.h"
 #include "DataStream/Contouring.h"
 #include "DataStream/Smoothing.h"
+#include "ImageData/ZarrLoader.h"
 #include "ImageStats/StatsCalculator.h"
 #include "Logger/Logger.h"
 #include "Timer/Timer.h"
@@ -1809,6 +1810,10 @@ bool Frame::GetLoaderSpectralData(int region_id, const AxisRange& z_range, int s
     const casacore::IPosition& origin, std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) {
     // Get spectral data from loader (add image mutex for swizzled data)
     return _loader->GetRegionSpectralData(region_id, z_range, stokes, mask, origin, _image_mutex, results, progress);
+}
+
+bool Frame::IsZarrLoader() const {
+    return dynamic_cast<ZarrLoader*>(_loader.get()) != nullptr;
 }
 
 bool Frame::CalculateMoments(int file_id, GeneratorProgressCallback progress_callback, const StokesRegion& stokes_region,
