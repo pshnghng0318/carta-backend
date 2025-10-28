@@ -95,6 +95,8 @@ private:
     int _cache_start_y = 0;                // Start Y coordinate of cached region
     int _cache_num_freq = 1;               // Number of frequency channels in 4D cache
     int _cache_num_stokes = 1;             // Number of stokes parameters in 4D cache
+    int _cache_freq_start = 0;             // Starting frequency index in 4D cache
+    int _cache_stokes_start = 0;           // Starting stokes index in 4D cache
     bool _is_full_channel_cache = false;   // Whether cache contains full channel or just a region
     
     // File modification time tracking for metadata caching
@@ -122,7 +124,7 @@ private:
     // Channel cache methods - now support region-based caching
     bool loadChannelCache(int freq_channel = 0, int stokes_channel = 0);
     bool loadRegionCache(int freq_channel, int stokes_channel, int start_x, int start_y, int width, int height);
-    bool load4DRegionCache(int start_x, int start_y, int width, int height, int num_freq, int num_stokes);
+    bool load4DRegionCache(int start_x, int start_y, int width, int height, int num_freq, int num_stokes, int freq_start = 0, int stokes_start = 0);
     bool getSliceFromCache(casacore::Array<float>& buffer, const casacore::Slicer& section);
 };
 

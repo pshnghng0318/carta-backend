@@ -1636,12 +1636,21 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             int full_area = full_width * full_height;
             double area_ratio = static_cast<double>(spatial_area) / static_cast<double>(full_area);
             
-            // Consider it region spectral if:
-            // 1. Small area (< 1% of full image) AND single channel/stokes
-            // 2. OR moderate area (< 25% of full image) with clear region boundaries
-            if ((area_ratio < 0.01 && (length[2] == 1 || length[3] == 1)) ||
-                (area_ratio < 0.25 && req_width < full_width && req_height < full_height)) {
+            // Region spectral characteristics:
+            // 1. Small to moderate spatial area (< 50% of full image)
+            // 2. Multi-channel request (length[2] > 1) OR single channel in spectral context
+            // 3. NOT a single pixel request (width > 1 OR height > 1)
+            // 4. NOT a 1D profile (both width > 1 AND height > 1)
+            
+            bool is_small_spatial_region = (area_ratio < 0.5 && req_width < full_width && req_height < full_height);
+            bool is_multi_channel = (length[2] > 1 || length[3] > 1);
+            bool is_not_single_pixel = (req_width > 1 || req_height > 1);
+            bool is_not_1d_profile = (req_width > 1 && req_height > 1);
+            
+            if (is_small_spatial_region && is_not_single_pixel && is_not_1d_profile) {
                 is_region_spectral = true;
+                spdlog::debug("REGION SPECTRAL DETECTED: area={:.2f}%, multi_ch={}, {}x{} spatial", 
+                             area_ratio * 100, is_multi_channel, req_width, req_height);
             }
         }
 
@@ -1712,13 +1721,40 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         if (!cache_suitable || !cache_type_suitable) {
             
             if ((use_region_cache || is_region_spectral) && !is_histogram_call) {
-                // Check if this is a 4D request for region spectral (multiple frequencies)
-                bool is_4d_request = (length.size() >= 4 && length[2] > 1);
+                // Enhanced 4D request detection for region spectral operations
+                bool is_4d_request = false;
+                int num_freq = 1, num_stokes = 1;
+                
+                if (length.size() >= 4) {
+                    // Check for multi-channel/multi-stokes requests
+                    if (length[2] > 1 || length[3] > 1) {
+                        is_4d_request = true;
+                        num_freq = length[2];
+                        num_stokes = length[3];
+                    }
+                    
+                    // For region spectral, even single channel can benefit from 4D cache
+                    // if we expect multiple channel requests to follow
+                    if (is_region_spectral && !is_4d_request) {
+                        // Load a small group of channels for region spectral efficiency
+                        int max_freq = _original_zarr_shape.size() > 1 ? _original_zarr_shape[1] : 1;
+                        int current_freq = freq_index;
+                        
+                        // Load a small batch around current frequency for spectral analysis
+                        int batch_size = std::min(10, max_freq - current_freq);
+                        if (batch_size > 1) {
+                            is_4d_request = true;
+                            num_freq = batch_size;
+                            num_stokes = std::max(1, static_cast<int>(length[3]));
+                            
+                            spdlog::debug("REGION SPECTRAL OPTIMIZATION: Loading {} freq channels starting from {}", 
+                                         num_freq, current_freq);
+                        }
+                    }
+                }
                 
                 if (is_4d_request && is_region_spectral) {
-                    // 4D Region spectral: load all frequencies at once
-                    int num_freq = length[2];
-                    int num_stokes = length[3];
+                    // 4D Region spectral: load multiple frequencies at once
                     
                     // Extract spatial coordinates
                     int spatial_start_x, spatial_start_y, spatial_width, spatial_height;
@@ -1734,11 +1770,12 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                         spatial_height = length[1];
                     }
                     
-                    spdlog::debug("ZARR doGetSlice: 4D Region spectral request - {}x{} spatial, {} freq, {} stokes", 
-                                 spatial_width, spatial_height, num_freq, num_stokes);
+                    spdlog::debug("ZARR doGetSlice: 4D Region spectral request - {}x{} spatial, {} freq, {} stokes starting from freq={}", 
+                                 spatial_width, spatial_height, num_freq, num_stokes, freq_index);
                     
-                    // Load 4D region cache (all frequencies)
-                    if (load4DRegionCache(spatial_start_x, spatial_start_y, spatial_width, spatial_height, num_freq, num_stokes)) {
+                    // Load 4D region cache with frequency offset
+                    if (load4DRegionCache(spatial_start_x, spatial_start_y, spatial_width, spatial_height, 
+                                         num_freq, num_stokes, freq_index, stokes_index)) {
                         cache_hit = getSliceFromCache(buffer, section);
                     }
                 } else {
@@ -2497,9 +2534,31 @@ bool CartaZarrImage::getSliceFromCache(casacore::Array<float>& buffer, const cas
         }
         
         if (is_4d_data) {
-            // CORRECTED 4D ACCESS for region spectral data
+            // ENHANCED 4D ACCESS for region spectral data with frequency/stokes offset validation
             // Cache layout: [width, height, freq, stokes] in row-major order
             // dest layout: [x, y, freq, stokes] in row-major order
+            
+            // Get the frequency and stokes indices from the current request
+            const IPosition& request_start = section.start();
+            int request_freq_start = (request_start.size() > 2) ? request_start[2] : 0;
+            int request_stokes_start = (request_start.size() > 3) ? request_start[3] : 0;
+            
+            spdlog::debug("4D CACHE ACCESS: Request freq={}:{} stokes={}:{}, Cache freq={}:{} stokes={}:{}", 
+                         request_freq_start, request_freq_start + num_freq - 1,
+                         request_stokes_start, request_stokes_start + num_stokes - 1,
+                         _cache_freq_start, _cache_freq_start + _cache_num_freq - 1,
+                         _cache_stokes_start, _cache_stokes_start + _cache_num_stokes - 1);
+            
+            // Check if requested range is within cached range
+            bool freq_in_range = (request_freq_start >= _cache_freq_start && 
+                                 request_freq_start + num_freq <= _cache_freq_start + _cache_num_freq);
+            bool stokes_in_range = (request_stokes_start >= _cache_stokes_start && 
+                                   request_stokes_start + num_stokes <= _cache_stokes_start + _cache_num_stokes);
+            
+            if (!freq_in_range || !stokes_in_range) {
+                spdlog::warn("4D CACHE MISS: Requested range outside cached range");
+                return false;
+            }
             
             for (int freq = 0; freq < num_freq; ++freq) {
                 for (int stokes = 0; stokes < num_stokes; ++stokes) {
@@ -2518,14 +2577,18 @@ bool CartaZarrImage::getSliceFromCache(casacore::Array<float>& buffer, const cas
                                 continue;
                             }
                             
-                            // Cache index: cache[width][height][freq][stokes]
+                            // Calculate cache-relative frequency and stokes indices
+                            int cache_freq_idx = (request_freq_start + freq) - _cache_freq_start;
+                            int cache_stokes_idx = (request_stokes_start + stokes) - _cache_stokes_start;
+                            
+                            // Cache index: cache[width][height][freq][stokes] with offsets
                             // Layout: width * height * freq * stokes in row-major order
-                            size_t cache_idx = (((freq * num_stokes + stokes) * _cache_height + src_y) * _cache_width + src_x);
+                            size_t cache_idx = (((cache_freq_idx * _cache_num_stokes + cache_stokes_idx) * _cache_height + src_y) * _cache_width + src_x);
                             
                             // Boundary check
                             if (cache_idx >= _channel_cache.size()) {
-                                spdlog::error("4D BOUNDARY VIOLATION: cache_idx {} >= cache_size {}, coords=({},{},{},{})", 
-                                             cache_idx, _channel_cache.size(), src_x, src_y, freq, stokes);
+                                spdlog::error("4D BOUNDARY VIOLATION: cache_idx {} >= cache_size {}, coords=({},{}) cache_freq={} cache_stokes={}", 
+                                             cache_idx, _channel_cache.size(), src_x, src_y, cache_freq_idx, cache_stokes_idx);
                                 dest_data[dest_idx] = std::numeric_limits<float>::quiet_NaN();
                                 continue;
                             }
@@ -2847,7 +2910,7 @@ bool CartaZarrImage::loadRegionCache(int freq_channel, int stokes_channel, int s
     }
 }
 
-bool CartaZarrImage::load4DRegionCache(int start_x, int start_y, int width, int height, int num_freq, int num_stokes) {
+bool CartaZarrImage::load4DRegionCache(int start_x, int start_y, int width, int height, int num_freq, int num_stokes, int freq_start, int stokes_start) {
     if (!_tensorstore_initialized) {
         spdlog::error("TensorStore not initialized for 4D region cache loading");
         return false;
@@ -2855,12 +2918,13 @@ bool CartaZarrImage::load4DRegionCache(int start_x, int start_y, int width, int 
     
     // Safety checks for region dimensions
     if (width <= 0 || height <= 0 || num_freq <= 0 || num_stokes <= 0) {
-        spdlog::error("Invalid 4D region dimensions: {}x{}x{}x{} at ({},{})", width, height, num_freq, num_stokes, start_x, start_y);
+        spdlog::error("Invalid 4D region dimensions: {}x{}x{}x{} at ({},{}) freq_start={} stokes_start={}", 
+                     width, height, num_freq, num_stokes, start_x, start_y, freq_start, stokes_start);
         return false;
     }
     
     try {
-        // For 5D ZARR, load 4D region [time=0, freq=0:num_freq, pol=0:num_stokes, l=start_x:end_x, m=start_y:end_y]
+        // For 5D ZARR, load 4D region [time=0, freq=freq_start:freq_start+num_freq, pol=stokes_start:stokes_start+num_stokes, l=start_x:end_x, m=start_y:end_y]
         if (_original_zarr_shape.size() == 5) {
             // Clamp region to valid bounds
             int max_width = _original_zarr_shape[3];   // l dimension (width)
@@ -2872,19 +2936,27 @@ bool CartaZarrImage::load4DRegionCache(int start_x, int start_y, int width, int 
             start_y = std::max(0, std::min(start_y, max_height - 1));
             width = std::min(width, max_width - start_x);
             height = std::min(height, max_height - start_y);
-            num_freq = std::min(num_freq, max_freq);
-            num_stokes = std::min(num_stokes, max_stokes);
+            
+            // Clamp frequency and stokes ranges
+            freq_start = std::max(0, std::min(freq_start, max_freq - 1));
+            stokes_start = std::max(0, std::min(stokes_start, max_stokes - 1));
+            num_freq = std::min(num_freq, max_freq - freq_start);
+            num_stokes = std::min(num_stokes, max_stokes - stokes_start);
             
             if (width <= 0 || height <= 0 || num_freq <= 0 || num_stokes <= 0) {
-                spdlog::warn("Invalid clamped 4D dimensions: {}x{}x{}x{} at ({},{})", width, height, num_freq, num_stokes, start_x, start_y);
+                spdlog::warn("Invalid clamped 4D dimensions: {}x{}x{}x{} at ({},{}) freq={}:{} stokes={}:{}", 
+                            width, height, num_freq, num_stokes, start_x, start_y, 
+                            freq_start, freq_start + num_freq - 1, stokes_start, stokes_start + num_stokes - 1);
                 return false;
             }
             
-            spdlog::info("Loading 4D region cache: {}x{}x{}x{} region at ({},{}) from full {}x{}x{}x{}", 
-                        width, height, num_freq, num_stokes, start_x, start_y, max_width, max_height, max_freq, max_stokes);
+            spdlog::info("Loading 4D region cache: {}x{}x{}x{} region at ({},{}) from freq={}:{} stokes={}:{} of {}x{}x{}x{}", 
+                        width, height, num_freq, num_stokes, start_x, start_y,
+                        freq_start, freq_start + num_freq - 1, stokes_start, stokes_start + num_stokes - 1,
+                        max_width, max_height, max_freq, max_stokes);
             
-            // Create box for 4D region: [time=0, freq=0:num_freq, pol=0:num_stokes, l=start_x:end_x, m=start_y:end_y]
-            std::vector<tensorstore::Index> box_origin = {0, 0, 0, start_x, start_y};
+            // Create box for 4D region with frequency/stokes offsets
+            std::vector<tensorstore::Index> box_origin = {0, freq_start, stokes_start, start_x, start_y};
             std::vector<tensorstore::Index> box_shape = {1, num_freq, num_stokes, width, height};
             
             spdlog::debug("4D REGION CACHE LOADING COORDINATES:");
@@ -2929,13 +3001,16 @@ bool CartaZarrImage::load4DRegionCache(int start_x, int start_y, int width, int 
             _cache_height = height;
             _cache_start_x = start_x;
             _cache_start_y = start_y;
-            _cache_num_freq = num_freq;     // New field needed
-            _cache_num_stokes = num_stokes; // New field needed
+            _cache_num_freq = num_freq;
+            _cache_num_stokes = num_stokes;
+            _cache_freq_start = freq_start;     // Store frequency offset
+            _cache_stokes_start = stokes_start; // Store stokes offset
             _channel_cache_loaded = true;
             _is_full_channel_cache = false;  // This is a 4D region cache
             
-            spdlog::info("Loaded 4D region cache: {}x{}x{}x{} elements at ({},{}) ({} MB)", 
+            spdlog::info("Loaded 4D region cache: {}x{}x{}x{} elements at ({},{}) freq={}:{} stokes={}:{} ({} MB)", 
                         width, height, num_freq, num_stokes, start_x, start_y,
+                        freq_start, freq_start + num_freq - 1, stokes_start, stokes_start + num_stokes - 1,
                         (total_elements * sizeof(float)) / (1024 * 1024));
             
             return true;
