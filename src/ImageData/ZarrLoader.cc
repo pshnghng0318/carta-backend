@@ -219,12 +219,14 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
     try {
         if (!_image) {
             spdlog::error("ZarrLoader::GetRegionSpectralData: No image available");
+            progress = 1.0;  // Set progress to avoid infinite while loop in RegionHandler
             return false;
         }
         
         auto zarr_image = std::dynamic_pointer_cast<CartaZarrImage>(_image);
         if (!zarr_image) {
             spdlog::error("ZarrLoader::GetRegionSpectralData: Image is not a CartaZarrImage");
+            progress = 1.0;  // Set progress to avoid infinite while loop in RegionHandler
             return false;
         }
         
@@ -235,6 +237,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
 
         if (shape.size() > 3 && (stokes < 0 || stokes >= shape[3])) {
             spdlog::error("ZarrLoader::GetRegionSpectralData: Stokes {} out of bounds (max: {})", stokes, shape[3] - 1);
+            progress = 1.0;  // Set progress to avoid infinite while loop in RegionHandler
             return false;
         }
         
@@ -248,278 +251,56 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         int region_height = y_max - y_min + 1;
         int region_area = region_width * region_height;
 
-        bool is_very_small_region = (region_area <= 100);
-        
-        if (is_very_small_region) {
-            spdlog::info("SMALL REGION OPTIMIZATION: Using direct read for {}x{} region (area={}) to avoid cache overhead", 
-                         region_width, region_height, region_area);
-        } else {
-            spdlog::debug("GetRegionSpectralData: Reading spectral data for region [{},{} to {},{}] ({}x{}) stokes={}, {} channels", 
-                         x_min, y_min, x_max, y_max, region_width, region_height, stokes, num_channels);
-        }
-        
         int z_start = spectral_range.from;
         int z_end = spectral_range.to;
         int profile_size = z_end - z_start + 1;
 
         std::vector<double> profile_data(profile_size, 0.0);
         
-        if (is_very_small_region) {
+        // SINGLE-CHANNEL STRATEGY: Process one channel at a time to avoid cache conflicts
+        // spdlog::info("GetRegionSpectralData: Processing {} channels one by one", profile_size);
+        
+        for (int z = z_start; z <= z_end; ++z) {
+            int profile_index = z - z_start;
             
+            // Read single channel from TensorStore
             casacore::IPosition start, length;
             if (shape.size() == 5) {
                 // 5D ZARR: [time, freq, stokes, x, y] 
-                start = casacore::IPosition(5, 0, z_start, stokes, x_min, y_min);
-                length = casacore::IPosition(5, 1, profile_size, 1, region_width, region_height);
+                start = casacore::IPosition(5, 0, z, stokes, x_min, y_min);
+                length = casacore::IPosition(5, 1, 1, 1, region_width, region_height);
             } else if (shape.size() == 4) {
                 // 4D: Use CARTA standard order [x, y, freq, stokes]
-                start = casacore::IPosition(4, x_min, y_min, z_start, stokes);
-                length = casacore::IPosition(4, region_width, region_height, profile_size, 1);
+                start = casacore::IPosition(4, x_min, y_min, z, stokes);
+                length = casacore::IPosition(4, region_width, region_height, 1, 1);
             } else if (shape.size() == 3) {
                 // 3D: Use CARTA standard order [x, y, freq]
-                start = casacore::IPosition(3, x_min, y_min, z_start);
-                length = casacore::IPosition(3, region_width, region_height, profile_size);
+                start = casacore::IPosition(3, x_min, y_min, z);
+                length = casacore::IPosition(3, region_width, region_height, 1);
             } else if (shape.size() == 2) {
-                // 2D: Use CARTA standard order [x, y]
+                // 2D: Use CARTA standard order [x, y] (only one channel)
                 start = casacore::IPosition(2, x_min, y_min);
                 length = casacore::IPosition(2, region_width, region_height);
             } else {
                 spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
+                progress = 1.0;
                 return false;
             }
-            spdlog::info("GetRegionSpectralData: Using 4D start={} length={}", 
-                         fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
             
-            casacore::Array<float> full_region_array;
-            casacore::Slicer full_slicer(start, length);
+            casacore::Array<float> channel_array;
+            casacore::Slicer channel_slicer(start, length);
             
-            if (zarr_image->readDirectFromTensorStore(full_region_array, full_slicer)) {
-                spdlog::info("DIRECT READ SUCCESS: Read {}D block of size {} for small region", 
-                             full_region_array.ndim(), full_region_array.size());
-                
-                casacore::IPosition array_shape = full_region_array.shape();
-                spdlog::info("DIRECT READ: Array shape = [{}]", fmt::join(array_shape.asStdVector(), ", "));
-                spdlog::info("DIRECT READ: Expected profile_size = {}, region_width = {}, region_height = {}", 
-                            profile_size, region_width, region_height);
-                spdlog::info("DIRECT READ: Mask shape = [{}], origin = [{}]", 
-                            fmt::join(mask_shape.asStdVector(), ", "), fmt::join(origin.asStdVector(), ", "));
-                
-                if (full_region_array.size() > 0) {
-                    const float* data_ptr = full_region_array.data();
-                    auto first_value = *full_region_array.begin();
-                    spdlog::warn("DIRECT READ: First pixel value = {} (array size = {})", first_value, full_region_array.size());
-                    
-                    if (array_shape.size() >= 2 && profile_size >= 3) {
-                        size_t ch0_idx, ch1_idx, ch2_idx;
-                        
-                        if (array_shape.size() == 5) {
-                            // [time=1, freq=profile_size, stokes=1, y=region_height, x=region_width]
-                            ch0_idx = 0;
-                            ch1_idx = region_height * region_width;
-                            ch2_idx = 2 * region_height * region_width;
-                        } else if (array_shape.size() == 4) {
-                            // [freq=profile_size, stokes=1, y=region_height, x=region_width]
-                            ch0_idx = 0;
-                            ch1_idx = region_height * region_width;
-                            ch2_idx = 2 * region_height * region_width;
-                        } else {
-                            ch0_idx = 0;
-                            ch1_idx = region_width * region_height;
-                            ch2_idx = 2 * region_width * region_height;
-                        }
-                        
-                        spdlog::warn("DIRECT READ: Raw data check - Ch0[0]={}, Ch1[0]={}, Ch2[0]={}", 
-                                    data_ptr[ch0_idx], data_ptr[ch1_idx], data_ptr[ch2_idx]);
-
-                        spdlog::warn("DIRECT READ: Sample pixels - Ch0[1]={}, Ch0[center]={}, Ch0[last]={}",
-                                    array_shape[0] > 1 ? data_ptr[1] : data_ptr[0],
-                                    data_ptr[region_width * region_height / 2],
-                                    data_ptr[region_width * region_height - 1]);
-
-                        if (ch1_idx + region_width * region_height <= full_region_array.size()) {
-                            spdlog::warn("DIRECT READ: Channel 1 samples - Ch1[1]={}, Ch1[center]={}, Ch1[last]={}",
-                                        ch1_idx + 1 < full_region_array.size() ? data_ptr[ch1_idx + 1] : data_ptr[ch1_idx],
-                                        ch1_idx + region_width * region_height / 2 < full_region_array.size() ? 
-                                        data_ptr[ch1_idx + region_width * region_height / 2] : data_ptr[ch1_idx],
-                                        ch1_idx + region_width * region_height - 1 < full_region_array.size() ? 
-                                        data_ptr[ch1_idx + region_width * region_height - 1] : data_ptr[ch1_idx]);
-                        }
-                        
-                        float min_val = *std::min_element(data_ptr, data_ptr + full_region_array.size());
-                        float max_val = *std::max_element(data_ptr, data_ptr + full_region_array.size());
-                        spdlog::warn("DIRECT READ: Data range - min={}, max={}", min_val, max_val);
-                        
-                        int non_zero_count = 0;
-                        int finite_count = 0;
-                        for (size_t i = 0; i < full_region_array.size(); ++i) {
-                            if (std::isfinite(data_ptr[i])) {
-                                finite_count++;
-                                if (data_ptr[i] != 0.0f) {
-                                    non_zero_count++;
-                                }
-                            }
-                        }
-                        spdlog::warn("DIRECT READ: Statistics - total={}, finite={}, non_zero={}", 
-                                    full_region_array.size(), finite_count, non_zero_count);
-                    }
-                }
-                
-                for (int z = 0; z < profile_size; ++z) {
-                    double sum = 0.0;
-                    int valid_count = 0;
-                    int total_checked = 0;
-                    int mask_true_count = 0;
-
-                    for (int y = 0; y < region_height; ++y) {
-                        for (int x = 0; x < region_width; ++x) {
-                            total_checked++;
-
-                            bool mask_value = false;
-                            if (x < mask_shape[0] && y < mask_shape[1]) {
-                                mask_value = mask(casacore::IPosition(2, x, y));
-                                if (mask_value) mask_true_count++;
-                            }
-                            
-                            if (mask_value) {
-                                float value;
-                                
-                                const float* data_ptr = full_region_array.data();
-                                
-                                if (array_shape.size() == 5) {
-                                    size_t linear_index = 0 + z * 1 + 0 * 1 * profile_size + y * 1 * profile_size * 1 + x * 1 * profile_size * 1 * region_height;
-                                    if (linear_index < full_region_array.size()) {
-                                        value = data_ptr[linear_index];
-                                    } else {
-                                        spdlog::error("DIRECT READ: 5D Linear index {} out of bounds (array size: {})", linear_index, full_region_array.size());
-                                        continue;
-                                    }
-                                } else if (array_shape.size() == 4) {
-                                    // 4D: [freq=profile_size, ?=1, y=region_height, x=region_width]
-                                    size_t linear_index = z * 1 * region_height * region_width + 0 * region_height * region_width + y * region_width + x;
-                                    if (linear_index < full_region_array.size()) {
-                                        value = data_ptr[linear_index];
-                                    } else {
-                                        spdlog::error("DIRECT READ: 4D Linear index {} out of bounds (array size: {})", linear_index, full_region_array.size());
-                                        continue;
-                                    }
-                                } else if (array_shape.size() == 3) {
-                                    // 3D: [freq=profile_size, y=region_height, x=region_width]
-                                    size_t linear_index = z * region_height * region_width + y * region_width + x;
-                                    if (linear_index < full_region_array.size()) {
-                                        value = data_ptr[linear_index];
-                                    } else {
-                                        spdlog::error("DIRECT READ: 3D Linear index {} out of bounds (array size: {})", linear_index, full_region_array.size());
-                                        continue;
-                                    }
-                                } else {
-                                    // 2D: [y=region_height, x=region_width]
-                                    size_t linear_index = y * region_width + x;
-                                    if (linear_index < full_region_array.size()) {
-                                        value = data_ptr[linear_index];
-                                    } else {
-                                        spdlog::error("DIRECT READ: 2D Linear index {} out of bounds (array size: {})", linear_index, full_region_array.size());
-                                        continue;
-                                    }
-                                }
-                                
-                                if (std::isfinite(value)) {
-                                    sum += value;
-                                    valid_count++;
-
-                                    if ((z <= 4 || z >= profile_size - 2) && valid_count <= 3) {
-                                        size_t debug_linear_index;
-                                        if (array_shape.size() == 5) {
-                                            debug_linear_index = 0 + z * 1 + 0 * 1 * profile_size + y * 1 * profile_size * 1 + x * 1 * profile_size * 1 * region_height;
-                                        } else if (array_shape.size() == 4) {
-                                            debug_linear_index = z * 1 * region_height * region_width + 0 * region_height * region_width + y * region_width + x;
-                                        } else if (array_shape.size() == 3) {
-                                            debug_linear_index = z * region_height * region_width + y * region_width + x;
-                                        } else {
-                                            debug_linear_index = y * region_width + x;
-                                        }
-                                        // spdlog::info("DIRECT READ: Pixel[{},{},{}] = {} (valid #{} for channel {}) linear_idx={}", 
-                                        //             x, y, z, value, valid_count, z, debug_linear_index);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    
-                    if (valid_count > 0) {
-                        profile_data[z] = sum / valid_count;
-                    } else {
-                        profile_data[z] = std::numeric_limits<double>::quiet_NaN();
-                    }
-                    
-                    if (z < 5 || z >= profile_size - 5 || z % 20 == 0) {
-                        spdlog::info("DIRECT READ: Channel {} - checked {} pixels, mask_true {} pixels, valid {} pixels, sum = {}, mean = {} ({})", 
-                                    z, total_checked, mask_true_count, valid_count, sum, profile_data[z], 
-                                    std::isfinite(profile_data[z]) ? "FINITE" : "NaN");
-                    }
-                }
-                
-                spdlog::warn("DIRECT READ: Profile calculation completed for ALL {} channels (z_start={}, z_end={})", 
-                            profile_size, z_start, z_end);
-                spdlog::warn("DIRECT READ: First 5 channel means: [{}]", 
-                            fmt::join(profile_data.begin(), profile_data.begin() + std::min(5, (int)profile_data.size()), ", "));
-                if (profile_data.size() > 10) {
-                    spdlog::warn("DIRECT READ: Last 5 channel means: [{}]", 
-                                fmt::join(profile_data.end() - 5, profile_data.end(), ", "));
-                }
-                
-                results[CARTA::StatsType::Mean] = profile_data;
+            if (!zarr_image->readDirectFromTensorStore(channel_array, channel_slicer)) {
+                spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to read channel {} from TensorStore", z);
                 progress = 1.0;
-                
-                spdlog::debug("DIRECT READ OPTIMIZATION: Successfully processed {}x{} region across {} channels", 
-                             region_width, region_height, profile_size);
-                return true;
-            } else {
-                spdlog::warn("Direct read failed for small region, falling back to per-channel method");
+                return false;
             }
-        }
-
-        // Read all channels at once for maximum efficiency
-        casacore::IPosition start, length;
-        if (shape.size() == 5) {
-            // 5D ZARR: [time, freq, stokes, x, y] 
-            start = casacore::IPosition(5, 0, z_start, stokes, x_min, y_min);
-            length = casacore::IPosition(5, 1, profile_size, 1, region_width, region_height);
-        } else if (shape.size() == 4) {
-            // 4D: Use CARTA standard order [x, y, freq, stokes]
-            start = casacore::IPosition(4, x_min, y_min, z_start, stokes);
-            length = casacore::IPosition(4, region_width, region_height, profile_size, 1);
-        } else if (shape.size() == 3) {
-            // 3D: Use CARTA standard order [x, y, freq]
-            start = casacore::IPosition(3, x_min, y_min, z_start);
-            length = casacore::IPosition(3, region_width, region_height, profile_size);
-        } else if (shape.size() == 2) {
-            // 2D: Use CARTA standard order [x, y]
-            start = casacore::IPosition(2, x_min, y_min);
-            length = casacore::IPosition(2, region_width, region_height);
-        } else {
-            spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
-            return false;
-        }
-        spdlog::info("GetRegionSpectralData: Using 4D start={} length={}", 
-                         fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
-
-        casacore::Array<float> full_array;
-        spdlog::info("GetRegionSpectralData: Reading ALL {} channels at once with start={} length={}", 
-                     profile_size, fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
-        
-        if (!zarr_image->doGetSlice(full_array, casacore::Slicer(start, length))) {
-            spdlog::error("ZarrLoader::GetRegionSpectralData: doGetSlice failed for full spectral range [{}-{}]", z_start, z_end);
-            return false;
-        }
-
-        // Process all channels from the single read
-        const float* data_ptr = full_array.data();
-        casacore::IPosition array_shape = full_array.shape();
-        
-        spdlog::info("GetRegionSpectralData: Successfully read full array of shape [{}], size={}", 
-                     fmt::join(array_shape.asStdVector(), ","), full_array.size());
-        
-        for (int z = 0; z < profile_size; ++z) {
+            
+            // Process this single channel
+            const float* data_ptr = channel_array.data();
+            casacore::IPosition array_shape = channel_array.shape();
+            
+            // Calculate mean for this channel
             double sum = 0.0;
             int valid_count = 0;
             
@@ -527,25 +308,27 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 for (int x = 0; x < region_width; ++x) {
                     int mask_x = x;
                     int mask_y = y;
-                    if (mask_x < mask_shape[0] && mask_y < mask_shape[1] && mask(casacore::IPosition(2, mask_x, mask_y))) {
+                    
+                    if (mask_x < mask_shape[0] && mask_y < mask_shape[1] && 
+                        mask(casacore::IPosition(2, mask_x, mask_y))) {
                         
-                        // Calculate linear index in full array
+                        // Calculate linear index in single channel array
                         size_t linear_index;
                         if (array_shape.size() == 5) {
-                            // [x, y, freq, stokes, time] 
-                            linear_index = x + y * region_width + z * region_width * region_height;
+                            // [time=1, freq=1, stokes=1, y=region_height, x=region_width]
+                            linear_index = y * region_width + x;
                         } else if (array_shape.size() == 4) {
-                            // [x, y, freq, stokes]
-                            linear_index = x + y * region_width + z * region_width * region_height;
+                            // [x=region_width, y=region_height, freq=1, stokes=1]
+                            linear_index = x + y * region_width;
                         } else if (array_shape.size() == 3) {
-                            // [x, y, freq]
-                            linear_index = x + y * region_width + z * region_width * region_height;
+                            // [x=region_width, y=region_height, freq=1]
+                            linear_index = x + y * region_width;
                         } else {
-                            // 2D: [x, y]
+                            // 2D: [x=region_width, y=region_height]
                             linear_index = x + y * region_width;
                         }
                         
-                        if (linear_index < full_array.size()) {
+                        if (linear_index < channel_array.size()) {
                             float value = data_ptr[linear_index];
                             if (std::isfinite(value)) {
                                 sum += value;
@@ -555,31 +338,35 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                     }
                 }
             }
-
+            
             if (valid_count > 0) {
-                profile_data[z] = sum / valid_count;
+                profile_data[profile_index] = sum / valid_count;
             } else {
-                profile_data[z] = std::numeric_limits<double>::quiet_NaN();
+                profile_data[profile_index] = std::numeric_limits<double>::quiet_NaN();
             }
             
-            if (z < 5 || z >= profile_size - 5 || z % 20 == 0) {
-                spdlog::info("BATCH READ: Channel {} - region {}x{}, valid {} pixels, sum = {}, mean = {} ({})", 
-                            z, region_width, region_height, valid_count, sum, profile_data[z],
-                            std::isfinite(profile_data[z]) ? "FINITE" : "NaN");
+            // Only log for debugging first few and last few channels
+            if (profile_index < 5 || profile_index >= profile_size - 5 || profile_index % 20 == 0) {
+                spdlog::info("Channel {} - region {}x{}, valid {} pixels, sum = {}, mean = {}", 
+                            z, region_width, region_height, valid_count, sum, profile_data[profile_index]);
             }
+            
+            // Update progress
+            progress = static_cast<float>(profile_index + 1) / static_cast<float>(profile_size);
         }
         
-        progress = 1.0;  // Complete since we read everything at once
-
+        // All channels processed
         results[CARTA::StatsType::Mean] = profile_data;
+        progress = 1.0;
         
-        spdlog::info("GetRegionSpectralData: Successfully calculated spectral profile for region {}x{} across {} channels (SINGLE READ)", 
-                     region_width, region_height, profile_size);
+        // spdlog::info("GetRegionSpectralData: Successfully processed {} channels individually for region {}x{}", 
+        //              profile_size, region_width, region_height);
         
         return true;
         
     } catch (std::exception& e) {
         spdlog::error("ZarrLoader::GetRegionSpectralData: Exception: {}", e.what());
+        progress = 1.0;  // Set progress to avoid infinite while loop in RegionHandler
         return false;
     }
 }

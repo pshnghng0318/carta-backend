@@ -126,6 +126,10 @@ private:
     bool loadRegionCache(int freq_channel, int stokes_channel, int start_x, int start_y, int width, int height);
     bool load4DRegionCache(int start_x, int start_y, int width, int height, int num_freq, int num_stokes, int freq_start = 0, int stokes_start = 0);
     bool getSliceFromCache(casacore::Array<float>& buffer, const casacore::Slicer& section);
+    
+    // Brightness unit and beam information reading
+    std::string readBrightnessUnit();
+    void setupImageInfo();
 };
 
 } // namespace carta

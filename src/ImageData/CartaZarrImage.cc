@@ -52,6 +52,8 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
     static std::unordered_map<std::string, IPosition> cached_original_shapes;
     static std::unordered_map<std::string, casacore::DataType> cached_data_types;
     static std::unordered_map<std::string, CoordinateSystem> cached_coord_sys;
+    static std::unordered_map<std::string, tensorstore::TensorStore<>> cached_tensorstores;
+    static std::unordered_map<std::string, std::string> cached_zarr_paths;
     
     bool is_repeat_init = initialized_files[filename];
     if (is_repeat_init) {
@@ -64,183 +66,26 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
         _coord_sys = cached_coord_sys[filename];
         _ndim = _shape.size();
         
-        // Still need to initialize TensorStore for this instance
-        initializeTensorStore();
+        // Use cached TensorStore to avoid re-initialization and duplicate logging
+        if (cached_tensorstores.find(filename) != cached_tensorstores.end()) {
+            _tensorstore = cached_tensorstores[filename];
+            _tensorstore_initialized = true;
+            spdlog::debug("CartaZarrImage: Using cached TensorStore for file: {}", filename);
+        } else {
+            // Fallback: initialize TensorStore if not cached
+            initializeTensorStore();
+        }
         
         // Set coordinate system in ImageInterface base class
         setCoordinateInfo(_coord_sys);
         
-        // Still need to read brightness unit for each instance
-        try {
-            std::filesystem::path zarr_path(filename);
-            std::filesystem::path zattrs_path = zarr_path / ".zattrs";
-            
-            if (std::filesystem::exists(zattrs_path)) {
-                std::ifstream zattrs_file(zattrs_path);
-                nlohmann::json zattrs_json;
-                zattrs_file >> zattrs_json;
-                
-                std::string found_bunit;
-
-                // Common keys: BUNIT, bunit, units, brightness_unit
-                if (zattrs_json.contains("BUNIT") && zattrs_json["BUNIT"].is_string()) {
-                    found_bunit = zattrs_json["BUNIT"].get<std::string>();
-                } else if (zattrs_json.contains("bunit") && zattrs_json["bunit"].is_string()) {
-                    found_bunit = zattrs_json["bunit"].get<std::string>();
-                } else if (zattrs_json.contains("units") && zattrs_json["units"].is_string()) {
-                    found_bunit = zattrs_json["units"].get<std::string>();
-                } else if (zattrs_json.contains("brightness_unit") && zattrs_json["brightness_unit"].is_string()) {
-                    found_bunit = zattrs_json["brightness_unit"].get<std::string>();
-                }
-
-                // If not found at top-level, check SKY/.zattrs (common convention for derived arrays)
-                if (found_bunit.empty()) {
-                    std::filesystem::path sky_zattrs = zarr_path / "SKY" / ".zattrs";
-                    if (std::filesystem::exists(sky_zattrs)) {
-                        try {
-                            std::ifstream sky_file(sky_zattrs);
-                            nlohmann::json sky_json;
-                            sky_file >> sky_json;
-                            if (sky_json.contains("units") && sky_json["units"].is_string()) {
-                                found_bunit = sky_json["units"].get<std::string>();
-                            } else if (sky_json.contains("BUNIT") && sky_json["BUNIT"].is_string()) {
-                                found_bunit = sky_json["BUNIT"].get<std::string>();
-                            } else if (sky_json.contains("bunit") && sky_json["bunit"].is_string()) {
-                                found_bunit = sky_json["bunit"].get<std::string>();
-                            }
-                        } catch (const std::exception& e) {
-                            spdlog::debug("ZARR UNIT: Failed to read SKY/.zattrs: {}", e.what());
-                        }
-                    }
-                }
-
-                if (!found_bunit.empty()) {
-                    casacore::String bunit_str(found_bunit);
-                    NormalizeUnit(bunit_str);
-                    if (casacore::UnitVal::check(bunit_str)) {
-                        // Set image brightness unit
-                        setUnits(casacore::Unit(bunit_str));
-                        spdlog::info("ZARR UNIT: Set image brightness unit from .zattrs: {}", bunit_str);
-                    } else {
-                        spdlog::warn("ZARR UNIT: Found brightness unit '{}' in .zattrs but failed to normalize/check", found_bunit);
-                    }
-                }
-
-                // Try to read restoring beam from BEAM zarr array if present
-                try {
-                    std::filesystem::path beam_array = zarr_path / "BEAM";
-                    std::filesystem::path beam_zarray = beam_array / ".zarray";
-                    if (std::filesystem::exists(beam_zarray)) {
-                        spdlog::info("Found BEAM array for Zarr image: {}", beam_array.string());
-
-                        // Build TensorStore spec for BEAM array
-                        nlohmann::json beam_spec_json = {
-                            {"driver", "zarr2"},
-                            {"kvstore", { {"driver", "file"}, {"path", beam_array.string()} }}
-                        };
-
-                        auto beam_spec_res = tensorstore::Spec::FromJson(beam_spec_json);
-                        if (!beam_spec_res.ok()) {
-                            spdlog::warn("Failed to create TensorStore spec for BEAM: {}", beam_spec_res.status().ToString());
-                        } else {
-                            auto beam_spec = beam_spec_res.value();
-                            auto open_res = tensorstore::Open(beam_spec, _context, tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read).result();
-                            if (!open_res.ok()) {
-                                spdlog::warn("Failed to open BEAM TensorStore: {}", open_res.status().ToString());
-                            } else {
-                                auto beam_store = open_res.value();
-
-                                // Read beam data from specific chunk 0.0.0.0 (time=0, freq=0, pol=0, all beam params)
-                                // BEAM array shape is typically [time, frequency, polarization, beam_param] where beam_param=[bmaj, bmin, bpa]
-                                auto domain = beam_store.domain();
-                                auto shape = domain.shape();
-                                
-                                // Convert shape to printable format
-                                std::string shape_str = "[";
-                                for (size_t i = 0; i < shape.size(); ++i) {
-                                    if (i > 0) shape_str += ", ";
-                                    shape_str += std::to_string(shape[i]);
-                                }
-                                shape_str += "]";
-                                spdlog::debug("BEAM array shape: {}", shape_str);
-
-                                if (shape.size() >= 4 && shape[3] >= 3) {
-                                    // Read the first beam entry [0, 0, 0, :] which contains [bmaj, bmin, bpa]
-                                    std::vector<tensorstore::Index> start(shape.size(), 0);
-                                    std::vector<tensorstore::Index> lengths(shape.size(), 1);
-                                    lengths[3] = 3; // Read first 3 beam parameters
-
-                                    auto read_res = tensorstore::Read(beam_store | tensorstore::AllDims().SizedInterval(start, lengths)).result();
-                                    if (!read_res.ok()) {
-                                        spdlog::warn("Failed to read BEAM chunk: {}", read_res.status().ToString());
-                                    } else {
-                                        auto beam_data = std::move(read_res.value());
-                                        
-                                        // Extract beam parameters from the read data
-                                        if (beam_data.num_elements() >= 3) {
-                                            const double* data_ptr = reinterpret_cast<const double*>(beam_data.data());
-                                            if (data_ptr) {
-                                                // Read bmaj, bmin, bpa from the first beam entry
-                                                double major = data_ptr[0];
-                                                double minor = data_ptr[1];
-                                                double pa = data_ptr[2];
-                                                
-                                                spdlog::debug("BEAM raw values: bmaj={}, bmin={}, bpa={}", major, minor, pa);
-
-                                                // Read units from BEAM/.zattrs if available (default to radians)
-                                                casacore::String beam_unit = "rad";
-                                                std::filesystem::path beam_zattrs_path = beam_array / ".zattrs";
-                                                if (std::filesystem::exists(beam_zattrs_path)) {
-                                                    try {
-                                                        std::ifstream bz(beam_zattrs_path);
-                                                        nlohmann::json bzjson;
-                                                        bz >> bzjson;
-                                                        if (bzjson.contains("units") && bzjson["units"].is_string()) {
-                                                            beam_unit = bzjson["units"].get<std::string>();
-                                                        }
-                                                    } catch (const std::exception& e) {
-                                                        spdlog::debug("Failed to parse BEAM/.zattrs units: {}", e.what());
-                                                    }
-                                                }
-
-                                                try {
-                                                    casacore::Quantity qmajor(major, beam_unit);
-                                                    casacore::Quantity qminor(minor, beam_unit);
-                                                    casacore::Quantity qpa(pa, beam_unit);
-
-                                                    // Set restoring beam on image info
-                                                    casacore::ImageInfo ii = imageInfo();
-                                                    ii.setRestoringBeam(qmajor, qminor, qpa);
-                                                    setImageInfo(ii);
-                                                    spdlog::info("ZARR BEAM: Set restoring beam from BEAM/0.0.0.0: major={} {}, minor={} {}, pa={} {}",
-                                                                qmajor.getValue(), qmajor.getUnit(), qminor.getValue(), qminor.getUnit(), qpa.getValue(), qpa.getUnit());
-                                                } catch (const std::exception& e) {
-                                                    spdlog::warn("Failed to set restoring beam from BEAM array: {}", e.what());
-                                                }
-                                            } else {
-                                                spdlog::warn("BEAM data pointer is null or insufficient data");
-                                            }
-                                        } else {
-                                            spdlog::warn("BEAM data has insufficient elements: {}", beam_data.num_elements());
-                                        }
-                                    }
-                                } else {
-                                    spdlog::warn("BEAM array has unexpected shape: {}", shape_str);
-                                }
-                            }
-                        }
-                    }
-                } catch (const std::exception& e) {
-                    spdlog::warn("Exception while extracting BEAM from Zarr: {}", e.what());
-                }
-            }
-        } catch (const std::exception& e) {
-            spdlog::warn("ZARR UNIT: Exception while parsing .zattrs for brightness unit: {}", e.what());
-        }
+        // Still need to read brightness unit and setup image info for each instance
+        readBrightnessUnit();
+        setupImageInfo();
         
         return;
     } else {
-        spdlog::info("CartaZarrImage: First-time initialization for file: {}", filename);
+        // spdlog::info("CartaZarrImage: First-time initialization for file: {}", filename);
         initialized_files[filename] = true;
     }
     
@@ -337,6 +182,10 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
     cached_original_shapes[filename] = _original_zarr_shape;
     cached_data_types[filename] = _actual_data_type;
     cached_coord_sys[filename] = _coord_sys;
+    if (_tensorstore_initialized) {
+        cached_tensorstores[filename] = _tensorstore;
+        spdlog::debug("CartaZarrImage: Cached TensorStore for future use: {}", filename);
+    }
     
     // Set coordinate system in ImageInterface base class
     setCoordinateInfo(_coord_sys);
@@ -361,165 +210,11 @@ void CartaZarrImage::setupCoordinateSystem() {
             
             spdlog::debug("CartaZarrImage: Reading coordinate system from .zattrs: {}", _name);
 
-            // Try to read brightness unit from .zattrs (top-level or SKY/.zattrs)
-            try {
-                std::string found_bunit;
-
-                // Common keys: BUNIT, bunit, units, brightness_unit
-                if (zattrs_json.contains("BUNIT") && zattrs_json["BUNIT"].is_string()) {
-                    found_bunit = zattrs_json["BUNIT"].get<std::string>();
-                } else if (zattrs_json.contains("bunit") && zattrs_json["bunit"].is_string()) {
-                    found_bunit = zattrs_json["bunit"].get<std::string>();
-                } else if (zattrs_json.contains("units") && zattrs_json["units"].is_string()) {
-                    found_bunit = zattrs_json["units"].get<std::string>();
-                } else if (zattrs_json.contains("brightness_unit") && zattrs_json["brightness_unit"].is_string()) {
-                    found_bunit = zattrs_json["brightness_unit"].get<std::string>();
-                }
-
-                // If not found at top-level, check SKY/.zattrs (common convention for derived arrays)
-                if (found_bunit.empty()) {
-                    std::filesystem::path zarr_path(_name.c_str());
-                    std::filesystem::path sky_zattrs = zarr_path / "SKY" / ".zattrs";
-                    if (std::filesystem::exists(sky_zattrs)) {
-                        try {
-                            std::ifstream sky_file(sky_zattrs);
-                            nlohmann::json sky_json;
-                            sky_file >> sky_json;
-                            if (sky_json.contains("units") && sky_json["units"].is_string()) {
-                                found_bunit = sky_json["units"].get<std::string>();
-                            } else if (sky_json.contains("BUNIT") && sky_json["BUNIT"].is_string()) {
-                                found_bunit = sky_json["BUNIT"].get<std::string>();
-                            } else if (sky_json.contains("bunit") && sky_json["bunit"].is_string()) {
-                                found_bunit = sky_json["bunit"].get<std::string>();
-                            }
-                        } catch (const std::exception& e) {
-                            spdlog::debug("ZARR UNIT: Failed to read SKY/.zattrs: {}", e.what());
-                        }
-                    }
-                }
-
-                if (!found_bunit.empty()) {
-                    casacore::String bunit_str(found_bunit);
-                    NormalizeUnit(bunit_str);
-                    if (casacore::UnitVal::check(bunit_str)) {
-                        // Set image brightness unit
-                        setUnits(casacore::Unit(bunit_str));
-                        spdlog::info("ZARR UNIT: Set image brightness unit from .zattrs: {}", bunit_str);
-                    } else {
-                        spdlog::warn("ZARR UNIT: Found brightness unit '{}' in .zattrs but failed to normalize/check", found_bunit);
-                    }
-                }
-            } catch (const std::exception& e) {
-                spdlog::warn("ZARR UNIT: Exception while parsing .zattrs for brightness unit: {}", e.what());
-            }
-
-            // Try to read restoring beam from BEAM zarr array if present
-            try {
-                std::filesystem::path beam_array = zarr_path / "BEAM";
-                std::filesystem::path beam_zarray = beam_array / ".zarray";
-                if (std::filesystem::exists(beam_zarray)) {
-                    spdlog::info("Found BEAM array for Zarr image: {}", beam_array.string());
-
-                    // Build TensorStore spec for BEAM array
-                    nlohmann::json beam_spec_json = {
-                        {"driver", "zarr2"},
-                        {"kvstore", { {"driver", "file"}, {"path", beam_array.string()} }}
-                    };
-
-                    auto beam_spec_res = tensorstore::Spec::FromJson(beam_spec_json);
-                    if (!beam_spec_res.ok()) {
-                        spdlog::warn("Failed to create TensorStore spec for BEAM: {}", beam_spec_res.status().ToString());
-                    } else {
-                        auto beam_spec = beam_spec_res.value();
-                        auto open_res = tensorstore::Open(beam_spec, _context, tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read).result();
-                        if (!open_res.ok()) {
-                            spdlog::warn("Failed to open BEAM TensorStore: {}", open_res.status().ToString());
-                        } else {
-                            auto beam_store = open_res.value();
-
-                            // Read beam data from specific chunk 0.0.0.0 (time=0, freq=0, pol=0, all beam params)
-                            // BEAM array shape is typically [time, frequency, polarization, beam_param] where beam_param=[bmaj, bmin, bpa]
-                            auto domain = beam_store.domain();
-                            auto shape = domain.shape();
-                            
-                            // Convert shape to printable format
-                            std::string shape_str = "[";
-                            for (size_t i = 0; i < shape.size(); ++i) {
-                                if (i > 0) shape_str += ", ";
-                                shape_str += std::to_string(shape[i]);
-                            }
-                            shape_str += "]";
-                            spdlog::debug("BEAM array shape: {}", shape_str);
-
-                            if (shape.size() >= 4 && shape[3] >= 3) {
-                                // Read the first beam entry [0, 0, 0, :] which contains [bmaj, bmin, bpa]
-                                std::vector<tensorstore::Index> start(shape.size(), 0);
-                                std::vector<tensorstore::Index> lengths(shape.size(), 1);
-                                lengths[3] = 3; // Read first 3 beam parameters
-
-                                auto read_res = tensorstore::Read(beam_store | tensorstore::AllDims().SizedInterval(start, lengths)).result();
-                                if (!read_res.ok()) {
-                                    spdlog::warn("Failed to read BEAM chunk: {}", read_res.status().ToString());
-                                } else {
-                                    auto beam_data = std::move(read_res.value());
-                                    
-                                    // Extract beam parameters from the read data
-                                    if (beam_data.num_elements() >= 3) {
-                                        const double* data_ptr = reinterpret_cast<const double*>(beam_data.data());
-                                        if (data_ptr) {
-                                            // Read bmaj, bmin, bpa from the first beam entry
-                                            double major = data_ptr[0];
-                                            double minor = data_ptr[1];
-                                            double pa = data_ptr[2];
-                                            
-                                            spdlog::debug("BEAM raw values: bmaj={}, bmin={}, bpa={}", major, minor, pa);
-
-                                            // Read units from BEAM/.zattrs if available (default to radians)
-                                            casacore::String beam_unit = "rad";
-                                            std::filesystem::path beam_zattrs_path = beam_array / ".zattrs";
-                                            if (std::filesystem::exists(beam_zattrs_path)) {
-                                                try {
-                                                    std::ifstream bz(beam_zattrs_path);
-                                                    nlohmann::json bzjson;
-                                                    bz >> bzjson;
-                                                    if (bzjson.contains("units") && bzjson["units"].is_string()) {
-                                                        beam_unit = bzjson["units"].get<std::string>();
-                                                    }
-                                                } catch (const std::exception& e) {
-                                                    spdlog::debug("Failed to parse BEAM/.zattrs units: {}", e.what());
-                                                }
-                                            }
-
-                                            try {
-                                                casacore::Quantity qmajor(major, beam_unit);
-                                                casacore::Quantity qminor(minor, beam_unit);
-                                                casacore::Quantity qpa(pa, beam_unit);
-
-                                                // Set restoring beam on image info
-                                                casacore::ImageInfo ii = imageInfo();
-                                                ii.setRestoringBeam(qmajor, qminor, qpa);
-                                                setImageInfo(ii);
-                                                spdlog::info("ZARR BEAM: Set restoring beam from BEAM/0.0.0.0: major={} {}, minor={} {}, pa={} {}",
-                                                             qmajor.getValue(), qmajor.getUnit(), qminor.getValue(), qminor.getUnit(), qpa.getValue(), qpa.getUnit());
-                                            } catch (const std::exception& e) {
-                                                spdlog::warn("Failed to set restoring beam from BEAM array: {}", e.what());
-                                            }
-                                        } else {
-                                            spdlog::warn("BEAM data pointer is null or insufficient data");
-                                        }
-                                    } else {
-                                        spdlog::warn("BEAM data has insufficient elements: {}", beam_data.num_elements());
-                                    }
-                                }
-                            } else {
-                                spdlog::warn("BEAM array has unexpected shape: {}", shape_str);
-                            }
-                        }
-                    }
-                }
-            } catch (const std::exception& e) {
-                spdlog::warn("Exception while extracting BEAM from Zarr: {}", e.what());
-            }
+            // Read brightness unit using dedicated function
+            readBrightnessUnit();
+            
+            // Setup image info including beam information  
+            setupImageInfo();
             
             // Parse WCS-like coordinate information
             if (parseWCSFromZattrs(zattrs_json)) {
@@ -1375,7 +1070,7 @@ void CartaZarrImage::initializeTensorStore() {
             if (std::filesystem::exists(potential_array_path / ".zarray")) {
                 zarr_path = potential_array_path.string();
                 found_array = true;
-                spdlog::info("Found Zarr array in subdirectory: {}", zarr_path);
+                spdlog::debug("Found Zarr array in subdirectory: {}", zarr_path);
                 break;
             }
         }
@@ -1388,7 +1083,7 @@ void CartaZarrImage::initializeTensorStore() {
         
         if (!found_array) {
             zarr_path = _name;  // Use original path
-            spdlog::info("Using direct Zarr path: {}", zarr_path);
+            spdlog::debug("Using direct Zarr path: {}", zarr_path);
         }
         
         // Create TensorStore spec using the format from extract_slice.cc example
@@ -1428,14 +1123,14 @@ void CartaZarrImage::initializeTensorStore() {
         
         // Verify that the data type is float32 as expected
         auto ts_dtype = _tensorstore.dtype();
-        spdlog::info("TensorStore data type: {}", ts_dtype.name());
+        spdlog::debug("TensorStore data type: {}", ts_dtype.name());
         
         // Check if data type is float32 (TensorStore uses "float32" as the name)
         if (ts_dtype.name() != "float32") {
             spdlog::warn("TensorStore data type is not float32, got: {}", ts_dtype.name());
         }
         
-        spdlog::info("Successfully initialized TensorStore for {}", _name);
+        spdlog::debug("Successfully initialized TensorStore for {}", _name);
         
         // Verify shape matches what we read from .zarray
         auto ts_domain = _tensorstore.domain();
@@ -1465,10 +1160,10 @@ void CartaZarrImage::initializeTensorStore() {
         }
         _ndim = _shape.size();
         
-        spdlog::info("Updated Zarr image shape from TensorStore: {}", _shape.toString());
+        spdlog::debug("Updated Zarr image shape from TensorStore: {}", _shape.toString());
         
-        spdlog::info("TensorStore rank: {}", ts_domain.rank());
-        spdlog::info("TensorStore shape: [{}]", 
+        spdlog::debug("TensorStore rank: {}", ts_domain.rank());
+        spdlog::debug("TensorStore shape: [{}]", 
                     [&ts_shape]() {
                         std::string result;
                         for (size_t i = 0; i < ts_shape.size(); ++i) {
@@ -1733,14 +1428,15 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                         num_stokes = length[3];
                     }
                     
-                    // For region spectral, even single channel can benefit from 4D cache
-                    // if we expect multiple channel requests to follow
-                    if (is_region_spectral && !is_4d_request) {
-                        // Load a small group of channels for region spectral efficiency
+                    // DISABLED: For region spectral, use single-channel strategy to avoid cache conflicts
+                    // The previous batch loading caused identical values across channels 0-9
+                    // Now using single-channel processing in ZarrLoader::GetRegionSpectralData
+                    if (false && is_region_spectral && !is_4d_request) {
+                        // DISABLED: Load a small group of channels for region spectral efficiency
                         int max_freq = _original_zarr_shape.size() > 1 ? _original_zarr_shape[1] : 1;
                         int current_freq = freq_index;
                         
-                        // Load a small batch around current frequency for spectral analysis
+                        // DISABLED: Load a small batch around current frequency for spectral analysis
                         int batch_size = std::min(10, max_freq - current_freq);
                         if (batch_size > 1) {
                             is_4d_request = true;
@@ -3447,6 +3143,196 @@ casacore::MFrequency::Types CartaZarrImage::ParseFrequencyFrameCode(int frame_co
     
     spdlog::warn("ZARR FREQ: Unknown frequency reference frame code {}, using default TOPO", frame_code);
     return casacore::MFrequency::TOPO;
+}
+
+void CartaZarrImage::setupImageInfo() {
+    try {
+        std::filesystem::path zarr_path(_name.c_str());
+        std::filesystem::path zattrs_path = zarr_path / ".zattrs";
+        
+        if (std::filesystem::exists(zattrs_path)) {
+            std::ifstream zattrs_file(zattrs_path);
+            nlohmann::json zattrs_json;
+            zattrs_file >> zattrs_json;
+            
+            // Try to read beam information from BEAM zarr array if present
+            try {
+                std::filesystem::path beam_array = zarr_path / "BEAM";
+                std::filesystem::path beam_zarray = beam_array / ".zarray";
+                if (std::filesystem::exists(beam_zarray)) {
+                    spdlog::info("setupImageInfo: Found BEAM array for Zarr image: {}", beam_array.string());
+
+                    // Build TensorStore spec for BEAM array
+                    nlohmann::json beam_spec_json = {
+                        {"driver", "zarr2"},
+                        {"kvstore", { {"driver", "file"}, {"path", beam_array.string()} }}
+                    };
+
+                    auto beam_spec_res = tensorstore::Spec::FromJson(beam_spec_json);
+                    if (!beam_spec_res.ok()) {
+                        spdlog::warn("setupImageInfo: Failed to create TensorStore spec for BEAM: {}", beam_spec_res.status().ToString());
+                        return;
+                    }
+
+                    auto beam_spec = beam_spec_res.value();
+                    auto open_res = tensorstore::Open(beam_spec, _context, tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read).result();
+                    if (!open_res.ok()) {
+                        spdlog::warn("setupImageInfo: Failed to open BEAM TensorStore: {}", open_res.status().ToString());
+                        return;
+                    }
+
+                    auto beam_store = open_res.value();
+
+                    // Read beam data from specific chunk 0.0.0.0 (time=0, freq=0, pol=0, all beam params)
+                    auto domain = beam_store.domain();
+                    auto shape = domain.shape();
+                    
+                    // Convert shape to printable format
+                    std::string shape_str = "[";
+                    for (size_t i = 0; i < shape.size(); ++i) {
+                        if (i > 0) shape_str += ", ";
+                        shape_str += std::to_string(shape[i]);
+                    }
+                    shape_str += "]";
+                    spdlog::debug("setupImageInfo: BEAM array shape: {}", shape_str);
+
+                    if (shape.size() >= 4 && shape[3] >= 3) {
+                        // Read the first beam entry [0, 0, 0, :] which contains [bmaj, bmin, bpa]
+                        std::vector<tensorstore::Index> start(shape.size(), 0);
+                        std::vector<tensorstore::Index> lengths(shape.size(), 1);
+                        lengths[3] = 3; // Read first 3 beam parameters
+
+                        auto read_res = tensorstore::Read(beam_store | tensorstore::AllDims().SizedInterval(start, lengths)).result();
+                        if (!read_res.ok()) {
+                            spdlog::warn("setupImageInfo: Failed to read BEAM chunk: {}", read_res.status().ToString());
+                            return;
+                        }
+
+                        auto beam_data = std::move(read_res.value());
+                        
+                        // Extract beam parameters from the read data
+                        if (beam_data.num_elements() >= 3) {
+                            const double* data_ptr = reinterpret_cast<const double*>(beam_data.data());
+                            if (data_ptr) {
+                                // Read bmaj, bmin, bpa from the first beam entry
+                                double major = data_ptr[0];
+                                double minor = data_ptr[1];
+                                double pa = data_ptr[2];
+                                
+                                spdlog::debug("setupImageInfo: BEAM raw values: bmaj={}, bmin={}, bpa={}", major, minor, pa);
+
+                                // Read units from BEAM/.zattrs if available (default to radians)
+                                casacore::String beam_unit = "rad";
+                                std::filesystem::path beam_zattrs_path = beam_array / ".zattrs";
+                                if (std::filesystem::exists(beam_zattrs_path)) {
+                                    try {
+                                        std::ifstream bz(beam_zattrs_path);
+                                        nlohmann::json bzjson;
+                                        bz >> bzjson;
+                                        if (bzjson.contains("units") && bzjson["units"].is_string()) {
+                                            beam_unit = bzjson["units"].get<std::string>();
+                                        }
+                                    } catch (const std::exception& e) {
+                                        spdlog::debug("setupImageInfo: Failed to parse BEAM/.zattrs units: {}", e.what());
+                                    }
+                                }
+
+                                try {
+                                    casacore::Quantity qmajor(major, beam_unit);
+                                    casacore::Quantity qminor(minor, beam_unit);
+                                    casacore::Quantity qpa(pa, beam_unit);
+
+                                    // Get current image info and set restoring beam
+                                    casacore::ImageInfo ii = imageInfo();
+                                    ii.setRestoringBeam(qmajor, qminor, qpa);
+                                    setImageInfo(ii);
+                                    
+                                    spdlog::info("setupImageInfo: Successfully set restoring beam from BEAM array: major={} {}, minor={} {}, pa={} {}",
+                                                qmajor.getValue(), qmajor.getUnit(), qminor.getValue(), qminor.getUnit(), qpa.getValue(), qpa.getUnit());
+                                } catch (const std::exception& e) {
+                                    spdlog::warn("setupImageInfo: Failed to set restoring beam from BEAM array: {}", e.what());
+                                }
+                            } else {
+                                spdlog::warn("setupImageInfo: BEAM data pointer is null or insufficient data");
+                            }
+                        } else {
+                            spdlog::warn("setupImageInfo: BEAM data has insufficient elements: {}", beam_data.num_elements());
+                        }
+                    } else {
+                        spdlog::warn("setupImageInfo: BEAM array has unexpected shape: {}", shape_str);
+                    }
+                }
+            } catch (const std::exception& e) {
+                spdlog::warn("setupImageInfo: Exception while extracting BEAM from Zarr: {}", e.what());
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("setupImageInfo: Exception while reading .zattrs for beam info: {}", e.what());
+    }
+}
+
+std::string CartaZarrImage::readBrightnessUnit() {
+    try {
+        std::filesystem::path zarr_path(_name.c_str());
+        std::filesystem::path zattrs_path = zarr_path / ".zattrs";
+        
+        if (std::filesystem::exists(zattrs_path)) {
+            std::ifstream zattrs_file(zattrs_path);
+            nlohmann::json zattrs_json;
+            zattrs_file >> zattrs_json;
+            
+            std::string found_bunit;
+
+            // Common keys: BUNIT, bunit, units, brightness_unit
+            if (zattrs_json.contains("BUNIT") && zattrs_json["BUNIT"].is_string()) {
+                found_bunit = zattrs_json["BUNIT"].get<std::string>();
+            } else if (zattrs_json.contains("bunit") && zattrs_json["bunit"].is_string()) {
+                found_bunit = zattrs_json["bunit"].get<std::string>();
+            } else if (zattrs_json.contains("units") && zattrs_json["units"].is_string()) {
+                found_bunit = zattrs_json["units"].get<std::string>();
+            } else if (zattrs_json.contains("brightness_unit") && zattrs_json["brightness_unit"].is_string()) {
+                found_bunit = zattrs_json["brightness_unit"].get<std::string>();
+            }
+
+            // If not found at top-level, check SKY/.zattrs (common convention for derived arrays)
+            if (found_bunit.empty()) {
+                std::filesystem::path sky_zattrs = zarr_path / "SKY" / ".zattrs";
+                if (std::filesystem::exists(sky_zattrs)) {
+                    try {
+                        std::ifstream sky_file(sky_zattrs);
+                        nlohmann::json sky_json;
+                        sky_file >> sky_json;
+                        if (sky_json.contains("units") && sky_json["units"].is_string()) {
+                            found_bunit = sky_json["units"].get<std::string>();
+                        } else if (sky_json.contains("BUNIT") && sky_json["BUNIT"].is_string()) {
+                            found_bunit = sky_json["BUNIT"].get<std::string>();
+                        } else if (sky_json.contains("bunit") && sky_json["bunit"].is_string()) {
+                            found_bunit = sky_json["bunit"].get<std::string>();
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::debug("readBrightnessUnit: Failed to read SKY/.zattrs: {}", e.what());
+                    }
+                }
+            }
+
+            if (!found_bunit.empty()) {
+                casacore::String bunit_str(found_bunit);
+                NormalizeUnit(bunit_str);
+                if (casacore::UnitVal::check(bunit_str)) {
+                    // Set image brightness unit
+                    setUnits(casacore::Unit(bunit_str));
+                    spdlog::info("readBrightnessUnit: Set image brightness unit from .zattrs: {}", bunit_str);
+                    return found_bunit;
+                } else {
+                    spdlog::warn("readBrightnessUnit: Found brightness unit '{}' in .zattrs but failed to normalize/check", found_bunit);
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("readBrightnessUnit: Exception while parsing .zattrs for brightness unit: {}", e.what());
+    }
+    
+    return "";
 }
 
 } // namespace carta
