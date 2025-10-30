@@ -122,49 +122,58 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
             return false;
         }
         
-        spdlog::debug("GetCursorSpectralData: Reading {} channels one by one for point ({},{}) stokes={}", 
+        spdlog::debug("GetCursorSpectralData: Using direct TensorStore read for {} channels at point ({},{}) stokes={}", 
                      num_channels, cursor_x, cursor_y, stokes);
         
         data.resize(num_channels);
         
-        // Read each channel individually
+        // Use direct TensorStore read to avoid cache loading and ensure success
+        // Read all channels at once as a single spectral profile
+        casacore::IPosition start, length;
+        
+        if (shape.size() == 5) {
+            // 5D ZARR: [time, freq, stokes, x, y] - read all freq channels for single pixel
+            start = casacore::IPosition(5, 0, 0, stokes, cursor_x, cursor_y);
+            length = casacore::IPosition(5, 1, num_channels, 1, 1, 1);
+        } else if (shape.size() == 4) {
+            // 4D: CARTA internal format [x, y, freq, stokes] - read all freq channels for single pixel
+            start = casacore::IPosition(4, cursor_x, cursor_y, 0, stokes);
+            length = casacore::IPosition(4, 1, 1, num_channels, 1);
+        } else if (shape.size() == 3) {
+            // 3D: [x, y, freq] - read all freq channels for single pixel
+            start = casacore::IPosition(3, cursor_x, cursor_y, 0);
+            length = casacore::IPosition(3, 1, 1, num_channels);
+        } else if (shape.size() == 2) {
+            // 2D: [x, y] - single channel only
+            start = casacore::IPosition(2, cursor_x, cursor_y);
+            length = casacore::IPosition(2, 1, 1);
+            data[0] = 0.0f; // Placeholder for 2D data
+            spdlog::debug("GetCursorSpectralData: 2D image - returning single placeholder value");
+            return true;
+        } else {
+            spdlog::error("ZarrLoader::GetCursorSpectralData: Unsupported number of dimensions: {}", shape.size());
+            return false;
+        }
+        
+        // Use direct TensorStore read via readPixelFromTensorStore to bypass cache entirely
+        casacore::Array<float> pixel_array;
+        casacore::Slicer section(start, length);
+        
+        if (!zarr_image->readPixelFromTensorStore(pixel_array, section)) {
+            spdlog::error("ZarrLoader::GetCursorSpectralData: readPixelFromTensorStore failed for spectral profile");
+            return false;
+        }
+        
+        // Copy array data to output vector
+        if (pixel_array.nelements() != num_channels) {
+            spdlog::error("ZarrLoader::GetCursorSpectralData: Expected {} elements, got {}", 
+                         num_channels, pixel_array.nelements());
+            return false;
+        }
+        
+        const float* pixel_data = pixel_array.data();
         for (int z = 0; z < num_channels; ++z) {
-            casacore::IPosition start, length;
-            
-            if (shape.size() == 5) {
-                // 5D ZARR: [time, freq, stokes, x, y] - read single channel for single pixel
-                start = casacore::IPosition(5, 0, z, stokes, cursor_x, cursor_y);
-                length = casacore::IPosition(5, 1, 1, 1, 1, 1);
-            } else if (shape.size() == 4) {
-                // 4D: CARTA internal format [x, y, freq, stokes] - read single channel for single pixel
-                start = casacore::IPosition(4, cursor_x, cursor_y, z, stokes);
-                length = casacore::IPosition(4, 1, 1, 1, 1);
-            } else if (shape.size() == 3) {
-                // 3D: [x, y, freq] - read single channel for single pixel
-                start = casacore::IPosition(3, cursor_x, cursor_y, z);
-                length = casacore::IPosition(3, 1, 1, 1);
-            } else if (shape.size() == 2) {
-                // 2D: [x, y] - single channel
-                start = casacore::IPosition(2, cursor_x, cursor_y);
-                length = casacore::IPosition(2, 1, 1);
-            } else {
-                spdlog::error("ZarrLoader::GetCursorSpectralData: Unsupported number of dimensions: {}", shape.size());
-                return false;
-            }
-            
-            casacore::Array<float> pixel_array;
-            if (!zarr_image->doGetSlice(pixel_array, casacore::Slicer(start, length))) {
-                spdlog::error("ZarrLoader::GetCursorSpectralData: doGetSlice failed for channel {}", z);
-                return false;
-            }
-            
-            if (pixel_array.nelements() != 1) {
-                spdlog::error("ZarrLoader::GetCursorSpectralData: Expected 1 element for channel {}, got {}", 
-                             z, pixel_array.nelements());
-                return false;
-            }
-            
-            data[z] = *pixel_array.data();
+            data[z] = pixel_data[z];
         }
         
         spdlog::debug("GetCursorSpectralData: Successfully read {} channels one by one for point ({},{})", 

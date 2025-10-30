@@ -130,6 +130,10 @@ private:
     // Brightness unit and beam information reading
     std::string readBrightnessUnit();
     void setupImageInfo();
+    
+    // Cached versions to avoid repeated loading
+    void readBrightnessUnitIfNeeded();
+    void setupImageInfoIfNeeded();
 };
 
 } // namespace carta

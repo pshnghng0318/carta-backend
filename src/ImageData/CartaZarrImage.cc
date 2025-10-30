@@ -55,6 +55,8 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
     static std::unordered_map<std::string, CoordinateSystem> cached_coord_sys;
     static std::unordered_map<std::string, tensorstore::TensorStore<>> cached_tensorstores;
     static std::unordered_map<std::string, std::string> cached_zarr_paths;
+    static std::unordered_map<std::string, bool> brightness_unit_loaded;
+    static std::unordered_map<std::string, bool> image_info_loaded;
     
     bool is_repeat_init = initialized_files[filename];
     if (is_repeat_init) {
@@ -80,9 +82,9 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
         // Set coordinate system in ImageInterface base class
         setCoordinateInfo(_coord_sys);
         
-        // Still need to read brightness unit and setup image info for each instance
-        readBrightnessUnit();
-        setupImageInfo();
+        // Only read brightness unit and setup image info once per file
+        readBrightnessUnitIfNeeded();
+        setupImageInfoIfNeeded();
         
         return;
     } else {
@@ -190,6 +192,10 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
     
     // Set coordinate system in ImageInterface base class
     setCoordinateInfo(_coord_sys);
+    
+    // Load brightness unit and image info (beam) once per file at the end of constructor
+    readBrightnessUnitIfNeeded();
+    setupImageInfoIfNeeded();
 }
 
 void CartaZarrImage::setupCoordinateSystem() {
@@ -211,12 +217,6 @@ void CartaZarrImage::setupCoordinateSystem() {
             
             spdlog::debug("CartaZarrImage: Reading coordinate system from .zattrs: {}", _name);
 
-            // Read brightness unit using dedicated function
-            readBrightnessUnit();
-            
-            // Setup image info including beam information  
-            setupImageInfo();
-            
             // Parse WCS-like coordinate information
             if (parseWCSFromZattrs(zattrs_json)) {
                 spdlog::info("Successfully parsed coordinate system from .zattrs");
@@ -1407,7 +1407,8 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         spdlog::debug("  Region spectral: {}", is_region_spectral ? "YES" : "NO");
         spdlog::debug("  Use region cache: {}", use_region_cache ? "YES" : "NO");
         spdlog::debug("  Use direct read: {}", use_direct_read ? "YES" : "NO");
-        spdlog::debug("  Current cache status: loaded={}, channel={}, is_full={}", _channel_cache_loaded, _cached_channel, _is_full_channel_cache);
+        int display_channel = (_cached_channel >= 0) ? _cached_channel / 1000 : _cached_channel;  // Decode frequency channel
+        spdlog::debug("  Current cache status: loaded={}, channel={}, is_full={}", _channel_cache_loaded, display_channel, _is_full_channel_cache);
         // spdlog::debug("  Target channel: {}", current_channel);
         
         // CACHE-FIRST STRATEGY (inspired by CartaFitsImage's GetDataSubset approach)
@@ -3355,6 +3356,47 @@ std::string CartaZarrImage::readBrightnessUnit() {
     }
     
     return "";
+}
+
+// Cached versions to avoid repeated loading per file
+void CartaZarrImage::readBrightnessUnitIfNeeded() {
+    static std::unordered_map<std::string, bool> brightness_unit_loaded;
+    static std::unordered_map<std::string, casacore::Unit> cached_brightness_units;
+    
+    if (!brightness_unit_loaded[_name]) {
+        std::string unit_str = readBrightnessUnit();
+        if (!unit_str.empty()) {
+            cached_brightness_units[_name] = units();
+        }
+        brightness_unit_loaded[_name] = true;
+        spdlog::debug("CartaZarrImage: Loaded brightness unit for file: {}", _name);
+    } else {
+        // Apply cached brightness unit to this instance
+        if (cached_brightness_units.find(_name) != cached_brightness_units.end()) {
+            setUnits(cached_brightness_units[_name]);
+            spdlog::debug("CartaZarrImage: Applied cached brightness unit for file: {}", _name);
+        }
+        spdlog::debug("CartaZarrImage: Skipping repeated brightness unit read for file: {}", _name);
+    }
+}
+
+void CartaZarrImage::setupImageInfoIfNeeded() {
+    static std::unordered_map<std::string, bool> image_info_loaded;
+    static std::unordered_map<std::string, casacore::ImageInfo> cached_image_info;
+    
+    if (!image_info_loaded[_name]) {
+        setupImageInfo();
+        cached_image_info[_name] = imageInfo();
+        image_info_loaded[_name] = true;
+        spdlog::debug("CartaZarrImage: Loaded image info for file: {}", _name);
+    } else {
+        // Apply cached image info (including beam) to this instance
+        if (cached_image_info.find(_name) != cached_image_info.end()) {
+            setImageInfo(cached_image_info[_name]);
+            spdlog::debug("CartaZarrImage: Applied cached image info (beam) for file: {}", _name);
+        }
+        spdlog::debug("CartaZarrImage: Skipping repeated image info setup for file: {}", _name);
+    }
 }
 
 } // namespace carta
