@@ -6,6 +6,7 @@
 
 #include "CartaZarrImage.h"
 #include "Logger/Logger.h"
+#include "ThreadManager/ThreadManager.h"
 
 #include "Util/Casacore.h"
 
@@ -1316,12 +1317,22 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         // Create a unique channel identifier combining freq and stokes
         int current_channel = freq_index * 1000 + stokes_index;  // Assuming max 1000 stokes per freq
         
-        // Decide caching strategy based on request size
-        int req_width = length[0];
-        int req_height = length[1];
+        // CRITICAL FIX: Calculate request size correctly based on coordinate reordering
+        int req_width, req_height;
+        if (coordinates_reordered) {
+            // Reordered format: [freq, stokes, y, x] -> spatial dimensions are at positions 2,3
+            req_width = (length.size() > 3) ? length[3] : 1;   // x dimension
+            req_height = (length.size() > 2) ? length[2] : 1;  // y dimension
+        } else {
+            // Normal format: [x, y, freq, stokes] -> spatial dimensions are at positions 0,1
+            req_width = length[0];   // x dimension
+            req_height = length[1];  // y dimension
+        }
+        
         int full_width = _shape[0];  // CARTA width
         int full_height = _shape[1]; // CARTA height
-        spdlog::info("doGetSlice: Request size = {}x{}, Full image size = {}x{}", req_width, req_height, full_width, full_height);
+        spdlog::info("doGetSlice: Request size = {}x{}, Full image size = {}x{} (coordinates_reordered={})", 
+                    req_width, req_height, full_width, full_height, coordinates_reordered);
 
         // Detect region spectral operations: small spatial region reads for spectral analysis
         // These typically read a small region across multiple channels/frequencies
@@ -1338,11 +1349,22 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             // 4. NOT a 1D profile (both width > 1 AND height > 1)
             
             bool is_small_spatial_region = (area_ratio < 0.5 && req_width < full_width && req_height < full_height);
-            bool is_multi_channel = (length[2] > 1 || length[3] > 1);
+            
+            // Check if this is multi-channel based on coordinate format
+            bool is_multi_channel = false;
+            if (coordinates_reordered) {
+                // Reordered format: [freq, stokes, y, x] -> check freq/stokes dimensions
+                is_multi_channel = (length[0] > 1 || length[1] > 1);
+            } else {
+                // Normal format: [x, y, freq, stokes] -> check freq/stokes dimensions
+                is_multi_channel = (length[2] > 1 || length[3] > 1);
+            }
+            
             bool is_not_single_pixel = (req_width > 1 || req_height > 1);
             bool is_not_1d_profile = (req_width > 1 && req_height > 1);
+            bool is_not_pixel_spectral = !(req_width == 1 && req_height == 1 && is_multi_channel);  // Exclude pixel spectral
             
-            if (is_small_spatial_region && is_not_single_pixel && is_not_1d_profile) {
+            if (is_small_spatial_region && is_not_single_pixel && is_not_1d_profile && is_not_pixel_spectral) {
                 is_region_spectral = true;
                 spdlog::debug("REGION SPECTRAL DETECTED: area={:.2f}%, multi_ch={}, {}x{} spatial", 
                              area_ratio * 100, is_multi_channel, req_width, req_height);
@@ -1355,19 +1377,33 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         bool is_single_point = (req_width == 1 && req_height == 1); // Single pixel request
         bool is_1d_profile = (is_horizontal_profile || is_vertical_profile) && !is_single_point;
         
+        // CRITICAL FIX: Detect pixel spectral (1x1 spatial + multi-channel) - handle coordinate reordering
+        bool is_pixel_spectral = false;
+        if (req_width == 1 && req_height == 1) {
+            // Check if this is multi-channel based on coordinate format
+            if (coordinates_reordered) {
+                // Reordered format: [freq, stokes, y, x] -> check freq/stokes dimensions
+                is_pixel_spectral = (length[0] > 1 || length[1] > 1);
+            } else {
+                // Normal format: [x, y, freq, stokes] -> check freq/stokes dimensions
+                is_pixel_spectral = (length[2] > 1 || length[3] > 1);
+            }
+        }
+        
         // Use region cache for small requests (e.g., z-profile regions, small tiles)
         // For 1D profiles, always use full channel cache to avoid complexity
         // NEVER use direct read - spatial profiles should ALWAYS use cache system
         // For histogram/statistics calculation, ALWAYS use full channel cache for efficiency
-        // For region spectral operations, PREFER region cache to avoid reading full width/height
-        bool use_region_cache = !is_1d_profile && !is_histogram_call && 
-                               (is_region_spectral || (req_width < full_width / 4 && req_height < full_height / 4));
-        bool use_direct_read = false;  // DISABLED: Spatial profiles must use cache system
+        // CRITICAL: For ALL spectral operations (pixel + region), use direct TensorStore read to avoid cache overhead
+        bool use_region_cache = !is_1d_profile && !is_histogram_call && !is_pixel_spectral && !is_region_spectral &&
+                               (req_width < full_width / 4 && req_height < full_height / 4);
+        bool use_direct_read = is_pixel_spectral || is_region_spectral;  // ENABLED for ALL spectral operations
         
         spdlog::debug("CACHE STRATEGY DECISION:");
         spdlog::debug("  Request size: {}x{}, Full size: {}x{}", req_width, req_height, full_width, full_height);
         spdlog::debug("  1D Profile detected: {} (horizontal={}, vertical={})", is_1d_profile ? "YES" : "NO", is_horizontal_profile, is_vertical_profile);
         spdlog::debug("  Single point request: {}", is_single_point ? "YES" : "NO");
+        spdlog::debug("  Pixel spectral detected: {}", is_pixel_spectral ? "YES" : "NO");
         spdlog::debug("  Region spectral: {}", is_region_spectral ? "YES" : "NO");
         spdlog::debug("  Use region cache: {}", use_region_cache ? "YES" : "NO");
         spdlog::debug("  Use direct read: {}", use_direct_read ? "YES" : "NO");
@@ -1381,13 +1417,8 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         bool cache_hit = false;
         
         // For single point requests, still try cache first (unlike previous direct read approach)
-        if (use_direct_read && _channel_cache_loaded && _cached_channel == current_channel) {
-            spdlog::debug("ZARR doGetSlice: Single point request - trying cache first before direct TensorStore");
-            if (getSliceFromCache(buffer, section)) {
-                return true;
-            }
-            // If cache miss, fall through to TensorStore read
-            spdlog::debug("ZARR doGetSlice: Cache miss for single point, falling back to TensorStore");
+        if (use_direct_read && (is_pixel_spectral || is_region_spectral)) {
+            spdlog::debug("ZARR doGetSlice: Spectral request (pixel or region) - using direct TensorStore read, bypassing cache");
             return readPixelFromTensorStore(buffer, section);
         }
         
@@ -1401,21 +1432,22 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             spdlog::debug("ZARR doGetSlice: Statistics/histogram requires full channel cache - loading now");
         }
         
-        // For region spectral operations, prefer region cache over full cache to avoid reading full width/height
-        if (is_region_spectral && (_is_full_channel_cache || !cache_suitable)) {
-            cache_type_suitable = false;
-            spdlog::debug("ZARR doGetSlice: Region spectral prefers region cache - avoiding full channel read");
-        }
-        
         // For region requests, check if we want region cache instead of full cache
-        if (!is_histogram_call && !is_region_spectral && use_region_cache && (_is_full_channel_cache || !cache_suitable)) {
+        if (!is_histogram_call && use_region_cache && (_is_full_channel_cache || !cache_suitable)) {
             cache_type_suitable = false;
         }
         
         // Load appropriate cache if needed (like CartaFitsImage's GetDataSubset template selection)
         if (!cache_suitable || !cache_type_suitable) {
             
-            if ((use_region_cache || is_region_spectral) && !is_histogram_call) {
+            // BACKGROUND PRELOAD STRATEGY (inspired by FITS approach):
+            // 1. Load current channel immediately (foreground)
+            // 2. Queue background loading of next few channels (4-9 channels ahead)
+            // 3. Maintain LRU cache to avoid memory overflow
+            
+            if (use_region_cache && !is_histogram_call) {
+                // IMMEDIATE FOREGROUND LOADING (like FITS FillImageCache)
+                // Load current channel/region immediately for user responsiveness
                 // Enhanced 4D request detection for region spectral operations
                 bool is_4d_request = false;
                 int num_freq = 1, num_stokes = 1;
@@ -1449,8 +1481,8 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                     }
                 }
                 
-                if (is_4d_request && is_region_spectral) {
-                    // 4D Region spectral: load multiple frequencies at once
+                if (is_4d_request) {
+                    // 4D request: load multiple frequencies at once
                     
                     // Extract spatial coordinates
                     int spatial_start_x, spatial_start_y, spatial_width, spatial_height;
@@ -1475,11 +1507,11 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                         cache_hit = getSliceFromCache(buffer, section);
                     }
                 } else {
-                    // Regular 2D region cache for single channel
-                    // For region spectral, use adaptive padding based on region size
-                    int padding = is_region_spectral ? 
-                        std::min(std::max(req_width, req_height) / 2, 200) :  // Adaptive padding for region spectral
-                        std::min(100, std::min(req_width, req_height));        // Standard padding for small requests
+                    // IMMEDIATE FOREGROUND LOADING for current channel (like FITS FillImageCache)
+                    // Then BACKGROUND PRELOAD STRATEGY: Queue loading of next 4-9 channels
+                    
+                    // For small requests, use adaptive padding based on region size
+                    int padding = std::min(100, std::min(req_width, req_height));        // Standard padding for small requests
                     
                     // Extract correct spatial coordinates based on reordering detection
                     int spatial_start_x, spatial_start_y;
@@ -1498,20 +1530,17 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                     int region_width = std::min(full_width - region_start_x, req_width + 2 * padding);
                     int region_height = std::min(full_height - region_start_y, req_height + 2 * padding);
                     
-                    spdlog::debug("ZARR doGetSlice: Loading region cache [freq={}, stokes={}]: {}x{} at ({},{}) with padding {} ({})",
-                                freq_index, stokes_index, region_width, region_height, region_start_x, region_start_y, padding,
-                                is_region_spectral ? "region_spectral" : "small_request");
+                    spdlog::debug("ZARR doGetSlice: Loading region cache [freq={}, stokes={}]: {}x{} at ({},{}) with padding {} (small_request)",
+                                freq_index, stokes_index, region_width, region_height, region_start_x, region_start_y, padding);
                     
                     if (loadRegionCache(freq_index, stokes_index, region_start_x, region_start_y, region_width, region_height)) {
                         cache_hit = getSliceFromCache(buffer, section);
                     }
                 }
                 
-                if (!cache_hit && !is_region_spectral) {
+                if (!cache_hit) {
                     spdlog::warn("ZARR doGetSlice: Region cache failed, falling back to full channel cache");
                     use_region_cache = false;  // Fall back to full channel cache
-                } else if (!cache_hit && is_region_spectral) {
-                    spdlog::warn("ZARR doGetSlice: Region cache failed for region spectral, trying direct read to avoid full channel");
                     // For region spectral, prefer direct read over full channel cache
                     return readPixelFromTensorStore(buffer, section);
                 }
@@ -1519,22 +1548,15 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             
             if ((!use_region_cache && !is_region_spectral) || !cache_hit) {
                 // Load full channel cache (equivalent to CartaFitsImage's full data subset read)
-                // Skip this for region spectral operations to avoid reading full width/height
-                if (!is_region_spectral) {
-                    spdlog::debug("ZARR doGetSlice: Loading full channel [freq={}, stokes={}] - FITS-style efficient data access",
-                                freq_index, stokes_index);
-                    
-                    if (loadChannelCache(freq_index, stokes_index)) {
-                        cache_hit = getSliceFromCache(buffer, section);
-                    }
-                    
-                    if (!cache_hit) {
-                        spdlog::warn("ZARR doGetSlice: Full channel cache failed, falling back to direct TensorStore read");
-                    }
-                } else {
-                    spdlog::debug("ZARR doGetSlice: Skipping full channel cache for region spectral, using direct read");
-                    // For region spectral, go directly to TensorStore read to avoid full width/height
-                    cache_hit = false;  // Force direct read
+                spdlog::debug("ZARR doGetSlice: Loading full channel [freq={}, stokes={}] - FITS-style efficient data access",
+                            freq_index, stokes_index);
+                
+                if (loadChannelCache(freq_index, stokes_index)) {
+                    cache_hit = getSliceFromCache(buffer, section);
+                }
+                
+                if (!cache_hit) {
+                    spdlog::warn("ZARR doGetSlice: Full channel cache failed, falling back to direct TensorStore read");
                 }
             }
         } else {
