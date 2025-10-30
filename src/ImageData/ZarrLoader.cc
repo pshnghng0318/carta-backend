@@ -199,19 +199,11 @@ bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, 
 
     if (_image && region_shape.size() >= 2) {
         int region_size = region_shape[0] * region_shape[1];
-        const int SMALL_REGION_THRESHOLD = 100; // pixels
         
-        // Only use loader path for very small regions to prevent cache overflow
-        if (region_size <= SMALL_REGION_THRESHOLD) {
-            spdlog::info("UseRegionSpectralData: RETURNING TRUE for small region spectral data ({}x{} region, size: {} pixels)", 
-                         region_shape[0], region_shape[1], region_size);
-            return true;
-        } else {
-            // Use RegionHandler's segmented processing for larger regions to prevent cache overflow
-            spdlog::info("UseRegionSpectralData: RETURNING FALSE for large region ({}x{} region, size: {} pixels) - using segmented processing", 
-                         region_shape[0], region_shape[1], region_size);
-            return false;
-        }
+        // Always use batch processing for region spectral data since we use direct read without cache
+        spdlog::info("UseRegionSpectralData: RETURNING TRUE for region spectral data ({}x{} region, size: {} pixels) - using multi-channel batch processing", 
+                     region_shape[0], region_shape[1], region_size);
+        return true;
     }
 
     spdlog::info("UseRegionSpectralData: RETURNING FALSE - Using default image slicing for {}x{} region", 
@@ -222,6 +214,9 @@ bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, 
 bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_range, int stokes,
     const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin,
     std::mutex& image_mutex, std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) {
+    
+    spdlog::info("ZarrLoader::GetRegionSpectralData: BATCH PROCESSING CALLED - region_id={}, spectral_range={}:{}, stokes={}", 
+                region_id, spectral_range.from, spectral_range.to, stokes);
     
     std::lock_guard<std::mutex> lock(image_mutex);
     
@@ -266,110 +261,130 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
 
         std::vector<double> profile_data(profile_size, 0.0);
         
-        // SINGLE-CHANNEL STRATEGY: Process one channel at a time to avoid cache conflicts
-        // spdlog::info("GetRegionSpectralData: Processing {} channels one by one", profile_size);
+        // BATCHED TENSOR STORE STRATEGY: Process multiple channels at once for efficiency
+        const int BATCH_SIZE = 10;  // Process 10 channels at a time as requested
         
-        for (int z = z_start; z <= z_end; ++z) {
-            int profile_index = z - z_start;
+        spdlog::debug("GetRegionSpectralData: Processing {} channels in batches of {}", profile_size, BATCH_SIZE);
+        
+        for (int batch_start = z_start; batch_start <= z_end; batch_start += BATCH_SIZE) {
+            int batch_end = std::min(batch_start + BATCH_SIZE - 1, z_end);
+            int batch_size = batch_end - batch_start + 1;
             
-            // Read single channel from TensorStore
+            spdlog::debug("Processing batch: channels {} to {} ({} channels)", 
+                         batch_start, batch_end, batch_size);
+            
+            // Read multiple channels from TensorStore in one operation
             casacore::IPosition start, length;
             if (shape.size() == 5) {
-                // 5D ZARR: [time, freq, stokes, x, y] 
-                start = casacore::IPosition(5, 0, z, stokes, x_min, y_min);
-                length = casacore::IPosition(5, 1, 1, 1, region_width, region_height);
+                // 5D ZARR: [time, freq, stokes, x, y] - read batch_size freq channels
+                start = casacore::IPosition(5, 0, batch_start, stokes, x_min, y_min);
+                length = casacore::IPosition(5, 1, batch_size, 1, region_width, region_height);
+                spdlog::info("5D ZARR BATCH: start=[0,{},{},{},{}], length=[1,{},1,{},{}] - {} channels",
+                           batch_start, stokes, x_min, y_min, batch_size, region_width, region_height, batch_size);
             } else if (shape.size() == 4) {
-                // 4D: Use CARTA standard order [x, y, freq, stokes]
-                start = casacore::IPosition(4, x_min, y_min, z, stokes);
-                length = casacore::IPosition(4, region_width, region_height, 1, 1);
+                // 4D: Use CARTA standard order [x, y, freq, stokes] - read batch_size freq channels
+                start = casacore::IPosition(4, x_min, y_min, batch_start, stokes);
+                length = casacore::IPosition(4, region_width, region_height, batch_size, 1);
+                spdlog::info("4D BATCH: start=[{},{},{},{}], length=[{},{},{},1] - {} channels",
+                           x_min, y_min, batch_start, stokes, region_width, region_height, batch_size, batch_size);
             } else if (shape.size() == 3) {
-                // 3D: Use CARTA standard order [x, y, freq]
-                start = casacore::IPosition(3, x_min, y_min, z);
-                length = casacore::IPosition(3, region_width, region_height, 1);
+                // 3D: Use CARTA standard order [x, y, freq] - read batch_size freq channels
+                start = casacore::IPosition(3, x_min, y_min, batch_start);
+                length = casacore::IPosition(3, region_width, region_height, batch_size);
+                spdlog::info("3D BATCH: start=[{},{},{}], length=[{},{},{}] - {} channels",
+                           x_min, y_min, batch_start, region_width, region_height, batch_size, batch_size);
             } else if (shape.size() == 2) {
                 // 2D: Use CARTA standard order [x, y] (only one channel)
                 start = casacore::IPosition(2, x_min, y_min);
                 length = casacore::IPosition(2, region_width, region_height);
+                spdlog::info("2D: start=[{},{}], length=[{},{}] - 1 channel",
+                           x_min, y_min, region_width, region_height);
             } else {
                 spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
                 progress = 1.0;
                 return false;
             }
             
-            casacore::Array<float> channel_array;
-            casacore::Slicer channel_slicer(start, length);
+            casacore::Array<float> batch_array;
+            casacore::Slicer batch_slicer(start, length);
             
-            if (!zarr_image->readDirectFromTensorStore(channel_array, channel_slicer)) {
-                spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to read channel {} from TensorStore", z);
+            if (!zarr_image->readPixelFromTensorStore(batch_array, batch_slicer)) {
+                spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to read batch channels {} to {} from TensorStore", 
+                             batch_start, batch_end);
                 progress = 1.0;
                 return false;
             }
             
-            // Process this single channel
-            const float* data_ptr = channel_array.data();
-            casacore::IPosition array_shape = channel_array.shape();
+            // Process each channel in the batch
+            const float* data_ptr = batch_array.data();
+            casacore::IPosition array_shape = batch_array.shape();
             
-            // Calculate mean for this channel
-            double sum = 0.0;
-            int valid_count = 0;
-            
-            for (int y = 0; y < region_height; ++y) {
-                for (int x = 0; x < region_width; ++x) {
-                    int mask_x = x;
-                    int mask_y = y;
-                    
-                    if (mask_x < mask_shape[0] && mask_y < mask_shape[1] && 
-                        mask(casacore::IPosition(2, mask_x, mask_y))) {
-                        
-                        // Calculate linear index in single channel array
-                        size_t linear_index;
-                        if (array_shape.size() == 5) {
-                            // [time=1, freq=1, stokes=1, y=region_height, x=region_width]
-                            linear_index = y * region_width + x;
-                        } else if (array_shape.size() == 4) {
-                            // [x=region_width, y=region_height, freq=1, stokes=1]
-                            linear_index = x + y * region_width;
-                        } else if (array_shape.size() == 3) {
-                            // [x=region_width, y=region_height, freq=1]
-                            linear_index = x + y * region_width;
-                        } else {
-                            // 2D: [x=region_width, y=region_height]
-                            linear_index = x + y * region_width;
-                        }
-                        
-                        if (linear_index < channel_array.size()) {
-                            float value = data_ptr[linear_index];
-                            if (std::isfinite(value)) {
-                                sum += value;
-                                valid_count++;
+            for (int z_offset = 0; z_offset < batch_size; ++z_offset) {
+                int z = batch_start + z_offset;
+                int profile_index = z - z_start;
+                // Calculate mean for this channel
+                double sum = 0.0;
+                int valid_count = 0;
+                for (int y = 0; y < region_height; ++y) {
+                    for (int x = 0; x < region_width; ++x) {
+                        // mask index: region pixel (x, y) 對應 mask 內 (x + x_min - origin[0], y + y_min - origin[1])
+                        int mask_x = x + x_min - origin[0];
+                        int mask_y = y + y_min - origin[1];
+                        if (mask_x >= 0 && mask_x < mask_shape[0] && mask_y >= 0 && mask_y < mask_shape[1] && 
+                            mask(casacore::IPosition(2, mask_x, mask_y))) {
+                            // 計算正確的 linear_index，考慮 batch 內 channel 的 offset
+                            size_t linear_index = 0;
+                            if (array_shape.size() == 5) {
+                                // [1, batch_size, 1, region_width, region_height]
+                                // layout: [time, freq, stokes, x, y]
+                                // freq (z_offset) 變化最快
+                                linear_index = z_offset * region_width * region_height + x * region_height + y;
+                            } else if (array_shape.size() == 4) {
+                                // [region_width, region_height, batch_size, 1]
+                                // layout: [x, y, freq, stokes]
+                                linear_index = x + y * region_width + z_offset * region_width * region_height;
+                            } else if (array_shape.size() == 3) {
+                                // [region_width, region_height, batch_size]
+                                // layout: [x, y, freq]
+                                linear_index = x + y * region_width + z_offset * region_width * region_height;
+                            } else {
+                                // 2D case - no batching
+                                linear_index = y * region_width + x;
+                            }
+                            if (linear_index < batch_array.nelements()) {
+                                float value = data_ptr[linear_index];
+                                if (std::isfinite(value)) {
+                                    sum += value;
+                                    valid_count++;
+                                }
                             }
                         }
                     }
                 }
+                // Calculate mean for this channel
+                if (valid_count > 0) {
+                    profile_data[profile_index] = sum / static_cast<double>(valid_count);
+                } else {
+                    profile_data[profile_index] = std::numeric_limits<double>::quiet_NaN();
+                }
+                if (z <= batch_end) {
+                    spdlog::debug("Batch channel {} - region {}x{}, valid {} pixels, sum = {}, mean = {}", 
+                                 z, region_width, region_height, valid_count, sum, profile_data[profile_index]);
+                }
             }
             
-            if (valid_count > 0) {
-                profile_data[profile_index] = sum / valid_count;
-            } else {
-                profile_data[profile_index] = std::numeric_limits<double>::quiet_NaN();
+            // Handle 2D case where we only process one channel
+            if (shape.size() == 2) {
+                break;
             }
-            
-            // Only log for debugging first few and last few channels
-            if (profile_index < 5 || profile_index >= profile_size - 5 || profile_index % 20 == 0) {
-                spdlog::info("Channel {} - region {}x{}, valid {} pixels, sum = {}, mean = {}", 
-                            z, region_width, region_height, valid_count, sum, profile_data[profile_index]);
-            }
-            
-            // Update progress
-            progress = static_cast<float>(profile_index + 1) / static_cast<float>(profile_size);
         }
         
         // All channels processed
         results[CARTA::StatsType::Mean] = profile_data;
         progress = 1.0;
         
-        // spdlog::info("GetRegionSpectralData: Successfully processed {} channels individually for region {}x{}", 
-        //              profile_size, region_width, region_height);
+        spdlog::debug("GetRegionSpectralData: Successfully processed {} channels in batches for region {}x{}", 
+                     profile_size, region_width, region_height);
         
         return true;
         
