@@ -121,6 +121,9 @@ private:
     casacore::MFrequency::Types ParseFrequencyFrame(const std::string& frame_str);
     casacore::MFrequency::Types ParseFrequencyFrameCode(int frame_code);
     
+    // Get direction reference system from ZARR metadata (handles ICRS, FK5, FK4)
+    casacore::MDirection::Types GetDirectionType();
+    
     // Channel cache methods - now support region-based caching
     bool loadChannelCache(int freq_channel = 0, int stokes_channel = 0);
     bool loadRegionCache(int freq_channel, int stokes_channel, int start_x, int start_y, int width, int height);

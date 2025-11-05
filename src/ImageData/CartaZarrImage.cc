@@ -653,8 +653,11 @@ bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double de
         DirectionCoordinate dir_coord;
         SpectralCoordinate spec_coord;
         try {
+            // Get direction type from metadata (reads "frame" from direction.reference.attrs)
+            casacore::MDirection::Types direction_type = GetDirectionType();
+            
             // Use CAR projection for radio astronomy data
-            dir_coord = DirectionCoordinate(MDirection::J2000, 
+            dir_coord = DirectionCoordinate(direction_type, 
                                           Projection::CAR,
                                           ref_val(0), ref_val(1),
                                           inc(0), inc(1),
@@ -688,20 +691,78 @@ bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double de
         // Create SpectralCoordinate
 
         try {
-            // Use calculated frequency values from coordinate arrays
-            double rest_freq = 1420405751.786; // in Hz (HI line, could be updated from metadata)
-            double spectral_crval = freq_hz; // Reference frequency in Hz from coordinate arrays
-            double spectral_cdelt = freq_cdelt_hz; // Channel width from coordinate arrays
-            double spectral_crpix = (depth - 1) / 2.0 + 1; // 1-based pixel
+            // Read rest frequency and reference frequency from metadata
+            double rest_freq = 0.0; // Default 0 means no rest frequency
+            double reference_freq = freq_hz; // Default to first frequency from array
+            
+            // Try to read rest_frequency and reference_frequency from frequency/.zattrs
+            try {
+                std::filesystem::path zarr_base(_name.c_str());
+                std::filesystem::path freq_zattrs_path = zarr_base / "frequency" / ".zattrs";
+                if (std::filesystem::exists(freq_zattrs_path)) {
+                    std::ifstream freq_zattrs_file(freq_zattrs_path);
+                    nlohmann::json freq_zattrs_json;
+                    freq_zattrs_file >> freq_zattrs_json;
+                    
+                    // Check for rest_frequency field
+                    if (freq_zattrs_json.contains("rest_frequency")) {
+                        if (freq_zattrs_json["rest_frequency"].contains("data")) {
+                            rest_freq = freq_zattrs_json["rest_frequency"]["data"].get<double>();
+                            spdlog::info("ZARR COORDS: Found rest_frequency in metadata: {:.3f} Hz ({:.3f} MHz)", 
+                                        rest_freq, rest_freq / 1e6);
+                        } else if (freq_zattrs_json["rest_frequency"].is_number()) {
+                            rest_freq = freq_zattrs_json["rest_frequency"].get<double>();
+                            spdlog::info("ZARR COORDS: Found rest_frequency in metadata: {:.3f} Hz ({:.3f} MHz)", 
+                                        rest_freq, rest_freq / 1e6);
+                        }
+                    }
+                    
+                    // Check for reference_frequency field (CRVAL3)
+                    if (freq_zattrs_json.contains("reference_frequency")) {
+                        if (freq_zattrs_json["reference_frequency"].contains("data")) {
+                            reference_freq = freq_zattrs_json["reference_frequency"]["data"].get<double>();
+                            spdlog::info("ZARR COORDS: Found reference_frequency (CRVAL3) in metadata: {:.3f} Hz ({:.3f} MHz)", 
+                                        reference_freq, reference_freq / 1e6);
+                        } else if (freq_zattrs_json["reference_frequency"].is_number()) {
+                            reference_freq = freq_zattrs_json["reference_frequency"].get<double>();
+                            spdlog::info("ZARR COORDS: Found reference_frequency (CRVAL3) in metadata: {:.3f} Hz ({:.3f} MHz)", 
+                                        reference_freq, reference_freq / 1e6);
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                spdlog::debug("ZARR COORDS: Could not read frequency metadata: {}", e.what());
+            }
+            
+            // If rest frequency not found or is 0, use default HI line frequency
+            if (rest_freq == 0.0) {
+                rest_freq = 1420405751.786; // HI line frequency in Hz
+                spdlog::debug("ZARR COORDS: Using default HI line rest frequency: {:.3f} Hz ({:.3f} MHz)", 
+                            rest_freq, rest_freq / 1e6);
+            }
+            
+            // CRVAL3: Use reference_frequency from metadata
+            // This is the frequency at the reference pixel (CRPIX3)
+            double spectral_crval = reference_freq;
+            
+            // CDELT3: Channel width from coordinate arrays
+            double spectral_cdelt = freq_cdelt_hz;
+            
+            // CRPIX3: Reference pixel for casacore SpectralCoordinate is 0-based
+            // The reference_frequency in metadata corresponds to the first frequency channel (pixel 0 in 0-based indexing)
+            // This will be converted to FITS CRPIX3 = 1 when exported to FITS header
+            double spectral_crpix = 0.0;
+            
             // Get frequency reference frame from metadata instead of hardcoding TOPO
             casacore::MFrequency::Types frequency_type = GetFrequencyType();
 
             spec_coord = SpectralCoordinate(frequency_type, spectral_crval, spectral_cdelt, spectral_crpix, rest_freq);
 
-            spdlog::info("ZARR WCS: SpectralCoordinate created with calculated values:");
-            spdlog::info("  Reference frequency: {:.3f} MHz", spectral_crval / 1e6);
-            spdlog::info("  Channel width: {:.3f} MHz", spectral_cdelt / 1e6);
-            spdlog::info("  Reference pixel: {:.1f}", spectral_crpix);
+            spdlog::info("ZARR WCS: SpectralCoordinate created with FITS-like parameters:");
+            spdlog::info("  CRVAL3 (Reference frequency): {:.6e} Hz ({:.3f} MHz)", spectral_crval, spectral_crval / 1e6);
+            spdlog::info("  CDELT3 (Channel width): {:.6e} Hz ({:.3f} MHz)", spectral_cdelt, spectral_cdelt / 1e6);
+            spdlog::info("  CRPIX3 (Reference pixel, 0-based internal): {:.1f} (FITS will show as 1)", spectral_crpix);
+            spdlog::info("  Rest frequency: {:.3f} MHz", rest_freq / 1e6);
             spdlog::info("  Frequency reference frame: {}", casacore::MFrequency::showType(frequency_type));
             
         } catch (const std::exception& coord_e) {
@@ -828,8 +889,11 @@ bool CartaZarrImage::parseWCSFromMetadata(const nlohmann::json& zattrs) {
                         // spdlog::debug("  Image shape: ({}, {})", _shape(0), _shape(1));
                         
                         try {
+                            // Get direction type from metadata (reads "frame" from direction.reference.attrs)
+                            casacore::MDirection::Types direction_type = GetDirectionType();
+                            
                             // Try CAR projection first (common for radio astronomy)
-                            dir_coord = DirectionCoordinate(MDirection::J2000, 
+                            dir_coord = DirectionCoordinate(direction_type, 
                                                           Projection::CAR,
                                                           ref_val(0), ref_val(1),
                                                           inc(0), inc(1),
@@ -3066,14 +3130,17 @@ casacore::MFrequency::Types CartaZarrImage::GetFrequencyType() {
             spdlog::debug("ZARR FREQ: Found frequency/.zattrs, checking for observer field");
             
             // Look for reference_value.attrs.observer (the correct location)
-            if (freq_zattrs_json.contains("reference_value") && 
-                freq_zattrs_json["reference_value"].contains("attrs") &&
-                freq_zattrs_json["reference_value"]["attrs"].contains("observer")) {
-                
-                std::string observer = freq_zattrs_json["reference_value"]["attrs"]["observer"].get<std::string>();
-                spdlog::info("ZARR FREQ: Found observer in frequency/.zattrs: '{}'", observer);
-                freq_type = ParseFrequencyFrame(observer);
-                return freq_type;
+            const std::vector<std::string> possible_keys = {"reference_value", "reference_frequency"};
+            for(const auto& key : possible_keys) {
+                if (freq_zattrs_json.contains(key) && 
+                    freq_zattrs_json[key].contains("attrs") &&
+                    freq_zattrs_json[key]["attrs"].contains("observer")) {
+                    
+                    std::string observer = freq_zattrs_json[key]["attrs"]["observer"].get<std::string>();
+                    spdlog::info("ZARR FREQ: Found observer in frequency/.zattrs under '{}': '{}'", key, observer);
+                    freq_type = ParseFrequencyFrame(observer);
+                    return freq_type;
+                }
             }
             
             // Also check for direct observer field (alternative location)
@@ -3166,6 +3233,57 @@ casacore::MFrequency::Types CartaZarrImage::ParseFrequencyFrameCode(int frame_co
     
     spdlog::warn("ZARR FREQ: Unknown frequency reference frame code {}, using default TOPO", frame_code);
     return casacore::MFrequency::TOPO;
+}
+
+casacore::MDirection::Types CartaZarrImage::GetDirectionType() {
+    // Get direction reference system from ZARR metadata
+    // Reads "frame" field from direction.reference.attrs (e.g., "icrs", "fk5", "fk4")
+    casacore::MDirection::Types dir_type(casacore::MDirection::J2000); // Default to J2000
+    
+    try {
+        std::filesystem::path zarr_path(_name.c_str());
+        std::filesystem::path zattrs_path = zarr_path / ".zattrs";
+        
+        if (std::filesystem::exists(zattrs_path)) {
+            std::ifstream zattrs_file(zattrs_path);
+            nlohmann::json zattrs_json;
+            zattrs_file >> zattrs_json;
+            
+            // Look for frame in direction.reference.attrs
+            if (zattrs_json.contains("direction") && 
+                zattrs_json["direction"].contains("reference") &&
+                zattrs_json["direction"]["reference"].contains("attrs") &&
+                zattrs_json["direction"]["reference"]["attrs"].contains("frame")) {
+                
+                std::string frame = zattrs_json["direction"]["reference"]["attrs"]["frame"].get<std::string>();
+                
+                // Convert to uppercase for case-insensitive comparison
+                std::transform(frame.begin(), frame.end(), frame.begin(), ::toupper);
+                
+                if (frame == "ICRS") {
+                    dir_type = casacore::MDirection::ICRS;
+                    spdlog::info("ZARR WCS: Using ICRS direction reference system");
+                } else if (frame == "FK5" || frame == "J2000") {
+                    dir_type = casacore::MDirection::J2000;
+                    spdlog::info("ZARR WCS: Using FK5/J2000 direction reference system");
+                } else if (frame == "FK4" || frame == "B1950") {
+                    dir_type = casacore::MDirection::B1950;
+                    spdlog::info("ZARR WCS: Using FK4/B1950 direction reference system");
+                } else if (frame == "GALACTIC") {
+                    dir_type = casacore::MDirection::GALACTIC;
+                    spdlog::info("ZARR WCS: Using GALACTIC direction reference system");
+                } else {
+                    spdlog::warn("ZARR WCS: Unknown frame '{}', using default J2000", frame);
+                }
+            } else {
+                spdlog::debug("ZARR WCS: No direction frame found in metadata, using default J2000");
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("ZARR WCS: Exception reading direction reference system: {}, using default J2000", e.what());
+    }
+    
+    return dir_type;
 }
 
 void CartaZarrImage::setupImageInfo() {
