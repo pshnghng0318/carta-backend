@@ -262,7 +262,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         std::vector<double> profile_data(profile_size, 0.0);
         
         // BATCHED TENSOR STORE STRATEGY: Process multiple channels at once for efficiency
-        const int BATCH_SIZE = 10;  // Process 10 channels at a time as requested
+        // Limited to 8 channels to prevent memory overflow (10000x10000 float32 = 400MB per channel, 8 channels = 3.2GB)
+        const int BATCH_SIZE = 8;  // Process 8 channels at a time (safe for large datacubes)
         
         spdlog::debug("GetRegionSpectralData: Processing {} channels in batches of {}", profile_size, BATCH_SIZE);
         
@@ -270,8 +271,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             int batch_end = std::min(batch_start + BATCH_SIZE - 1, z_end);
             int batch_size = batch_end - batch_start + 1;
             
-            spdlog::debug("Processing batch: channels {} to {} ({} channels)", 
-                         batch_start, batch_end, batch_size);
+            // spdlog::debug("Processing batch: channels {} to {} ({} channels)", 
+            //              batch_start, batch_end, batch_size);
             
             // Read multiple channels from TensorStore in one operation
             casacore::IPosition start, length;
@@ -279,26 +280,26 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 // 5D ZARR: [time, freq, stokes, x, y] - read batch_size freq channels
                 start = casacore::IPosition(5, 0, batch_start, stokes, x_min, y_min);
                 length = casacore::IPosition(5, 1, batch_size, 1, region_width, region_height);
-                spdlog::info("5D ZARR BATCH: start=[0,{},{},{},{}], length=[1,{},1,{},{}] - {} channels",
-                           batch_start, stokes, x_min, y_min, batch_size, region_width, region_height, batch_size);
+                // spdlog::info("5D ZARR BATCH: start=[0,{},{},{},{}], length=[1,{},1,{},{}] - {} channels",
+                //            batch_start, stokes, x_min, y_min, batch_size, region_width, region_height, batch_size);
             } else if (shape.size() == 4) {
                 // 4D: Use CARTA standard order [x, y, freq, stokes] - read batch_size freq channels
                 start = casacore::IPosition(4, x_min, y_min, batch_start, stokes);
                 length = casacore::IPosition(4, region_width, region_height, batch_size, 1);
-                spdlog::info("4D BATCH: start=[{},{},{},{}], length=[{},{},{},1] - {} channels",
-                           x_min, y_min, batch_start, stokes, region_width, region_height, batch_size, batch_size);
+                // spdlog::info("4D BATCH: start=[{},{},{},{}], length=[{},{},{},1] - {} channels",
+                //            x_min, y_min, batch_start, stokes, region_width, region_height, batch_size, batch_size);
             } else if (shape.size() == 3) {
                 // 3D: Use CARTA standard order [x, y, freq] - read batch_size freq channels
                 start = casacore::IPosition(3, x_min, y_min, batch_start);
                 length = casacore::IPosition(3, region_width, region_height, batch_size);
-                spdlog::info("3D BATCH: start=[{},{},{}], length=[{},{},{}] - {} channels",
-                           x_min, y_min, batch_start, region_width, region_height, batch_size, batch_size);
+                // spdlog::info("3D BATCH: start=[{},{},{}], length=[{},{},{}] - {} channels",
+                //            x_min, y_min, batch_start, region_width, region_height, batch_size, batch_size);
             } else if (shape.size() == 2) {
                 // 2D: Use CARTA standard order [x, y] (only one channel)
                 start = casacore::IPosition(2, x_min, y_min);
                 length = casacore::IPosition(2, region_width, region_height);
-                spdlog::info("2D: start=[{},{}], length=[{},{}] - 1 channel",
-                           x_min, y_min, region_width, region_height);
+                // spdlog::info("2D: start=[{},{}], length=[{},{}] - 1 channel",
+                //            x_min, y_min, region_width, region_height);
             } else {
                 spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
                 progress = 1.0;
@@ -367,10 +368,10 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 } else {
                     profile_data[profile_index] = std::numeric_limits<double>::quiet_NaN();
                 }
-                if (z <= batch_end) {
-                    spdlog::debug("Batch channel {} - region {}x{}, valid {} pixels, sum = {}, mean = {}", 
-                                 z, region_width, region_height, valid_count, sum, profile_data[profile_index]);
-                }
+                // if (z <= batch_end) {
+                //     spdlog::debug("Batch channel {} - region {}x{}, valid {} pixels, sum = {}, mean = {}", 
+                //                  z, region_width, region_height, valid_count, sum, profile_data[profile_index]);
+                // }
             }
             
             // Handle 2D case where we only process one channel

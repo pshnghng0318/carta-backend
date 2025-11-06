@@ -44,7 +44,9 @@ using namespace casacore;
 namespace carta {
 
 CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<float>(), _name(filename) {
-    // Initialize TensorStore context
+    // Initialize TensorStore context with memory limit
+    // Note: Full context initialization happens in initializeTensorStore()
+    // This is just a placeholder that will be replaced
     _context = tensorstore::Context::Default();
     
     // Check if this is a repeated initialization for the same file
@@ -1118,6 +1120,24 @@ void CartaZarrImage::createMinimalCoordinateSystem() {
 
 void CartaZarrImage::initializeTensorStore() {
     try {
+        // Create TensorStore context with memory limit
+        // For 10000x10000 float32: ~400MB per channel, limit to 8 channels = 3.2GB
+        nlohmann::json context_spec = {
+            {"cache_pool", {
+                {"total_bytes_limit", 3ULL << 30}  // 3GB cache limit (allows ~8 channels of 10000x10000 float32)
+            }}
+        };
+        
+        auto context_result = tensorstore::Context::FromJson(context_spec);
+        if (context_result.ok()) {
+            _context = context_result.value();
+            spdlog::info("TensorStore context initialized with 3GB cache limit (~8 channels for large datacubes)");
+        } else {
+            spdlog::warn("Failed to create TensorStore context with cache limit: {}, using default", 
+                        context_result.status().ToString());
+            _context = tensorstore::Context::Default();
+        }
+        
         // Create TensorStore spec for Zarr using the correct format
         // Handle hierarchical zarr files (check for subdirectories with .zarray)
         std::string zarr_path = _name;
@@ -1345,19 +1365,19 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         // CRITICAL FIX: The coordinates are being reordered somewhere before doGetSlice
         // Based on the error pattern, we need to detect and correct this reordering
         
-        // Add diagnostic to understand coordinate format - reduce logging frequency
-        static int debug_call_count = 0;
-        static std::unordered_set<std::string> logged_patterns;
+        // // Add diagnostic to understand coordinate format - reduce logging frequency
+        // static int debug_call_count = 0;
+        // static std::unordered_set<std::string> logged_patterns;
         
-        std::string pattern = fmt::format("{}_{}", start.toString(), length.toString());
-        bool should_log = (debug_call_count < 10) || (logged_patterns.find(pattern) == logged_patterns.end());
+        // std::string pattern = fmt::format("{}_{}", start.toString(), length.toString());
+        // bool should_log = (debug_call_count < 10) || (logged_patterns.find(pattern) == logged_patterns.end());
         
-        if (should_log) {
-            spdlog::warn("doGetSlice: COORDINATE DEBUG #{} - start={}, length={}", debug_call_count, start.toString(), length.toString());
-            spdlog::warn("doGetSlice: CARTA shape={}, ZARR shape={}", _shape.toString(), _original_zarr_shape.toString());
-            logged_patterns.insert(pattern);
-        }
-        debug_call_count++;
+        // if (should_log) {
+        //     spdlog::warn("doGetSlice: COORDINATE DEBUG #{} - start={}, length={}", debug_call_count, start.toString(), length.toString());
+        //     spdlog::warn("doGetSlice: CARTA shape={}, ZARR shape={}", _shape.toString(), _original_zarr_shape.toString());
+        //     logged_patterns.insert(pattern);
+        // }
+        // debug_call_count++;
         
         int freq_index, stokes_index;
         
@@ -1521,8 +1541,14 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                     // Check for multi-channel/multi-stokes requests
                     if (length[2] > 1 || length[3] > 1) {
                         is_4d_request = true;
-                        num_freq = length[2];
+                        // Limit to max 8 channels per batch to prevent memory overflow
+                        // For 10000x10000 float32: 8 channels = 3.2GB
+                        num_freq = std::min(static_cast<int>(length[2]), 8);
                         num_stokes = length[3];
+                        
+                        if (length[2] > 8) {
+                            spdlog::warn("Request for {} channels exceeds limit, capping at 8 channels per batch", length[2]);
+                        }
                     }
                     
                     // DISABLED: For region spectral, use single-channel strategy to avoid cache conflicts
@@ -2963,10 +2989,10 @@ Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer
                 box_origin[i] = start[i];
                 box_shape[i] = length[i];
             }
-            spdlog::debug("5D coordinate mapping: Direct ZARR order [time={}, freq={}, stokes={}, x={}, y={}]", 
-                         box_origin[0], box_origin[1], box_origin[2], box_origin[3], box_origin[4]);
+            // spdlog::debug("5D coordinate mapping: Direct ZARR order [time={}, freq={}, stokes={}, x={}, y={}]", 
+            //              box_origin[0], box_origin[1], box_origin[2], box_origin[3], box_origin[4]);
         } else if (start.size() == 4) {
-            spdlog::debug("start={}, length={}", start.toString(), length.toString());
+            // spdlog::debug("start={}, length={}", start.toString(), length.toString());
             // 4D case: CARTA internal format [x, y, freq, stokes]
             // Map CARTA [x,y,freq,stokes] -> ZARR [time=0, freq, stokes, x, y]
             box_origin.resize(5);
@@ -2982,9 +3008,9 @@ Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer
             box_shape[3] = length[0];          // x length
             box_shape[4] = length[1];          // y length
             
-            spdlog::debug("4D coordinate mapping: CARTA[x={},y={},freq={},stokes={}] -> ZARR[time={},freq={},stokes={},x={},y={}]", 
-                         start[0], start[1], start[2], start[3],
-                         box_origin[0], box_origin[1], box_origin[2], box_origin[3], box_origin[4]);
+            // spdlog::debug("4D coordinate mapping: CARTA[x={},y={},freq={},stokes={}] -> ZARR[time={},freq={},stokes={},x={},y={}]", 
+            //              start[0], start[1], start[2], start[3],
+            //              box_origin[0], box_origin[1], box_origin[2], box_origin[3], box_origin[4]);
         } else if (start.size() == 3) {
             // 3D case: incoming CARTA [x,y,freq] to match ZarrLoader pattern
             // Map CARTA [x,y,freq] -> ZARR [time=0, freq, stokes=0, x, y]
@@ -3019,7 +3045,7 @@ Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer
             spdlog::error("readPixelFromTensorStore: Unsupported section dimensions: {}", start.size());
             return false;
         }
-        spdlog::debug("dim = {}", start.size());
+        // spdlog::debug("dim = {}", start.size());
         
         // Validate coordinates against ZARR bounds
         for (size_t i = 0; i < box_origin.size(); ++i) {
