@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/driver/zarr/libzlib_compressor.lo
+bazel-out/darwin_arm64-opt/bin/tensorstore/driver/zarr/_objs/zlib_compressor/zlib_compressor.o

@@ -1,0 +1,11 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/strings/libcord_internal.a
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/strings/_objs/cord_internal/cord_internal.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/strings/_objs/cord_internal/cord_rep_btree.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/strings/_objs/cord_internal/cord_rep_btree_navigator.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/strings/_objs/cord_internal/cord_rep_btree_reader.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/strings/_objs/cord_internal/cord_rep_consume.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/strings/_objs/cord_internal/cord_rep_crc.o

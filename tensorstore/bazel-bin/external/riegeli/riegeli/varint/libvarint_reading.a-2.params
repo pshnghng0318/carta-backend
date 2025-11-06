@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/varint/libvarint_reading.a
+bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/varint/_objs/varint_reading/varint_reading.o

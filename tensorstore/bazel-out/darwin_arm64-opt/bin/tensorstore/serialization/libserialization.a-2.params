@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/serialization/libserialization.a
+bazel-out/darwin_arm64-opt/bin/tensorstore/serialization/_objs/serialization/serialization.o

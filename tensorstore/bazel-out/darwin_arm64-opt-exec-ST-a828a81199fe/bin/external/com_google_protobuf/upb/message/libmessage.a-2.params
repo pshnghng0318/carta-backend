@@ -1,0 +1,11 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt-exec-ST-a828a81199fe/bin/external/com_google_protobuf/upb/message/libmessage.a
+bazel-out/darwin_arm64-opt-exec-ST-a828a81199fe/bin/external/com_google_protobuf/upb/message/_objs/message/accessors.o
+bazel-out/darwin_arm64-opt-exec-ST-a828a81199fe/bin/external/com_google_protobuf/upb/message/_objs/message/array.o
+bazel-out/darwin_arm64-opt-exec-ST-a828a81199fe/bin/external/com_google_protobuf/upb/message/_objs/message/compat.o
+bazel-out/darwin_arm64-opt-exec-ST-a828a81199fe/bin/external/com_google_protobuf/upb/message/_objs/message/map.o
+bazel-out/darwin_arm64-opt-exec-ST-a828a81199fe/bin/external/com_google_protobuf/upb/message/_objs/message/map_sorter.o
+bazel-out/darwin_arm64-opt-exec-ST-a828a81199fe/bin/external/com_google_protobuf/upb/message/_objs/message/message.o

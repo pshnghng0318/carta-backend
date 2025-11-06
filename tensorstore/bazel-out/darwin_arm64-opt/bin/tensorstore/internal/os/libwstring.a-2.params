@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/os/libwstring.a
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/os/_objs/wstring/wstring.o

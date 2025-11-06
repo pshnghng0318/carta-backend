@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/zlib/libzlib_reader.a
+bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/zlib/_objs/zlib_reader/zlib_reader.o

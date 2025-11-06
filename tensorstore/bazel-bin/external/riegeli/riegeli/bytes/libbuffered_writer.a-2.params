@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/bytes/libbuffered_writer.a
+bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/bytes/_objs/buffered_writer/buffered_writer.o

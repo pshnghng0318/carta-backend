@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/libnditerable_transformed_array.a
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/_objs/nditerable_transformed_array/nditerable_transformed_array.o

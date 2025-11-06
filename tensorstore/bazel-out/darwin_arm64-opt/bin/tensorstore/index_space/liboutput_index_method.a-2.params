@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/index_space/liboutput_index_method.a
+bazel-out/darwin_arm64-opt/bin/tensorstore/index_space/_objs/output_index_method/output_index_method.o

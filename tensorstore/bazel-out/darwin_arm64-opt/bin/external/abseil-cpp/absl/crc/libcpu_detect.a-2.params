@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/crc/libcpu_detect.a
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/crc/_objs/cpu_detect/cpu_detect.o

@@ -1,0 +1,12 @@
+,tensorstore,tensorstore
+abseil-cpp,tensorstore,tensorstore
+bazel_tools,__main__,tensorstore
+googletest,tensorstore,tensorstore
+local_config_apple_cc,tensorstore,tensorstore
+local_config_xcode,tensorstore,tensorstore
+net_sourceforge_half,tensorstore,tensorstore
+nlohmann_json,tensorstore,tensorstore
+platforms,tensorstore,tensorstore
+re2,tensorstore,tensorstore
+riegeli,tensorstore,tensorstore
+rules_cc,tensorstore,tensorstore

@@ -1,0 +1,2 @@
+_repo_mapping /private/var/tmp/_bazel_pshuang/27898a449dbbc68511c015c6e0d8588f/execroot/tensorstore/bazel-out/darwin_arm64-opt/bin/tensorstore/open_mode_test.repo_mapping
+tensorstore/tensorstore/open_mode_test /private/var/tmp/_bazel_pshuang/27898a449dbbc68511c015c6e0d8588f/execroot/tensorstore/bazel-out/darwin_arm64-opt/bin/tensorstore/open_mode_test

@@ -1,0 +1,8 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/os/libfile_util.a
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/os/_objs/file_util/file_util.o
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/os/_objs/file_util/file_info_posix.o
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/os/_objs/file_util/file_util_posix.o

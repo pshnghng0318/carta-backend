@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/driver/zarr/libspec.lo
+bazel-out/darwin_arm64-opt/bin/tensorstore/driver/zarr/_objs/spec/spec.o

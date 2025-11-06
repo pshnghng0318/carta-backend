@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/libgrid_chunk_key_ranges_base10.a
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/_objs/grid_chunk_key_ranges_base10/grid_chunk_key_ranges_base10.o

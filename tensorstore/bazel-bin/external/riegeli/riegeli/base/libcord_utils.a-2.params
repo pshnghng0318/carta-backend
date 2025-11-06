@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/base/libcord_utils.a
+bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/base/_objs/cord_utils/cord_utils.o

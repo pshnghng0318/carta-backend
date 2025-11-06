@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/libnditerable_elementwise_input_transform.a
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/_objs/nditerable_elementwise_input_transform/nditerable_elementwise_input_transform.o

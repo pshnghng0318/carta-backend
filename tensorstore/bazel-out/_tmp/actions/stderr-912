@@ -1,0 +1,12 @@
+In file included from tensorstore/driver/n5/driver.cc:40:
+In file included from ./tensorstore/driver/kvs_backed_chunk_driver.h:52:
+[1m./tensorstore/internal/cache/kvs_backed_cache.h:510:26: [0m[0;1;35mwarning: [0m[1m'RequireRepeatableRead' overrides a member function but is not marked 'override' [-Winconsistent-missing-override][0m
+  510 |     [0;34mvirtual[0m absl::Status RequireRepeatableRead([0m
+      | [0;1;32m                         ^
+[0m[1m./tensorstore/internal/cache/kvs_backed_chunk_cache.h:86:20: [0m[0;1;36mnote: [0min instantiation of member class 'tensorstore::internal::KvsBackedCache<tensorstore::internal::KvsBackedChunkCache, tensorstore::internal::ChunkCache>::TransactionNode' requested here[0m
+   86 |   TransactionNode* DoAllocateTransactionNode([0m
+      | [0;1;32m                   ^
+[0m[1m./tensorstore/internal/cache/chunk_cache.h:154:26: [0m[0;1;36mnote: [0moverridden virtual function is here[0m
+  154 |     [0;34mvirtual[0m absl::Status RequireRepeatableRead([0m
+      | [0;1;32m                         ^
+[0m1 warning generated.

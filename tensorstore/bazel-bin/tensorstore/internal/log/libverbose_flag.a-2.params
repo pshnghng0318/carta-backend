@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/log/libverbose_flag.a
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/log/_objs/verbose_flag/verbose_flag.o

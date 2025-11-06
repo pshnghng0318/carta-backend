@@ -1,0 +1,6 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/cache/libcache.a
+bazel-out/darwin_arm64-opt/bin/tensorstore/internal/cache/_objs/cache/cache.o

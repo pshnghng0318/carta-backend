@@ -1,0 +1,17 @@
+-D
+-no_warning_for_no_symbols
+-static
+-o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/libsynchronization.a
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/barrier.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/blocking_counter.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/create_thread_identity.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/futex_waiter.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/per_thread_sem.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/pthread_waiter.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/sem_waiter.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/stdcpp_waiter.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/waiter_base.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/win32_waiter.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/mutex.o
+bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/synchronization/_objs/synchronization/notification.o
