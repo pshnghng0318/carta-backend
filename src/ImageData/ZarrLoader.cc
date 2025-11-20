@@ -13,6 +13,10 @@
 #include <memory>
 #include <iostream>
 #include <algorithm>
+#include <chrono>
+#include <thread>
+#include <future>
+#include <vector>
 
 using namespace carta;
 
@@ -261,118 +265,182 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
 
         std::vector<double> profile_data(profile_size, 0.0);
         
-        // BATCHED TENSOR STORE STRATEGY: Process multiple channels at once for efficiency
-        // Limited to 8 channels to prevent memory overflow (10000x10000 float32 = 400MB per channel, 8 channels = 3.2GB)
-        const int BATCH_SIZE = 8;  // Process 8 channels at a time (safe for large datacubes)
+        // PARALLEL BATCH READING STRATEGY: Use 4 threads, each reads 4 channels
+        // 4 threads × 4 channels = 16 channels per parallel batch
+        const int PARALLEL_THREADS = 4;  // Number of concurrent threads
+        const int CHANNELS_PER_THREAD = 4;  // Each thread reads 4 channels
+        const int BATCH_SIZE = PARALLEL_THREADS * CHANNELS_PER_THREAD;  // 16 channels total
         
-        spdlog::debug("GetRegionSpectralData: Processing {} channels in batches of {}", profile_size, BATCH_SIZE);
+        spdlog::info("GetRegionSpectralData: Processing {} channels ({}x{} parallel batches)", 
+                    profile_size, PARALLEL_THREADS, CHANNELS_PER_THREAD);
+        auto start_time = std::chrono::high_resolution_clock::now();
         
-        for (int batch_start = z_start; batch_start <= z_end; batch_start += BATCH_SIZE) {
-            int batch_end = std::min(batch_start + BATCH_SIZE - 1, z_end);
-            int batch_size = batch_end - batch_start + 1;
+        // Lambda function to read multiple channels AND calculate statistics for one thread
+        auto read_and_compute_batch = [&](int start_z, int end_z) -> std::pair<bool, std::vector<double>> {
+            auto thread_id = std::hash<std::thread::id>{}(std::this_thread::get_id()) % 10000;
+            auto thread_start_time = std::chrono::high_resolution_clock::now();
             
-            // spdlog::debug("Processing batch: channels {} to {} ({} channels)", 
-            //              batch_start, batch_end, batch_size);
+            int num_channels = end_z - start_z + 1;
             
-            // Read multiple channels from TensorStore in one operation
+            // Step 1: Read data from TensorStore
+            auto read_start = std::chrono::high_resolution_clock::now();
             casacore::IPosition start, length;
             if (shape.size() == 5) {
-                // 5D ZARR: [time, freq, stokes, x, y] - read batch_size freq channels
-                start = casacore::IPosition(5, 0, batch_start, stokes, x_min, y_min);
-                length = casacore::IPosition(5, 1, batch_size, 1, region_width, region_height);
-                // spdlog::info("5D ZARR BATCH: start=[0,{},{},{},{}], length=[1,{},1,{},{}] - {} channels",
-                //            batch_start, stokes, x_min, y_min, batch_size, region_width, region_height, batch_size);
+                start = casacore::IPosition(5, 0, start_z, stokes, x_min, y_min);
+                length = casacore::IPosition(5, 1, num_channels, 1, region_width, region_height);
             } else if (shape.size() == 4) {
-                // 4D: Use CARTA standard order [x, y, freq, stokes] - read batch_size freq channels
-                start = casacore::IPosition(4, x_min, y_min, batch_start, stokes);
-                length = casacore::IPosition(4, region_width, region_height, batch_size, 1);
-                // spdlog::info("4D BATCH: start=[{},{},{},{}], length=[{},{},{},1] - {} channels",
-                //            x_min, y_min, batch_start, stokes, region_width, region_height, batch_size, batch_size);
+                start = casacore::IPosition(4, x_min, y_min, start_z, stokes);
+                length = casacore::IPosition(4, region_width, region_height, num_channels, 1);
             } else if (shape.size() == 3) {
-                // 3D: Use CARTA standard order [x, y, freq] - read batch_size freq channels
-                start = casacore::IPosition(3, x_min, y_min, batch_start);
-                length = casacore::IPosition(3, region_width, region_height, batch_size);
-                // spdlog::info("3D BATCH: start=[{},{},{}], length=[{},{},{}] - {} channels",
-                //            x_min, y_min, batch_start, region_width, region_height, batch_size, batch_size);
+                start = casacore::IPosition(3, x_min, y_min, start_z);
+                length = casacore::IPosition(3, region_width, region_height, num_channels);
             } else if (shape.size() == 2) {
-                // 2D: Use CARTA standard order [x, y] (only one channel)
                 start = casacore::IPosition(2, x_min, y_min);
                 length = casacore::IPosition(2, region_width, region_height);
-                // spdlog::info("2D: start=[{},{}], length=[{},{}] - 1 channel",
-                //            x_min, y_min, region_width, region_height);
             } else {
-                spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
-                progress = 1.0;
-                return false;
+                spdlog::error("Unsupported dimensions: {}", shape.size());
+                return {false, std::vector<double>()};
             }
             
             casacore::Array<float> batch_array;
-            casacore::Slicer batch_slicer(start, length);
+            casacore::Slicer slicer(start, length);
             
-            if (!zarr_image->readPixelFromTensorStore(batch_array, batch_slicer)) {
-                spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to read batch channels {} to {} from TensorStore", 
-                             batch_start, batch_end);
-                progress = 1.0;
-                return false;
+            bool success = zarr_image->readPixelFromTensorStore(batch_array, slicer);
+            if (!success) {
+                return {false, std::vector<double>()};
             }
             
-            // Process each channel in the batch
+            auto read_end = std::chrono::high_resolution_clock::now();
+            auto read_ms = std::chrono::duration_cast<std::chrono::milliseconds>(read_end - read_start).count();
+            
+            // Step 2: Calculate mean for each channel in this batch (PARALLELIZED!)
+            auto compute_start = std::chrono::high_resolution_clock::now();
             const float* data_ptr = batch_array.data();
             casacore::IPosition array_shape = batch_array.shape();
+            std::vector<double> channel_means(num_channels);
             
-            for (int z_offset = 0; z_offset < batch_size; ++z_offset) {
-                int z = batch_start + z_offset;
-                int profile_index = z - z_start;
-                // Calculate mean for this channel
+            // Pre-calculate mask access pattern to avoid repeated IPosition creation
+            casacore::IPosition mask_pos(2);
+            
+            for (int ch_offset = 0; ch_offset < num_channels; ++ch_offset) {
                 double sum = 0.0;
                 int valid_count = 0;
+                
+                // Optimize: iterate in memory order for better cache locality
                 for (int y = 0; y < region_height; ++y) {
+                    int mask_y = y + y_min - origin[1];
+                    bool y_in_mask = (mask_y >= 0 && mask_y < mask_shape[1]);
+                    
                     for (int x = 0; x < region_width; ++x) {
-                        // mask index: region pixel (x, y) 對應 mask 內 (x + x_min - origin[0], y + y_min - origin[1])
                         int mask_x = x + x_min - origin[0];
-                        int mask_y = y + y_min - origin[1];
-                        if (mask_x >= 0 && mask_x < mask_shape[0] && mask_y >= 0 && mask_y < mask_shape[1] && 
-                            mask(casacore::IPosition(2, mask_x, mask_y))) {
-                            // 計算正確的 linear_index，考慮 batch 內 channel 的 offset
-                            size_t linear_index = 0;
-                            if (array_shape.size() == 5) {
-                                // [1, batch_size, 1, region_width, region_height]
-                                // layout: [time, freq, stokes, x, y]
-                                // freq (z_offset) 變化最快
-                                linear_index = z_offset * region_width * region_height + x * region_height + y;
-                            } else if (array_shape.size() == 4) {
-                                // [region_width, region_height, batch_size, 1]
-                                // layout: [x, y, freq, stokes]
-                                linear_index = x + y * region_width + z_offset * region_width * region_height;
-                            } else if (array_shape.size() == 3) {
-                                // [region_width, region_height, batch_size]
-                                // layout: [x, y, freq]
-                                linear_index = x + y * region_width + z_offset * region_width * region_height;
-                            } else {
-                                // 2D case - no batching
-                                linear_index = y * region_width + x;
-                            }
-                            if (linear_index < batch_array.nelements()) {
-                                float value = data_ptr[linear_index];
-                                if (std::isfinite(value)) {
-                                    sum += value;
-                                    valid_count++;
-                                }
-                            }
+                        
+                        // Early exit if outside mask bounds
+                        if (!y_in_mask || mask_x < 0 || mask_x >= mask_shape[0]) {
+                            continue;
+                        }
+                        
+                        // Reuse IPosition object instead of creating new one each time
+                        mask_pos[0] = mask_x;
+                        mask_pos[1] = mask_y;
+                        if (!mask(mask_pos)) {
+                            continue;
+                        }
+                        
+                        // Calculate linear index (optimized for common case)
+                        size_t linear_index;
+                        if (array_shape.size() == 4 || array_shape.size() == 3) {
+                            // Most common case: [x, y, ch] or [x, y, ch, stokes]
+                            linear_index = x + y * region_width + ch_offset * region_width * region_height;
+                        } else if (array_shape.size() == 5) {
+                            linear_index = ch_offset * region_width * region_height + x * region_height + y;
+                        } else {
+                            linear_index = y * region_width + x;
+                        }
+                        
+                        // Bounds check only in debug mode (assume correct access in release)
+                        #ifdef DEBUG
+                        if (linear_index >= batch_array.nelements()) {
+                            continue;
+                        }
+                        #endif
+                        
+                        float value = data_ptr[linear_index];
+                        if (std::isfinite(value)) {
+                            sum += value;
+                            valid_count++;
                         }
                     }
                 }
-                // Calculate mean for this channel
+                
                 if (valid_count > 0) {
-                    profile_data[profile_index] = sum / static_cast<double>(valid_count);
+                    channel_means[ch_offset] = sum / static_cast<double>(valid_count);
                 } else {
-                    profile_data[profile_index] = std::numeric_limits<double>::quiet_NaN();
+                    channel_means[ch_offset] = std::numeric_limits<double>::quiet_NaN();
                 }
-                // if (z <= batch_end) {
-                //     spdlog::debug("Batch channel {} - region {}x{}, valid {} pixels, sum = {}, mean = {}", 
-                //                  z, region_width, region_height, valid_count, sum, profile_data[profile_index]);
-                // }
             }
+            
+            auto compute_end = std::chrono::high_resolution_clock::now();
+            auto compute_ms = std::chrono::duration_cast<std::chrono::milliseconds>(compute_end - compute_start).count();
+            auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(compute_end - thread_start_time).count();
+            
+            size_t batch_mb = (num_channels * region_width * region_height * sizeof(float)) / (1024*1024);
+            double read_speed_gbs = (batch_mb / 1024.0) / (read_ms / 1000.0);
+            
+            spdlog::info("Thread {} channels {}-{}: read {} ms ({:.2f} GB/s), compute {} ms, total {} ms", 
+                        thread_id, start_z, end_z, read_ms, read_speed_gbs, compute_ms, total_ms);
+            
+            return {success, std::move(channel_means)};
+        };
+        
+        // Process channels in groups of BATCH_SIZE (16 channels = 4 threads × 4 channels)
+        for (int batch_start = z_start; batch_start <= z_end; batch_start += BATCH_SIZE) {
+            int batch_end = std::min(batch_start + BATCH_SIZE - 1, z_end);
+            int actual_batch_size = batch_end - batch_start + 1;
+            
+            auto batch_start_time = std::chrono::high_resolution_clock::now();
+            spdlog::info("Processing parallel batch: channels {} to {} ({} channels, {} threads)", 
+                         batch_start, batch_end, actual_batch_size, PARALLEL_THREADS);
+            
+            // Launch parallel reads AND computation using std::async
+            std::vector<std::future<std::pair<bool, std::vector<double>>>> futures;
+            for (int thread_idx = 0; thread_idx < PARALLEL_THREADS; ++thread_idx) {
+                int thread_start_z = batch_start + thread_idx * CHANNELS_PER_THREAD;
+                int thread_end_z = std::min(thread_start_z + CHANNELS_PER_THREAD - 1, z_end);
+                
+                if (thread_start_z <= z_end) {
+                    futures.push_back(std::async(std::launch::async, read_and_compute_batch, thread_start_z, thread_end_z));
+                }
+            }
+            
+            // Wait for all threads to complete and collect results
+            for (int thread_idx = 0; thread_idx < futures.size(); ++thread_idx) {
+                int thread_start_z = batch_start + thread_idx * CHANNELS_PER_THREAD;
+                int thread_end_z = std::min(thread_start_z + CHANNELS_PER_THREAD - 1, z_end);
+                
+                auto result = futures[thread_idx].get();
+                
+                if (!result.first) {
+                    spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to process channels {}-{}", 
+                                 thread_start_z, thread_end_z);
+                    progress = 1.0;
+                    return false;
+                }
+                
+                // Copy computed means to profile_data
+                const std::vector<double>& channel_means = result.second;
+                for (int ch_offset = 0; ch_offset < channel_means.size(); ++ch_offset) {
+                    int z_index = thread_start_z + ch_offset;
+                    int profile_index = z_index - z_start;
+                    profile_data[profile_index] = channel_means[ch_offset];
+                }
+            }
+            
+            auto batch_end_time = std::chrono::high_resolution_clock::now();
+            auto batch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(batch_end_time - batch_start_time).count();
+            size_t total_mb = (actual_batch_size * region_width * region_height * sizeof(float)) / (1024*1024);
+            double total_speed_gbs = (total_mb / 1024.0) / (batch_ms / 1000.0);
+            spdlog::info("Parallel batch complete: {} ms for {} channels ({} MB total, {:.2f} GB/s aggregate)", 
+                        batch_ms, actual_batch_size, total_mb, total_speed_gbs);
             
             // Handle 2D case where we only process one channel
             if (shape.size() == 2) {
@@ -384,8 +452,10 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         results[CARTA::StatsType::Mean] = profile_data;
         progress = 1.0;
         
-        spdlog::debug("GetRegionSpectralData: Successfully processed {} channels in batches for region {}x{}", 
-                     profile_size, region_width, region_height);
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        spdlog::info("GetRegionSpectralData: Successfully processed {} channels in batches for region {}x{} - TOTAL TIME: {} ms ({:.2f} ms/channel)", 
+                     profile_size, region_width, region_height, total_ms, static_cast<double>(total_ms) / profile_size);
         
         return true;
         

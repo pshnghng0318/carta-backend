@@ -12,6 +12,7 @@
 
 #include <limits>
 #include <cmath>
+#include <thread>
 #include <casacore/coordinates/Coordinates/LinearCoordinate.h>
 #include <casacore/coordinates/Coordinates/DirectionCoordinate.h>
 #include <casacore/coordinates/Coordinates/SpectralCoordinate.h>
@@ -1120,20 +1121,33 @@ void CartaZarrImage::createMinimalCoordinateSystem() {
 
 void CartaZarrImage::initializeTensorStore() {
     try {
-        // Create TensorStore context with memory limit
-        // For 10000x10000 float32: ~400MB per channel, limit to 8 channels = 3.2GB
+        // Detect number of CPU cores for optimal parallelization
+        unsigned int num_cpus = std::thread::hardware_concurrency();
+        if (num_cpus == 0) num_cpus = 8;  // fallback to 8 if detection fails
+        
+        // Create TensorStore context with aggressive parallelization
+        // Using all available CPU cores for maximum I/O and decode throughput
+        // For large regions (e.g., 8000×5000), each thread may need ~640MB
+        // With 4 threads: 4 × 640MB = 2.56GB, so use 4GB cache to avoid eviction
         nlohmann::json context_spec = {
             {"cache_pool", {
-                {"total_bytes_limit", 3ULL << 30}  // 3GB cache limit (allows ~8 channels of 10000x10000 float32)
+                {"total_bytes_limit", 4ULL << 30}  // 4GB cache limit (increased for large regions)
+            }},
+            {"data_copy_concurrency", {
+                {"limit", num_cpus}  // Use all CPU cores for chunk decode operations
+            }},
+            {"file_io_concurrency", {
+                {"limit", num_cpus}  // Use all CPU cores for parallel file I/O
             }}
         };
         
         auto context_result = tensorstore::Context::FromJson(context_spec);
         if (context_result.ok()) {
             _context = context_result.value();
-            spdlog::info("TensorStore context initialized with 3GB cache limit (~8 channels for large datacubes)");
+            spdlog::info("TensorStore context initialized: {} CPU cores, 2GB cache, {}-thread data_copy_concurrency, {}-thread file_io_concurrency for maximum parallel throughput",
+                        num_cpus, num_cpus, num_cpus);
         } else {
-            spdlog::warn("Failed to create TensorStore context with cache limit: {}, using default", 
+            spdlog::warn("Failed to create TensorStore context with cache and concurrency: {}, using default", 
                         context_result.status().ToString());
             _context = tensorstore::Context::Default();
         }
@@ -1541,13 +1555,13 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                     // Check for multi-channel/multi-stokes requests
                     if (length[2] > 1 || length[3] > 1) {
                         is_4d_request = true;
-                        // Limit to max 8 channels per batch to prevent memory overflow
-                        // For 10000x10000 float32: 8 channels = 3.2GB
-                        num_freq = std::min(static_cast<int>(length[2]), 8);
+                        // Limit to max 4 channels per batch to prevent memory overflow
+                        // For 10000x10000 float32: 4 channels = 1.6GB
+                        num_freq = std::min(static_cast<int>(length[2]), 4);
                         num_stokes = length[3];
                         
-                        if (length[2] > 8) {
-                            spdlog::warn("Request for {} channels exceeds limit, capping at 8 channels per batch", length[2]);
+                        if (length[2] > 4) {
+                            spdlog::warn("Request for {} channels exceeds limit, capping at 4 channels per batch", length[2]);
                         }
                     }
                     
