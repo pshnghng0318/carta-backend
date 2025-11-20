@@ -453,13 +453,22 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
             
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
+    
+    # Prepare force-load arguments for compression libraries
+    set(FORCE_LOAD_ARGS "")
+    foreach(lib ${TENSORSTORE_FORCE_LOAD_LIBS})
+        if(EXISTS ${lib})
+            list(APPEND FORCE_LOAD_ARGS "-Wl,--whole-archive" "${lib}" "-Wl,--no-whole-archive")
+        endif()
+    endforeach()
+
     target_link_libraries(carta_backend
         PRIVATE
             protobuf
+            uv
             ${LINK_LIBS}
-            -Wl,--whole-archive
-            ${TENSORSTORE_ROOT}/_deps/absl-build/absl/hash/libabsl_hash.a
-            -Wl,--no-whole-archive)
+            -Wl,--whole-archive ${TENSORSTORE_MAIN_LIB} -Wl,--no-whole-archive
+            ${FORCE_LOAD_ARGS})
             
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
 
