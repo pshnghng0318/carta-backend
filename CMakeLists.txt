@@ -175,14 +175,25 @@ add_subdirectory(third-party/spdlog)
 # JSON schemas
 add_subdirectory(schemas)
 
-# nlohmann/json
+# nlohmann/json - use project's version, not system version
+# MUST set include directory BEFORE system paths to prevent ABI mismatch
+include_directories(BEFORE "${CMAKE_SOURCE_DIR}/third-party/nlohmann_json/include")
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 set(JSON_Install OFF CACHE INTERNAL "")
 add_subdirectory(third-party/nlohmann_json)
 
-# json-schema-validator
-set(nlohmann_json_VERSION "v3.11.3")
+# json-schema-validator - configure to use project's nlohmann_json
+# Set version to match our bundled nlohmann_json (v3.11.3)
+set(nlohmann_json_VERSION "v3.11.3" CACHE STRING "nlohmann_json version" FORCE)
+# Prevent json-schema-validator from using system nlohmann_json by ensuring target exists
+# The validator's CMakeLists.txt checks: if (NOT TARGET nlohmann_json)
+# Since we already added nlohmann_json above, it will use our version
 add_subdirectory(third-party/json-schema-validator)
+
+# xtensor 0.26.0 (C++17 compatible) for optimized array operations
+# Add AFTER json-schema-validator to avoid affecting its compilation
+include_directories("${CMAKE_SOURCE_DIR}/third-party/xtensor-0.26.0/include")
+include_directories("/opt/homebrew/include")  # for xtl dependency
 
 # TensorStore configuration
 set(TENSORSTORE_ROOT "${CMAKE_SOURCE_DIR}/tensorstore")

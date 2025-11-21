@@ -2021,123 +2021,123 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
                         freq_channel, stokes_channel, _cache_width, _cache_height, 
                         (total_elements * sizeof(float)) / (1024 * 1024));
             
-            // DEBUG: Check TensorStore data layout and verify expected NaN boundaries
-            spdlog::debug("TENSORSTORE DATA LAYOUT DEBUG:");
-            spdlog::debug("  TensorStore array shape: {}", zarr_array.shape().size());
-            for (size_t i = 0; i < zarr_array.shape().size(); ++i) {
-                spdlog::debug("    Dimension {}: {}", i, zarr_array.shape()[i]);
-            }
+            // // DEBUG: Check TensorStore data layout and verify expected NaN boundaries
+            // spdlog::debug("TENSORSTORE DATA LAYOUT DEBUG:");
+            // spdlog::debug("  TensorStore array shape: {}", zarr_array.shape().size());
+            // for (size_t i = 0; i < zarr_array.shape().size(); ++i) {
+            //     spdlog::debug("    Dimension {}: {}", i, zarr_array.shape()[i]);
+            // }
             
-            // Check first few and expected boundary rows specifically 
-            std::vector<int> test_rows = {0, 1, 2, 183, 184, 249, 250, 251, 252, 253};
-            for (int row : test_rows) {
-                if (row >= _cache_height) continue;
+            // // Check first few and expected boundary rows specifically 
+            // std::vector<int> test_rows = {0, 1, 2, 183, 184, 249, 250, 251, 252, 253};
+            // for (int row : test_rows) {
+            //     if (row >= _cache_height) continue;
                 
-                // Sample a few columns in this row
-                std::vector<int> sample_cols = {100, 1000, 3000, 5000, 7000};
-                int nan_count = 0, finite_count = 0;
+            //     // Sample a few columns in this row
+            //     std::vector<int> sample_cols = {100, 1000, 3000, 5000, 7000};
+            //     int nan_count = 0, finite_count = 0;
                 
-                for (int col : sample_cols) {
-                    if (col >= _cache_width) continue;
+            //     for (int col : sample_cols) {
+            //         if (col >= _cache_width) continue;
                     
-                    size_t cache_idx = row * _cache_width + col;
-                    if (cache_idx < _channel_cache.size()) {
-                        float val = _channel_cache[cache_idx];
-                        if (std::isnan(val)) {
-                            nan_count++;
-                        } else if (std::isfinite(val)) {
-                            finite_count++;
-                        }
-                    }
-                }
+            //         size_t cache_idx = row * _cache_width + col;
+            //         if (cache_idx < _channel_cache.size()) {
+            //             float val = _channel_cache[cache_idx];
+            //             if (std::isnan(val)) {
+            //                 nan_count++;
+            //             } else if (std::isfinite(val)) {
+            //                 finite_count++;
+            //             }
+            //         }
+            //     }
                 
-                spdlog::debug("  Row {}: {}/{} NaN, {}/{} finite (expected: row<250 should be NaN)", 
-                             row, nan_count, sample_cols.size(), finite_count, sample_cols.size());
-            }
+            //     spdlog::debug("  Row {}: {}/{} NaN, {}/{} finite (expected: row<250 should be NaN)", 
+            //                  row, nan_count, sample_cols.size(), finite_count, sample_cols.size());
+            // }
             
-            // Sample a few key positions to understand data layout
-            spdlog::debug("CACHE DATA SAMPLING:");
-            for (int y = 0; y < std::min(5, _cache_height); y++) {
-                int x = 0;
-                int idx = y * _cache_width + x;
-                float val = _channel_cache[idx];
-                spdlog::debug("  row={}, col={}, idx={}, value={}, isNaN={}", y, x, idx, val, std::isnan(val));
-            }
+            // // Sample a few key positions to understand data layout
+            // spdlog::debug("CACHE DATA SAMPLING:");
+            // for (int y = 0; y < std::min(5, _cache_height); y++) {
+            //     int x = 0;
+            //     int idx = y * _cache_width + x;
+            //     float val = _channel_cache[idx];
+            //     spdlog::debug("  row={}, col={}, idx={}, value={}, isNaN={}", y, x, idx, val, std::isnan(val));
+            // }
             
-            // Precise boundary analysis based on image data
-            if (_cache_height > 250) {
-                spdlog::debug("PRECISE BOUNDARY ANALYSIS:");
+            // // Precise boundary analysis based on image data
+            // if (_cache_height > 250) {
+            //     spdlog::debug("PRECISE BOUNDARY ANALYSIS:");
                 
-                // Sample multiple columns to get accurate boundary
-                std::vector<int> sample_columns = {100, 200, 500, 1000, 2000, 3000, 4000, 5000, 6000, 7000};
-                int consensus_first_row = -1;
-                int consensus_last_row = -1;
+            //     // Sample multiple columns to get accurate boundary
+            //     std::vector<int> sample_columns = {100, 200, 500, 1000, 2000, 3000, 4000, 5000, 6000, 7000};
+            //     int consensus_first_row = -1;
+            //     int consensus_last_row = -1;
                 
-                // Check each sample column
-                for (int col : sample_columns) {
-                    if (col >= _cache_width) continue;
+            //     // Check each sample column
+            //     for (int col : sample_columns) {
+            //         if (col >= _cache_width) continue;
                     
-                    int col_first_row = -1;
-                    int col_last_row = -1;
+            //         int col_first_row = -1;
+            //         int col_last_row = -1;
                     
-                    for (int y = 0; y < _cache_height; y++) {
-                        int idx = y * _cache_width + col;
-                        float val = _channel_cache[idx];
-                        if (!std::isnan(val) && std::isfinite(val)) {
-                            if (col_first_row == -1) col_first_row = y;
-                            col_last_row = y;
-                        }
-                    }
+            //         for (int y = 0; y < _cache_height; y++) {
+            //             int idx = y * _cache_width + col;
+            //             float val = _channel_cache[idx];
+            //             if (!std::isnan(val) && std::isfinite(val)) {
+            //                 if (col_first_row == -1) col_first_row = y;
+            //                 col_last_row = y;
+            //             }
+            //         }
                     
-                    spdlog::debug("  Column {}: first_row={}, last_row={}", col, col_first_row, col_last_row);
+            //         spdlog::debug("  Column {}: first_row={}, last_row={}", col, col_first_row, col_last_row);
                     
-                    // Update consensus (use most restrictive bounds)
-                    if (col_first_row >= 0) {
-                        if (consensus_first_row == -1 || col_first_row < consensus_first_row) {
-                            consensus_first_row = col_first_row;
-                        }
-                    }
-                    if (col_last_row >= 0) {
-                        if (consensus_last_row == -1 || col_last_row > consensus_last_row) {
-                            consensus_last_row = col_last_row;
-                        }
-                    }
-                }
+            //         // Update consensus (use most restrictive bounds)
+            //         if (col_first_row >= 0) {
+            //             if (consensus_first_row == -1 || col_first_row < consensus_first_row) {
+            //                 consensus_first_row = col_first_row;
+            //             }
+            //         }
+            //         if (col_last_row >= 0) {
+            //             if (consensus_last_row == -1 || col_last_row > consensus_last_row) {
+            //                 consensus_last_row = col_last_row;
+            //             }
+            //         }
+            //     }
                 
-                // Additional detailed analysis around discovered boundaries
-                if (consensus_first_row >= 0) {
-                    spdlog::debug("DETAILED BOUNDARY EXAMINATION:");
-                    int check_start = std::max(0, consensus_first_row - 5);
-                    int check_end = std::min(_cache_height - 1, consensus_first_row + 5);
+            //     // Additional detailed analysis around discovered boundaries
+            //     if (consensus_first_row >= 0) {
+            //         spdlog::debug("DETAILED BOUNDARY EXAMINATION:");
+            //         int check_start = std::max(0, consensus_first_row - 5);
+            //         int check_end = std::min(_cache_height - 1, consensus_first_row + 5);
                     
-                    for (int y = check_start; y <= check_end; y++) {
-                        // Count valid pixels in this row
-                        int valid_pixels = 0;
-                        int total_pixels = 0;
-                        for (int x = 0; x < _cache_width; x += 100) { // Sample every 100 pixels
-                            int idx = y * _cache_width + x;
-                            float val = _channel_cache[idx];
-                            if (!std::isnan(val) && std::isfinite(val)) {
-                                valid_pixels++;
-                            }
-                            total_pixels++;
-                        }
-                        float valid_ratio = (float)valid_pixels / total_pixels;
-                        spdlog::debug("    Row {}: {}/{} valid pixels ({:.1f}%)", 
-                                     y, valid_pixels, total_pixels, valid_ratio * 100);
-                    }
-                }
+            //         for (int y = check_start; y <= check_end; y++) {
+            //             // Count valid pixels in this row
+            //             int valid_pixels = 0;
+            //             int total_pixels = 0;
+            //             for (int x = 0; x < _cache_width; x += 100) { // Sample every 100 pixels
+            //                 int idx = y * _cache_width + x;
+            //                 float val = _channel_cache[idx];
+            //                 if (!std::isnan(val) && std::isfinite(val)) {
+            //                     valid_pixels++;
+            //                 }
+            //                 total_pixels++;
+            //             }
+            //             float valid_ratio = (float)valid_pixels / total_pixels;
+            //             spdlog::debug("    Row {}: {}/{} valid pixels ({:.1f}%)", 
+            //                          y, valid_pixels, total_pixels, valid_ratio * 100);
+            //         }
+            //     }
                 
-                spdlog::info("FINAL BOUNDARY ANALYSIS:");
-                spdlog::info("  Consensus first data row: {}", consensus_first_row);
-                spdlog::info("  Consensus last data row: {}", consensus_last_row);
-                spdlog::info("  Total data rows: {}", (consensus_first_row >= 0 && consensus_last_row >= 0) ? (consensus_last_row - consensus_first_row + 1) : 0);
-                spdlog::info("  NaN header rows: {}", consensus_first_row >= 0 ? consensus_first_row : _cache_height);
-                spdlog::info("  NaN footer rows: {}", consensus_last_row >= 0 ? (_cache_height - consensus_last_row - 1) : 0);
-                spdlog::info("  Data coverage: {:.1f}% of image height", 
-                            consensus_first_row >= 0 && consensus_last_row >= 0 ? 
-                            ((float)(consensus_last_row - consensus_first_row + 1) / _cache_height * 100) : 0.0);
-            }
+            //     spdlog::info("FINAL BOUNDARY ANALYSIS:");
+            //     spdlog::info("  Consensus first data row: {}", consensus_first_row);
+            //     spdlog::info("  Consensus last data row: {}", consensus_last_row);
+            //     spdlog::info("  Total data rows: {}", (consensus_first_row >= 0 && consensus_last_row >= 0) ? (consensus_last_row - consensus_first_row + 1) : 0);
+            //     spdlog::info("  NaN header rows: {}", consensus_first_row >= 0 ? consensus_first_row : _cache_height);
+            //     spdlog::info("  NaN footer rows: {}", consensus_last_row >= 0 ? (_cache_height - consensus_last_row - 1) : 0);
+            //     spdlog::info("  Data coverage: {:.1f}% of image height", 
+            //                 consensus_first_row >= 0 && consensus_last_row >= 0 ? 
+            //                 ((float)(consensus_last_row - consensus_first_row + 1) / _cache_height * 100) : 0.0);
+            // }
             
             return true;
         } else {
@@ -2517,51 +2517,16 @@ bool CartaZarrImage::getSliceFromCache(casacore::Array<float>& buffer, const cas
             float min_val = std::numeric_limits<float>::max();
             float max_val = std::numeric_limits<float>::lowest();
             
-            // // Sample first few values for debugging
-            // spdlog::debug("EXTRACTED DATA SAMPLE (first 10 pixels):");
-            // for (int i = 0; i < std::min(10, req_width * req_height); ++i) {
-            //     spdlog::debug("  pixel[{}] = {}, isNaN={}, isFinite={}", 
-            //                  i, dest_data[i], std::isnan(dest_data[i]), std::isfinite(dest_data[i]));
-            // }
-            
+            // Calculate statistics in a single pass (optimized - removed unused rms/stddev)
             for (int i = 0; i < req_width * req_height; ++i) {
-                if (std::isnan(dest_data[i])) {
+                float val = dest_data[i];
+                if (std::isnan(val)) {
                     nan_count++;
-                } else if (std::isfinite(dest_data[i])) {
+                } else if (std::isfinite(val)) {
                     valid_count++;
-                    min_val = std::min(min_val, dest_data[i]);
-                    max_val = std::max(max_val, dest_data[i]);
+                    min_val = std::min(min_val, val);
+                    max_val = std::max(max_val, val);
                 }
-            }
-            
-            // Calculate comprehensive statistics
-            double sum = 0.0;
-            double sum_squares = 0.0;
-            double mean = 0.0;
-            double rms = 0.0;
-            double stddev = 0.0;
-            
-            if (valid_count > 0) {
-                // Calculate sum and sum of squares
-                for (int i = 0; i < req_width * req_height; ++i) {
-                    if (std::isfinite(dest_data[i])) {
-                        sum += dest_data[i];
-                        sum_squares += dest_data[i] * dest_data[i];
-                    }
-                }
-                
-                mean = sum / valid_count;
-                rms = std::sqrt(sum_squares / valid_count);
-                
-                // Calculate standard deviation
-                double variance_sum = 0.0;
-                for (int i = 0; i < req_width * req_height; ++i) {
-                    if (std::isfinite(dest_data[i])) {
-                        double diff = dest_data[i] - mean;
-                        variance_sum += diff * diff;
-                    }
-                }
-                stddev = std::sqrt(variance_sum / valid_count);
             }
             
             // spdlog::debug("EXTRACTED DATA SUMMARY:");

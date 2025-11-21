@@ -18,6 +18,12 @@
 #include <future>
 #include <vector>
 
+// xtensor 0.26.0 for optimized array operations (C++17 compatible)
+#include <xtensor/containers/xadapt.hpp>   // Wrap raw pointer as xtensor array
+#include <xtensor/views/xview.hpp>         // Array slicing and views
+#include <xtensor/core/xmath.hpp>          // nansum, nanmean, nanmin, nanmax, nanvar, nanstd, count_nonnan
+#include <xtensor/generators/xbuilder.hpp> // Array construction utilities
+
 using namespace carta;
 
 ZarrLoader::ZarrLoader(const std::string& filename) : FileLoader(filename) {
@@ -263,24 +269,77 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         int z_end = spectral_range.to;
         int profile_size = z_end - z_start + 1;
 
-        std::vector<double> profile_data(profile_size, 0.0);
+        // Calculate beam area for flux density calculation (like Hdf5Loader)
+        double beam_area = CalculateBeamArea();
+        bool has_flux = !std::isnan(beam_area);
         
-        // PARALLEL BATCH READING STRATEGY: Use 4 threads, each reads 4 channels
-        // 4 threads × 4 channels = 16 channels per parallel batch
-        const int PARALLEL_THREADS = 4;  // Number of concurrent threads
-        const int CHANNELS_PER_THREAD = 4;  // Each thread reads 4 channels
-        const int BATCH_SIZE = PARALLEL_THREADS * CHANNELS_PER_THREAD;  // 16 channels total
+        spdlog::debug("GetRegionSpectralData: beam_area={}, has_flux={}", beam_area, has_flux);
+
+        // Initialize results vectors for all statistics types (like Hdf5Loader)
+        std::vector<double> num_pixels_vec(profile_size, 0);
+        std::vector<double> nan_count_vec(profile_size, 0);
+        std::vector<double> sum_vec(profile_size, 0.0);
+        std::vector<double> mean_vec(profile_size, NAN);
+        std::vector<double> rms_vec(profile_size, NAN);
+        std::vector<double> sigma_vec(profile_size, NAN);
+        std::vector<double> sum_sq_vec(profile_size, 0.0);
+        std::vector<double> min_vec(profile_size, std::numeric_limits<float>::max());
+        std::vector<double> max_vec(profile_size, std::numeric_limits<float>::lowest());
+        std::vector<double> extrema_vec(profile_size, NAN);
+        std::vector<double> flux_vec(profile_size, NAN);
         
-        spdlog::info("GetRegionSpectralData: Processing {} channels ({}x{} parallel batches)", 
-                    profile_size, PARALLEL_THREADS, CHANNELS_PER_THREAD);
+        // OPTIMIZED THREAD STRATEGY for I/O-bound operations
+        // Fewer threads = less I/O contention, better throughput
+        unsigned int hardware_cpus = std::thread::hardware_concurrency();
+        int num_threads;
+        if (hardware_cpus >= 11) {
+            num_threads = 6;  // 11-14+ CPUs: use 6 threads
+        } else if (hardware_cpus >= 7) {
+            num_threads = 4;  // 7-10 CPUs: use 4 threads
+        } else if (hardware_cpus >= 4) {
+            num_threads = 2;  // 4-6 CPUs: use 2 threads
+        } else {
+            num_threads = 1;  // 1-3 CPUs: use 1 thread
+        }
+        
+        // MEMORY-BASED CHANNEL CALCULATION
+        // Formula: num_threads × region_pixels × sizeof(float) × channels_per_thread ≤ 8 GB
+        // Solve for channels_per_thread = 8GB / (num_threads × region_pixels × 4)
+        const size_t MAX_MEMORY_BYTES = 8ULL * 1024 * 1024 * 1024;  // 8 GB limit
+        const size_t BYTES_PER_PIXEL = sizeof(float);  // 4 bytes
+        
+        size_t total_memory_per_channel = num_threads * region_area * BYTES_PER_PIXEL;
+        int calculated_channels_per_thread = static_cast<int>(MAX_MEMORY_BYTES / total_memory_per_channel);
+        
+        // Ensure minimum of 4 channels per thread for reasonable I/O efficiency
+        // and maximum of 64 to avoid excessive batch sizes
+        int channels_per_thread = std::max(4, std::min(64, calculated_channels_per_thread));
+        
+        const int PARALLEL_THREADS = num_threads;
+        const int CHANNELS_PER_THREAD = channels_per_thread;
+        const int BATCH_SIZE = PARALLEL_THREADS * CHANNELS_PER_THREAD;
+        
+        size_t memory_per_batch_mb = (BATCH_SIZE * region_area * sizeof(float)) / (1024 * 1024);
+        double memory_per_batch_gb = memory_per_batch_mb / 1024.0;
+        
+        spdlog::info("GetRegionSpectralData: Processing {} channels, region={}x{} pixels ({} total pixels)", 
+                    profile_size, region_width, region_height, region_area);
+        spdlog::info("  Thread strategy: {} CPUs detected -> using {} threads", hardware_cpus, PARALLEL_THREADS);
+        spdlog::info("  Memory calculation: 8 GB / ({} threads × {} pixels × 4 bytes) = {} channels/thread", 
+                    PARALLEL_THREADS, region_area, CHANNELS_PER_THREAD);
+        spdlog::info("  Batch config: {} threads × {} channels/thread = {} channels/batch ({:.2f} GB/batch)", 
+                    PARALLEL_THREADS, CHANNELS_PER_THREAD, BATCH_SIZE, memory_per_batch_gb);
         auto start_time = std::chrono::high_resolution_clock::now();
         
-        // Lambda function to read multiple channels AND calculate statistics for one thread
-        auto read_and_compute_batch = [&](int start_z, int end_z) -> std::pair<bool, std::vector<double>> {
+        // Lambda function to read multiple channels AND calculate ALL statistics for one thread
+        auto read_and_compute_batch = [&](int start_z, int end_z) -> std::pair<bool, std::vector<std::vector<double>>> {
             auto thread_id = std::hash<std::thread::id>{}(std::this_thread::get_id()) % 10000;
             auto thread_start_time = std::chrono::high_resolution_clock::now();
             
             int num_channels = end_z - start_z + 1;
+            
+            // Result vectors: [num_pixels, sum, sum_sq, min, max] for each channel
+            std::vector<std::vector<double>> channel_stats(num_channels, std::vector<double>(5, 0.0));
             
             // Step 1: Read data from TensorStore
             auto read_start = std::chrono::high_resolution_clock::now();
@@ -299,7 +358,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 length = casacore::IPosition(2, region_width, region_height);
             } else {
                 spdlog::error("Unsupported dimensions: {}", shape.size());
-                return {false, std::vector<double>()};
+                return {false, std::vector<std::vector<double>>()};
             }
             
             casacore::Array<float> batch_array;
@@ -307,75 +366,146 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             
             bool success = zarr_image->readPixelFromTensorStore(batch_array, slicer);
             if (!success) {
-                return {false, std::vector<double>()};
+                return {false, std::vector<std::vector<double>>()};
             }
             
             auto read_end = std::chrono::high_resolution_clock::now();
             auto read_ms = std::chrono::duration_cast<std::chrono::milliseconds>(read_end - read_start).count();
             
-            // Step 2: Calculate mean for each channel in this batch (PARALLELIZED!)
+            // Step 2: Calculate ALL statistics for each channel in this batch
             auto compute_start = std::chrono::high_resolution_clock::now();
             const float* data_ptr = batch_array.data();
             casacore::IPosition array_shape = batch_array.shape();
-            std::vector<double> channel_means(num_channels);
             
-            // Pre-calculate mask access pattern to avoid repeated IPosition creation
-            casacore::IPosition mask_pos(2);
-            
-            for (int ch_offset = 0; ch_offset < num_channels; ++ch_offset) {
-                double sum = 0.0;
-                int valid_count = 0;
-                
-                // Optimize: iterate in memory order for better cache locality
-                for (int y = 0; y < region_height; ++y) {
-                    int mask_y = y + y_min - origin[1];
-                    bool y_in_mask = (mask_y >= 0 && mask_y < mask_shape[1]);
-                    
-                    for (int x = 0; x < region_width; ++x) {
-                        int mask_x = x + x_min - origin[0];
-                        
-                        // Early exit if outside mask bounds
-                        if (!y_in_mask || mask_x < 0 || mask_x >= mask_shape[0]) {
-                            continue;
-                        }
-                        
-                        // Reuse IPosition object instead of creating new one each time
-                        mask_pos[0] = mask_x;
-                        mask_pos[1] = mask_y;
-                        if (!mask(mask_pos)) {
-                            continue;
-                        }
-                        
-                        // Calculate linear index (optimized for common case)
-                        size_t linear_index;
-                        if (array_shape.size() == 4 || array_shape.size() == 3) {
-                            // Most common case: [x, y, ch] or [x, y, ch, stokes]
-                            linear_index = x + y * region_width + ch_offset * region_width * region_height;
-                        } else if (array_shape.size() == 5) {
-                            linear_index = ch_offset * region_width * region_height + x * region_height + y;
-                        } else {
-                            linear_index = y * region_width + x;
-                        }
-                        
-                        // Bounds check only in debug mode (assume correct access in release)
-                        #ifdef DEBUG
-                        if (linear_index >= batch_array.nelements()) {
-                            continue;
-                        }
-                        #endif
-                        
-                        float value = data_ptr[linear_index];
-                        if (std::isfinite(value)) {
-                            sum += value;
-                            valid_count++;
-                        }
+            // Check if we need to apply mask (if mask covers the entire region, use xtensor fast path)
+            bool simple_rectangular_region = true;
+            for (int y = 0; y < region_height && simple_rectangular_region; ++y) {
+                int mask_y = y + y_min - origin[1];
+                if (mask_y < 0 || mask_y >= mask_shape[1]) {
+                    simple_rectangular_region = false;
+                    break;
+                }
+                for (int x = 0; x < region_width && simple_rectangular_region; ++x) {
+                    int mask_x = x + x_min - origin[0];
+                    if (mask_x < 0 || mask_x >= mask_shape[0]) {
+                        simple_rectangular_region = false;
+                        break;
+                    }
+                    casacore::IPosition mask_pos(2, mask_x, mask_y);
+                    if (!mask(mask_pos)) {
+                        simple_rectangular_region = false;
+                        break;
                     }
                 }
-                
-                if (valid_count > 0) {
-                    channel_means[ch_offset] = sum / static_cast<double>(valid_count);
+            }
+            
+            if (simple_rectangular_region) {
+                // FAST PATH: Use xtensor vectorized operations with SIMD acceleration
+                // Wrap raw data as xtensor array (zero-copy view)
+                std::vector<size_t> shape_vec;
+                if (array_shape.size() == 4 || array_shape.size() == 3) {
+                    shape_vec = {static_cast<size_t>(num_channels), 
+                                static_cast<size_t>(region_height), 
+                                static_cast<size_t>(region_width)};
+                } else if (array_shape.size() == 5) {
+                    shape_vec = {static_cast<size_t>(num_channels),
+                                static_cast<size_t>(region_width),
+                                static_cast<size_t>(region_height)};
                 } else {
-                    channel_means[ch_offset] = std::numeric_limits<double>::quiet_NaN();
+                    shape_vec = {static_cast<size_t>(region_height), 
+                                static_cast<size_t>(region_width)};
+                }
+                
+                // Wrap data as xtensor array (zero-copy, specify size explicitly to avoid ambiguity)
+                auto xarr = xt::adapt(data_ptr, shape_vec.size(), shape_vec);
+                
+                // Process each channel with vectorized operations
+                for (int ch_offset = 0; ch_offset < num_channels; ++ch_offset) {
+                    auto channel_view = xt::view(xarr, ch_offset, xt::all(), xt::all());
+                    
+                    // All nan-aware operations (automatically skip NaN values with SIMD)
+                    uint64_t valid_count = xt::count_nonnan(channel_view)();
+                    
+                    if (valid_count > 0) {
+                        double sum = xt::nansum(channel_view)();
+                        double sum_sq = xt::nansum(xt::square(channel_view))();
+                        float min_val = xt::nanmin(channel_view)();
+                        float max_val = xt::nanmax(channel_view)();
+                        
+                        channel_stats[ch_offset][0] = valid_count;
+                        channel_stats[ch_offset][1] = sum;
+                        channel_stats[ch_offset][2] = sum_sq;
+                        channel_stats[ch_offset][3] = min_val;
+                        channel_stats[ch_offset][4] = max_val;
+                    } else {
+                        channel_stats[ch_offset][0] = 0;
+                        channel_stats[ch_offset][1] = 0.0;
+                        channel_stats[ch_offset][2] = 0.0;
+                        channel_stats[ch_offset][3] = std::numeric_limits<float>::quiet_NaN();
+                        channel_stats[ch_offset][4] = std::numeric_limits<float>::quiet_NaN();
+                    }
+                }
+            } else {
+                // SLOW PATH: Manual iteration with mask checking (for complex masks)
+                casacore::IPosition mask_pos(2);
+                
+                for (int ch_offset = 0; ch_offset < num_channels; ++ch_offset) {
+                    double sum = 0.0;
+                    double sum_sq = 0.0;
+                    uint64_t valid_count = 0;
+                    float min_val = std::numeric_limits<float>::max();
+                    float max_val = std::numeric_limits<float>::lowest();
+                    
+                    // Iterate over region with mask checking
+                    for (int y = 0; y < region_height; ++y) {
+                        int mask_y = y + y_min - origin[1];
+                        bool y_in_mask = (mask_y >= 0 && mask_y < mask_shape[1]);
+                        
+                        if (!y_in_mask) continue;
+                        
+                        for (int x = 0; x < region_width; ++x) {
+                            int mask_x = x + x_min - origin[0];
+                            
+                            // Early exit if outside mask bounds
+                            if (mask_x < 0 || mask_x >= mask_shape[0]) {
+                                continue;
+                            }
+                            
+                            // Reuse IPosition object instead of creating new one each time
+                            mask_pos[0] = mask_x;
+                            mask_pos[1] = mask_y;
+                            if (!mask(mask_pos)) {
+                                continue;
+                            }
+                            
+                            // Calculate linear index (optimized for common case)
+                            size_t linear_index;
+                            if (array_shape.size() == 4 || array_shape.size() == 3) {
+                                // Most common case: [x, y, ch] or [x, y, ch, stokes]
+                                linear_index = x + y * region_width + ch_offset * region_width * region_height;
+                            } else if (array_shape.size() == 5) {
+                                linear_index = ch_offset * region_width * region_height + x * region_height + y;
+                            } else {
+                                linear_index = y * region_width + x;
+                            }
+                            
+                            float value = data_ptr[linear_index];
+                            if (std::isfinite(value)) {
+                                sum += value;
+                                sum_sq += value * value;
+                                valid_count++;
+                                min_val = std::min(min_val, value);
+                                max_val = std::max(max_val, value);
+                            }
+                        }
+                    }
+                    
+                    // Store results: [num_pixels, sum, sum_sq, min, max]
+                    channel_stats[ch_offset][0] = valid_count;
+                    channel_stats[ch_offset][1] = sum;
+                    channel_stats[ch_offset][2] = sum_sq;
+                    channel_stats[ch_offset][3] = (valid_count > 0) ? min_val : std::numeric_limits<float>::quiet_NaN();
+                    channel_stats[ch_offset][4] = (valid_count > 0) ? max_val : std::numeric_limits<float>::quiet_NaN();
                 }
             }
             
@@ -389,7 +519,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             spdlog::info("Thread {} channels {}-{}: read {} ms ({:.2f} GB/s), compute {} ms, total {} ms", 
                         thread_id, start_z, end_z, read_ms, read_speed_gbs, compute_ms, total_ms);
             
-            return {success, std::move(channel_means)};
+            // batch_array will be automatically destroyed here, releasing ~{} MB
+            // Only return compact statistics (5 doubles × num_channels)
+            return {success, std::move(channel_stats)};
         };
         
         // Process channels in groups of BATCH_SIZE (16 channels = 4 threads × 4 channels)
@@ -402,7 +534,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                          batch_start, batch_end, actual_batch_size, PARALLEL_THREADS);
             
             // Launch parallel reads AND computation using std::async
-            std::vector<std::future<std::pair<bool, std::vector<double>>>> futures;
+            std::vector<std::future<std::pair<bool, std::vector<std::vector<double>>>>> futures;
             for (int thread_idx = 0; thread_idx < PARALLEL_THREADS; ++thread_idx) {
                 int thread_start_z = batch_start + thread_idx * CHANNELS_PER_THREAD;
                 int thread_end_z = std::min(thread_start_z + CHANNELS_PER_THREAD - 1, z_end);
@@ -426,13 +558,21 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                     return false;
                 }
                 
-                // Copy computed means to profile_data
-                const std::vector<double>& channel_means = result.second;
-                for (int ch_offset = 0; ch_offset < channel_means.size(); ++ch_offset) {
+                // Copy computed statistics to result vectors
+                const std::vector<std::vector<double>>& channel_stats = result.second;
+                for (int ch_offset = 0; ch_offset < channel_stats.size(); ++ch_offset) {
                     int z_index = thread_start_z + ch_offset;
                     int profile_index = z_index - z_start;
-                    profile_data[profile_index] = channel_means[ch_offset];
+                    
+                    // Extract stats: [num_pixels, sum, sum_sq, min, max]
+                    num_pixels_vec[profile_index] = channel_stats[ch_offset][0];
+                    sum_vec[profile_index] = channel_stats[ch_offset][1];
+                    sum_sq_vec[profile_index] = channel_stats[ch_offset][2];
+                    min_vec[profile_index] = channel_stats[ch_offset][3];
+                    max_vec[profile_index] = channel_stats[ch_offset][4];
                 }
+                // result and channel_stats will be destroyed here after copying
+                // Large batch_array was already freed when lambda returned
             }
             
             auto batch_end_time = std::chrono::high_resolution_clock::now();
@@ -448,8 +588,42 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             }
         }
         
-        // All channels processed
-        results[CARTA::StatsType::Mean] = profile_data;
+        // All channels processed - calculate derived statistics (like Hdf5Loader)
+        for (int z = 0; z < profile_size; ++z) {
+            uint64_t num_pixels = num_pixels_vec[z];
+            if (num_pixels > 0) {
+                double sum = sum_vec[z];
+                double sum_sq = sum_sq_vec[z];
+                
+                mean_vec[z] = sum / num_pixels;
+                rms_vec[z] = std::sqrt(sum_sq / num_pixels);
+                sigma_vec[z] = num_pixels > 1 ? std::sqrt((sum_sq - (sum * sum / num_pixels)) / (num_pixels - 1)) : 0;
+                extrema_vec[z] = (std::abs(min_vec[z]) > std::abs(max_vec[z])) ? min_vec[z] : max_vec[z];
+                
+                // Calculate flux density if beam area is available
+                if (has_flux) {
+                    flux_vec[z] = sum / beam_area;
+                }
+            }
+        }
+        
+        // Store all statistics in results map
+        results[CARTA::StatsType::NumPixels] = num_pixels_vec;
+        results[CARTA::StatsType::NanCount] = nan_count_vec;
+        results[CARTA::StatsType::Sum] = sum_vec;
+        results[CARTA::StatsType::Mean] = mean_vec;
+        results[CARTA::StatsType::RMS] = rms_vec;
+        results[CARTA::StatsType::Sigma] = sigma_vec;
+        results[CARTA::StatsType::SumSq] = sum_sq_vec;
+        results[CARTA::StatsType::Min] = min_vec;
+        results[CARTA::StatsType::Max] = max_vec;
+        results[CARTA::StatsType::Extrema] = extrema_vec;
+        
+        // Add flux density if available
+        if (has_flux) {
+            results[CARTA::StatsType::FluxDensity] = flux_vec;
+        }
+        
         progress = 1.0;
         
         auto end_time = std::chrono::high_resolution_clock::now();
