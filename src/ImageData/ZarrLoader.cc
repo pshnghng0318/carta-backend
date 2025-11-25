@@ -273,7 +273,20 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         double beam_area = CalculateBeamArea();
         bool has_flux = !std::isnan(beam_area);
         
-        spdlog::debug("GetRegionSpectralData: beam_area={}, has_flux={}", beam_area, has_flux);
+        spdlog::info("GetRegionSpectralData: beam_area={}, has_flux={}", beam_area, has_flux);
+        
+        // Additional debug: check image info
+        auto image = GetImage();
+        if (image) {
+            auto& info = image->imageInfo();
+            if (info.hasSingleBeam()) {
+                spdlog::info("GetRegionSpectralData: Image has single beam");
+            } else {
+                spdlog::warn("GetRegionSpectralData: Image does NOT have single beam!");
+            }
+        } else {
+            spdlog::warn("GetRegionSpectralData: Image pointer is null!");
+        }
 
         // Initialize results vectors for all statistics types (like Hdf5Loader)
         std::vector<double> num_pixels_vec(profile_size, 0);
@@ -303,17 +316,26 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         }
         
         // MEMORY-BASED CHANNEL CALCULATION
-        // Formula: num_threads × region_pixels × sizeof(float) × channels_per_thread ≤ 8 GB
-        // Solve for channels_per_thread = 8GB / (num_threads × region_pixels × 4)
-        const size_t MAX_MEMORY_BYTES = 8ULL * 1024 * 1024 * 1024;  // 8 GB limit
+        // Formula: num_threads × region_pixels × sizeof(float) × channels_per_thread ≤ 4 GB (safe limit)
+        // Solve for channels_per_thread = 4GB / (num_threads × region_pixels × 4)
+        const size_t MAX_MEMORY_BYTES = 4ULL * 1024 * 1024 * 1024;  // 4 GB limit (conservative)
         const size_t BYTES_PER_PIXEL = sizeof(float);  // 4 bytes
         
         size_t total_memory_per_channel = num_threads * region_area * BYTES_PER_PIXEL;
         int calculated_channels_per_thread = static_cast<int>(MAX_MEMORY_BYTES / total_memory_per_channel);
         
-        // Ensure minimum of 4 channels per thread for reasonable I/O efficiency
+        // Ensure minimum of 2 channels per thread (essential for progress)
         // and maximum of 64 to avoid excessive batch sizes
-        int channels_per_thread = std::max(4, std::min(64, calculated_channels_per_thread));
+        int channels_per_thread = std::max(2, std::min(64, calculated_channels_per_thread));
+        
+        // For very large regions, ensure we don't exceed available memory
+        size_t estimated_batch_memory = static_cast<size_t>(num_threads) * channels_per_thread * region_area * BYTES_PER_PIXEL;
+        if (estimated_batch_memory > MAX_MEMORY_BYTES) {
+            // Recalculate with stricter limit
+            channels_per_thread = static_cast<int>(MAX_MEMORY_BYTES / total_memory_per_channel);
+            channels_per_thread = std::max(1, channels_per_thread);  // Absolute minimum: 1 channel/thread
+            spdlog::warn("Large region detected - reducing to {} channels/thread to fit memory limit", channels_per_thread);
+        }
         
         const int PARALLEL_THREADS = num_threads;
         const int CHANNELS_PER_THREAD = channels_per_thread;
@@ -325,7 +347,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         spdlog::info("GetRegionSpectralData: Processing {} channels, region={}x{} pixels ({} total pixels)", 
                     profile_size, region_width, region_height, region_area);
         spdlog::info("  Thread strategy: {} CPUs detected -> using {} threads", hardware_cpus, PARALLEL_THREADS);
-        spdlog::info("  Memory calculation: 8 GB / ({} threads × {} pixels × 4 bytes) = {} channels/thread", 
+        spdlog::info("  Memory calculation: 4 GB / ({} threads × {} pixels × 4 bytes) = {} channels/thread", 
                     PARALLEL_THREADS, region_area, CHANNELS_PER_THREAD);
         spdlog::info("  Batch config: {} threads × {} channels/thread = {} channels/batch ({:.2f} GB/batch)", 
                     PARALLEL_THREADS, CHANNELS_PER_THREAD, BATCH_SIZE, memory_per_batch_gb);
@@ -377,60 +399,125 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             const float* data_ptr = batch_array.data();
             casacore::IPosition array_shape = batch_array.shape();
             
+            // DEBUG: Log array shape received from TensorStore
+            spdlog::info("BATCH READ: array_shape={} (size={}), num_channels={}, region={}x{}", 
+                        array_shape.toString(), array_shape.size(), num_channels, region_width, region_height);
+            spdlog::info("BATCH READ: array_shape dimensions breakdown:");
+            for (size_t i = 0; i < array_shape.size(); ++i) {
+                spdlog::info("  array_shape[{}] = {}", i, array_shape[i]);
+            }
+            spdlog::info("BATCH READ: First 10 raw values from batch_array:");
+            for (int i = 0; i < std::min(10, static_cast<int>(batch_array.size())); ++i) {
+                spdlog::info("  raw[{}] = {:.6e} (isnan={})", i, data_ptr[i], std::isnan(data_ptr[i]));
+            }
+            
             // Check if we need to apply mask (if mask covers the entire region, use xtensor fast path)
             bool simple_rectangular_region = true;
+            int mask_fail_x = -1, mask_fail_y = -1;
+            std::string mask_fail_reason = "";
+            
             for (int y = 0; y < region_height && simple_rectangular_region; ++y) {
                 int mask_y = y + y_min - origin[1];
                 if (mask_y < 0 || mask_y >= mask_shape[1]) {
                     simple_rectangular_region = false;
+                    mask_fail_x = -1;
+                    mask_fail_y = y;
+                    mask_fail_reason = "mask_y out of bounds";
                     break;
                 }
                 for (int x = 0; x < region_width && simple_rectangular_region; ++x) {
                     int mask_x = x + x_min - origin[0];
                     if (mask_x < 0 || mask_x >= mask_shape[0]) {
                         simple_rectangular_region = false;
+                        mask_fail_x = x;
+                        mask_fail_y = y;
+                        mask_fail_reason = "mask_x out of bounds";
                         break;
                     }
                     casacore::IPosition mask_pos(2, mask_x, mask_y);
                     if (!mask(mask_pos)) {
                         simple_rectangular_region = false;
+                        mask_fail_x = x;
+                        mask_fail_y = y;
+                        mask_fail_reason = "mask pixel is false";
                         break;
                     }
                 }
             }
             
+            spdlog::info("MASK CHECK: simple_rectangular_region={}, mask_shape={}, region={}x{}, origin=[{},{}], x_min={}, y_min={}",
+                        simple_rectangular_region, mask_shape.toString(), region_width, region_height, 
+                        origin[0], origin[1], x_min, y_min);
+            if (!simple_rectangular_region) {
+                spdlog::info("MASK CHECK FAILED: reason='{}', fail_position=({},{}), using SLOW PATH with mask filtering", 
+                            mask_fail_reason, mask_fail_x, mask_fail_y);
+            }
+            
             if (simple_rectangular_region) {
-                // FAST PATH: Use xtensor vectorized operations with SIMD acceleration
-                // Wrap raw data as xtensor array (zero-copy view)
-                std::vector<size_t> shape_vec;
-                if (array_shape.size() == 4 || array_shape.size() == 3) {
-                    shape_vec = {static_cast<size_t>(num_channels), 
-                                static_cast<size_t>(region_height), 
-                                static_cast<size_t>(region_width)};
-                } else if (array_shape.size() == 5) {
-                    shape_vec = {static_cast<size_t>(num_channels),
-                                static_cast<size_t>(region_width),
-                                static_cast<size_t>(region_height)};
-                } else {
-                    shape_vec = {static_cast<size_t>(region_height), 
-                                static_cast<size_t>(region_width)};
-                }
-                
-                // Wrap data as xtensor array (zero-copy, specify size explicitly to avoid ambiguity)
-                auto xarr = xt::adapt(data_ptr, shape_vec.size(), shape_vec);
-                
-                // Process each channel with vectorized operations
+                // FAST PATH: Use xtensor with proper mask and NaN filtering
+                // Step 1: First pass - filter mask and NaN, collect valid pixels
                 for (int ch_offset = 0; ch_offset < num_channels; ++ch_offset) {
-                    auto channel_view = xt::view(xarr, ch_offset, xt::all(), xt::all());
+                    std::vector<float> valid_pixels;
+                    valid_pixels.reserve(region_width * region_height / 2); // Estimate half pixels valid
                     
-                    // All nan-aware operations (automatically skip NaN values with SIMD)
-                    uint64_t valid_count = xt::count_nonnan(channel_view)();
+                    // Collect valid (finite and masked) pixels
+                    for (int y = 0; y < region_height; ++y) {
+                        int mask_y = y + y_min - origin[1];
+                        if (mask_y < 0 || mask_y >= mask_shape[1]) continue;
+                        
+                        for (int x = 0; x < region_width; ++x) {
+                            int mask_x = x + x_min - origin[0];
+                            if (mask_x < 0 || mask_x >= mask_shape[0]) continue;
+                            
+                            // Calculate linear index based on array shape
+                            size_t linear_index;
+                            if (array_shape.size() == 4 || array_shape.size() == 3) {
+                                linear_index = x + y * region_width + ch_offset * region_width * region_height;
+                            } else if (array_shape.size() == 5) {
+                                linear_index = ch_offset * region_width * region_height + x * region_height + y;
+                            } else {
+                                linear_index = y * region_width + x;
+                            }
+                            
+                            float value = data_ptr[linear_index];
+                            if (std::isfinite(value)) {
+                                valid_pixels.push_back(value);
+                            }
+                        }
+                    }
+                    
+                    // Debug output for first channel
+                    if (ch_offset == 0) {
+                        spdlog::info("XTENSOR: Channel 0 collected {} valid pixels out of {} total",
+                                    valid_pixels.size(), region_width * region_height);
+                        if (valid_pixels.size() > 0) {
+                            spdlog::info("  First 5 valid values: {:.6e}, {:.6e}, {:.6e}, {:.6e}, {:.6e}",
+                                        valid_pixels[0], 
+                                        valid_pixels.size() > 1 ? valid_pixels[1] : 0,
+                                        valid_pixels.size() > 2 ? valid_pixels[2] : 0,
+                                        valid_pixels.size() > 3 ? valid_pixels[3] : 0,
+                                        valid_pixels.size() > 4 ? valid_pixels[4] : 0);
+                        }
+                    }
+                    
+                    // Step 2: Use xtensor on clean data (no NaN, all masked pixels filtered)
+                    uint64_t valid_count = valid_pixels.size();
                     
                     if (valid_count > 0) {
-                        double sum = xt::nansum(channel_view)();
-                        double sum_sq = xt::nansum(xt::square(channel_view))();
-                        float min_val = xt::nanmin(channel_view)();
-                        float max_val = xt::nanmax(channel_view)();
+                        // Wrap valid pixels as xtensor array (1D)
+                        std::vector<size_t> shape_1d = {valid_pixels.size()};
+                        auto valid_arr = xt::adapt(valid_pixels.data(), valid_pixels.size(), xt::no_ownership(), shape_1d);
+                        
+                        // Now use xtensor operations (no NaN in data, so regular operations work)
+                        double sum = xt::sum(valid_arr)();
+                        double sum_sq = xt::sum(xt::square(valid_arr))();
+                        float min_val = xt::amin(valid_arr)();
+                        float max_val = xt::amax(valid_arr)();
+                        
+                        if (ch_offset == 0) {
+                            spdlog::info("XTENSOR: Channel 0 stats - sum={:.6e}, min={:.6e}, max={:.6e}",
+                                        sum, min_val, max_val);
+                        }
                         
                         channel_stats[ch_offset][0] = valid_count;
                         channel_stats[ch_offset][1] = sum;
@@ -438,6 +525,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                         channel_stats[ch_offset][3] = min_val;
                         channel_stats[ch_offset][4] = max_val;
                     } else {
+                        if (ch_offset < 3) {
+                            spdlog::warn("XTENSOR: Channel {} has zero valid pixels!", ch_offset);
+                        }
                         channel_stats[ch_offset][0] = 0;
                         channel_stats[ch_offset][1] = 0.0;
                         channel_stats[ch_offset][2] = 0.0;
@@ -446,7 +536,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                     }
                 }
             } else {
-                // SLOW PATH: Manual iteration with mask checking (for complex masks)
+                // SLOW PATH: Manual iteration with explicit mask checking
                 casacore::IPosition mask_pos(2);
                 
                 for (int ch_offset = 0; ch_offset < num_channels; ++ch_offset) {
@@ -466,22 +556,20 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                         for (int x = 0; x < region_width; ++x) {
                             int mask_x = x + x_min - origin[0];
                             
-                            // Early exit if outside mask bounds
                             if (mask_x < 0 || mask_x >= mask_shape[0]) {
                                 continue;
                             }
                             
-                            // Reuse IPosition object instead of creating new one each time
+                            // Check mask value
                             mask_pos[0] = mask_x;
                             mask_pos[1] = mask_y;
                             if (!mask(mask_pos)) {
                                 continue;
                             }
                             
-                            // Calculate linear index (optimized for common case)
+                            // Calculate linear index
                             size_t linear_index;
                             if (array_shape.size() == 4 || array_shape.size() == 3) {
-                                // Most common case: [x, y, ch] or [x, y, ch, stokes]
                                 linear_index = x + y * region_width + ch_offset * region_width * region_height;
                             } else if (array_shape.size() == 5) {
                                 linear_index = ch_offset * region_width * region_height + x * region_height + y;
@@ -500,7 +588,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                         }
                     }
                     
-                    // Store results: [num_pixels, sum, sum_sq, min, max]
+                    // Store results
                     channel_stats[ch_offset][0] = valid_count;
                     channel_stats[ch_offset][1] = sum;
                     channel_stats[ch_offset][2] = sum_sq;
@@ -535,21 +623,25 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             
             // Launch parallel reads AND computation using std::async
             std::vector<std::future<std::pair<bool, std::vector<std::vector<double>>>>> futures;
+            std::vector<std::pair<int, int>> thread_ranges;  // Track actual ranges for result collection
+            
             for (int thread_idx = 0; thread_idx < PARALLEL_THREADS; ++thread_idx) {
                 int thread_start_z = batch_start + thread_idx * CHANNELS_PER_THREAD;
                 int thread_end_z = std::min(thread_start_z + CHANNELS_PER_THREAD - 1, z_end);
                 
-                if (thread_start_z <= z_end) {
+                // Only launch if there are channels to process AND within valid range
+                if (thread_start_z <= z_end && thread_start_z <= thread_end_z) {
+                    thread_ranges.push_back({thread_start_z, thread_end_z});
                     futures.push_back(std::async(std::launch::async, read_and_compute_batch, thread_start_z, thread_end_z));
                 }
             }
             
             // Wait for all threads to complete and collect results
-            for (int thread_idx = 0; thread_idx < futures.size(); ++thread_idx) {
-                int thread_start_z = batch_start + thread_idx * CHANNELS_PER_THREAD;
-                int thread_end_z = std::min(thread_start_z + CHANNELS_PER_THREAD - 1, z_end);
+            for (size_t future_idx = 0; future_idx < futures.size(); ++future_idx) {
+                int thread_start_z = thread_ranges[future_idx].first;
+                int thread_end_z = thread_ranges[future_idx].second;
                 
-                auto result = futures[thread_idx].get();
+                auto result = futures[future_idx].get();
                 
                 if (!result.first) {
                     spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to process channels {}-{}", 
@@ -558,11 +650,18 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                     return false;
                 }
                 
-                // Copy computed statistics to result vectors
+                // Copy computed statistics to result vectors with bounds checking
                 const std::vector<std::vector<double>>& channel_stats = result.second;
-                for (int ch_offset = 0; ch_offset < channel_stats.size(); ++ch_offset) {
+                for (size_t ch_offset = 0; ch_offset < channel_stats.size(); ++ch_offset) {
                     int z_index = thread_start_z + ch_offset;
                     int profile_index = z_index - z_start;
+                    
+                    // Bounds check to prevent index out of range
+                    if (profile_index < 0 || profile_index >= profile_size) {
+                        spdlog::error("Index out of bounds: profile_index={} (valid range: 0-{}), z_index={}, z_start={}",
+                                     profile_index, profile_size - 1, z_index, z_start);
+                        continue;
+                    }
                     
                     // Extract stats: [num_pixels, sum, sum_sq, min, max]
                     num_pixels_vec[profile_index] = channel_stats[ch_offset][0];
@@ -570,6 +669,13 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                     sum_sq_vec[profile_index] = channel_stats[ch_offset][2];
                     min_vec[profile_index] = channel_stats[ch_offset][3];
                     max_vec[profile_index] = channel_stats[ch_offset][4];
+                    
+                    // Log first few channel results for debugging
+                    if (profile_index < 3) {
+                        spdlog::info("Extracted channel {}: num_pixels={:.0f}, sum={:.6e}, min={:.6e}, max={:.6e}",
+                                    profile_index, channel_stats[ch_offset][0], channel_stats[ch_offset][1],
+                                    channel_stats[ch_offset][3], channel_stats[ch_offset][4]);
+                    }
                 }
                 // result and channel_stats will be destroyed here after copying
                 // Large batch_array was already freed when lambda returned
@@ -589,6 +695,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         }
         
         // All channels processed - calculate derived statistics (like Hdf5Loader)
+        spdlog::info("=== Computing derived statistics for {} channels ===", profile_size);
         for (int z = 0; z < profile_size; ++z) {
             uint64_t num_pixels = num_pixels_vec[z];
             if (num_pixels > 0) {
@@ -603,6 +710,24 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 // Calculate flux density if beam area is available
                 if (has_flux) {
                     flux_vec[z] = sum / beam_area;
+                }
+                
+                // Output detailed values for first 5 channels and every 10th channel
+                if (z < 5 || z % 10 == 0) {
+                    spdlog::info("Channel {}: num_pixels={}, sum={:.6e}, sum_sq={:.6e}",
+                                z, num_pixels, sum, sum_sq);
+                    spdlog::info("  -> min={:.6e}, max={:.6e}, mean={:.6e}",
+                                min_vec[z], max_vec[z], mean_vec[z]);
+                    spdlog::info("  -> rms={:.6e}, sigma={:.6e}, extrema={:.6e}",
+                                rms_vec[z], sigma_vec[z], extrema_vec[z]);
+                    if (has_flux) {
+                        spdlog::info("  -> flux={:.6e} (sum/beam_area, beam_area={:.6e})",
+                                    flux_vec[z], beam_area);
+                    }
+                }
+            } else {
+                if (z < 5) {
+                    spdlog::warn("Channel {}: num_pixels=0 (no valid pixels)", z);
                 }
             }
         }
