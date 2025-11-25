@@ -1968,16 +1968,22 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
                 return false;
             }
             
-            // Create box for entire channel - freq_channel and stokes_channel are already correct ZARR coordinates
+            // Create box for 4 channels - read freq_channel through freq_channel+3
+            int num_cache_channels = std::min(4, static_cast<int>(_original_zarr_shape[1]) - freq_channel);
             std::vector<tensorstore::Index> box_origin = {0, freq_channel, stokes_channel, 0, 0};
-            std::vector<tensorstore::Index> box_shape = {1, 1, 1, _cache_width, _cache_height};
+            std::vector<tensorstore::Index> box_shape = {1, num_cache_channels, 1, _cache_width, _cache_height};
             
-            spdlog::debug("CACHE LOADING COORDINATES:");
-            spdlog::debug("  ZARR 5D cache box: origin=[{},{},{},{},{}], shape=[{},{},{},{},{}]", 
+            spdlog::info("CACHE LOADING {} CHANNELS starting from freq={}", num_cache_channels, freq_channel);
+            spdlog::info("  ZARR 5D cache box: origin=[{},{},{},{},{}], shape=[{},{},{},{},{}]", 
                          box_origin[0], box_origin[1], box_origin[2], box_origin[3], box_origin[4],
                          box_shape[0], box_shape[1], box_shape[2], box_shape[3], box_shape[4]);
-            spdlog::debug("  This reads: time={}, freq={}, pol={}, l=[0,{}), m=[0,{})", 
-                         0, freq_channel, stokes_channel, _cache_width, _cache_height);
+            spdlog::info("  This reads ZARR coordinates:");
+            spdlog::info("    time: [0, 1)");
+            spdlog::info("    freq: [{}, {})", freq_channel, freq_channel + num_cache_channels);
+            spdlog::info("    stokes: [{}, {})", stokes_channel, stokes_channel + 1);
+            spdlog::info("    l (width/x): [0, {})", _cache_width);
+            spdlog::info("    m (height/y): [0, {})", _cache_height);
+            spdlog::info("  So y=1000 in ZARR corresponds to m=1000 coordinate");
             
             tensorstore::Box<> cache_box(box_origin, box_shape);
             
@@ -1997,29 +2003,116 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
             
             auto zarr_array = std::move(read_result.value());
             
+            // DEBUG: Comprehensive TensorStore data validation
+            const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
+            
+            // Check array dimensions from TensorStore
+            spdlog::info("DEBUG: TensorStore array info:");
+            spdlog::info("  Shape: {}", zarr_array.shape().size());
+            for (size_t i = 0; i < zarr_array.shape().size(); ++i) {
+                spdlog::info("    Dimension[{}]: {}", i, zarr_array.shape()[i]);
+            }
+            spdlog::info("  Total elements: {}", zarr_array.num_elements());
+            spdlog::info("  Expected elements: {} * {} * {} = {}", 
+                        num_cache_channels, _cache_width, _cache_height,
+                        num_cache_channels * _cache_width * _cache_height);
+            
+            // CRITICAL: TensorStore 5D array layout analysis
+            // Shape: [time=1, freq=4, stokes=1, l=7763, m=4742]
+            // Need to determine memory layout order
+            spdlog::info("DEBUG: Analyzing TensorStore memory layout for 5D array:");
+            spdlog::info("  Requested box: time=[0,1), freq=[0,{}), stokes=[0,1), l=[0,{}), m=[0,{})", 
+                        num_cache_channels, _cache_width, _cache_height);
+            
+            // Test different possible layouts by checking known boundary positions
+            // For this image, boundaries (y=0, y=last, x=0, x=last) should have NaN
+            
+            if (_cache_height > 1000 && _cache_width > 1000) {
+                // Try different stride calculations to find correct layout
+                spdlog::info("DEBUG: Testing different memory layout interpretations:");
+                
+                // Layout 1: Row-major C-style [time][freq][stokes][l][m] 
+                // Element at (t=0, f=0, s=0, l=x, m=y) is at: t*F*S*L*M + f*S*L*M + s*L*M + l*M + m
+                spdlog::info("  Layout 1 (C-style row-major [time][freq][stokes][l][m]):");
+                size_t layout1_stride_freq = _cache_width * _cache_height;  // S*L*M (stokes=1)
+                size_t layout1_y0_offset = 0;  // y=0, x=0, first channel
+                size_t layout1_y1000_offset = 1000;  // y=1000, x=0
+                size_t layout1_ylast_offset = _cache_height - 1;  // y=last, x=0
+                
+                spdlog::info("    y=0, x=0: {:.6e} (isnan={})", 
+                            src_data[layout1_y0_offset], std::isnan(src_data[layout1_y0_offset]));
+                spdlog::info("    y=1000, x=0: {:.6e} (isnan={})", 
+                            src_data[layout1_y1000_offset], std::isnan(src_data[layout1_y1000_offset]));
+                spdlog::info("    y=last({}), x=0: {:.6e} (isnan={})", 
+                            _cache_height - 1, src_data[layout1_ylast_offset], std::isnan(src_data[layout1_ylast_offset]));
+                
+                // Layout 2: Row-major with different axis order [time][freq][stokes][m][l]
+                // Element at (t=0, f=0, s=0, l=x, m=y) is at: t*F*S*M*L + f*S*M*L + s*M*L + m*L + l
+                spdlog::info("  Layout 2 (row-major [time][freq][stokes][m][l]):");
+                size_t layout2_stride_m = _cache_width;  // L
+                size_t layout2_y0_offset = 0 * layout2_stride_m + 0;  // y=0, x=0
+                size_t layout2_y1000_offset = 1000 * layout2_stride_m + 0;  // y=1000, x=0
+                size_t layout2_ylast_offset = (_cache_height - 1) * layout2_stride_m + 0;  // y=last, x=0
+                
+                spdlog::info("    y=0, x=0: {:.6e} (isnan={})", 
+                            src_data[layout2_y0_offset], std::isnan(src_data[layout2_y0_offset]));
+                spdlog::info("    y=1000, x=0: {:.6e} (isnan={})", 
+                            src_data[layout2_y1000_offset], std::isnan(src_data[layout2_y1000_offset]));
+                spdlog::info("    y=last({}), x=0: {:.6e} (isnan={})", 
+                            _cache_height - 1, src_data[layout2_ylast_offset], std::isnan(src_data[layout2_ylast_offset]));
+                
+                // Check which layout gives NaN at boundaries
+                bool layout1_has_boundary_nan = std::isnan(src_data[layout1_y0_offset]) && std::isnan(src_data[layout1_ylast_offset]);
+                bool layout2_has_boundary_nan = std::isnan(src_data[layout2_y0_offset]) && std::isnan(src_data[layout2_ylast_offset]);
+                
+                spdlog::info("  Layout 1 boundary check: {}", layout1_has_boundary_nan ? "CORRECT (NaN at y=0 and y=last)" : "WRONG");
+                spdlog::info("  Layout 2 boundary check: {}", layout2_has_boundary_nan ? "CORRECT (NaN at y=0 and y=last)" : "WRONG");
+            }
+            
             // Verify data type
             if (zarr_array.dtype().name() != "float32") {
                 spdlog::error("Unexpected data type in cache: {}", zarr_array.dtype().name());
                 return false;
             }
             
-            // Copy data to cache
-            size_t total_elements = _cache_width * _cache_height;
+            // Copy data to cache (now contains num_cache_channels channels)
+            size_t total_elements = num_cache_channels * _cache_width * _cache_height;
             _channel_cache.resize(total_elements);
             
-            const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
             std::copy(src_data, src_data + total_elements, _channel_cache.data());
             
-            // Store the cached channel identifier
+            // Store the cached channel identifier and number of channels
             _cached_channel = freq_channel * 1000 + stokes_channel;
+            _num_cached_channels = num_cache_channels;
             _cache_start_x = 0;  // Full channel cache starts at origin
             _cache_start_y = 0;
             _channel_cache_loaded = true;
             _is_full_channel_cache = true;  // This is a full channel cache
             
-            spdlog::info("Loaded channel [freq={}, stokes={}] cache: {}x{} pixels ({} MB)", 
-                        freq_channel, stokes_channel, _cache_width, _cache_height, 
+            spdlog::info("Loaded {} channels [freq={}-{}, stokes={}] cache: {}x{} pixels per channel ({} MB total)", 
+                        num_cache_channels, freq_channel, freq_channel + num_cache_channels - 1, stokes_channel,
+                        _cache_width, _cache_height, 
                         (total_elements * sizeof(float)) / (1024 * 1024));
+            
+            // DEBUG: Output y=1000 x-profile for first channel to verify cache storage
+            if (_cache_height > 1000) {
+                spdlog::info("DEBUG: Channel 0 (freq={}) y=1000 x-profile (first 10 pixels):", freq_channel);
+                size_t row_offset = 1000 * _cache_width;
+                for (int x = 0; x < std::min(10, static_cast<int>(_cache_width)); ++x) {
+                    float val = _channel_cache[row_offset + x];
+                    spdlog::info("  x={}: {:.6e} (isnan={})", x, val, std::isnan(val));
+                }
+                
+                // Verify by reading directly from cache
+                spdlog::info("DEBUG: Verifying by re-reading y=1000 x-profile from cache:");
+                for (int x = 0; x < std::min(10, static_cast<int>(_cache_width)); ++x) {
+                    size_t cache_idx = row_offset + x;
+                    if (cache_idx < _channel_cache.size()) {
+                        float val = _channel_cache[cache_idx];
+                        spdlog::info("  x={}: {:.6e} (isnan={})", x, val, std::isnan(val));
+                    }
+                }
+            }
             
             // // DEBUG: Check TensorStore data layout and verify expected NaN boundaries
             // spdlog::debug("TENSORSTORE DATA LAYOUT DEBUG:");

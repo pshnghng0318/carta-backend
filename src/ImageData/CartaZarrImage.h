@@ -89,6 +89,7 @@ private:
     std::vector<float> _channel_cache;     // Cached data for current region
     bool _channel_cache_loaded = false;    // Whether cache is loaded
     int _cached_channel = 0;               // Which channel is cached (default: first channel)
+    int _num_cached_channels = 1;          // Number of channels in cache (for multi-channel caching)
     int _cache_width = 0;                  // Width of cached data
     int _cache_height = 0;                 // Height of cached data
     int _cache_start_x = 0;                // Start X coordinate of cached region

@@ -399,18 +399,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             const float* data_ptr = batch_array.data();
             casacore::IPosition array_shape = batch_array.shape();
             
-            // DEBUG: Log array shape received from TensorStore
-            spdlog::info("BATCH READ: array_shape={} (size={}), num_channels={}, region={}x{}", 
-                        array_shape.toString(), array_shape.size(), num_channels, region_width, region_height);
-            spdlog::info("BATCH READ: array_shape dimensions breakdown:");
-            for (size_t i = 0; i < array_shape.size(); ++i) {
-                spdlog::info("  array_shape[{}] = {}", i, array_shape[i]);
-            }
-            spdlog::info("BATCH READ: First 10 raw values from batch_array:");
-            for (int i = 0; i < std::min(10, static_cast<int>(batch_array.size())); ++i) {
-                spdlog::info("  raw[{}] = {:.6e} (isnan={})", i, data_ptr[i], std::isnan(data_ptr[i]));
-            }
-            
             // Check if we need to apply mask (if mask covers the entire region, use xtensor fast path)
             bool simple_rectangular_region = true;
             int mask_fail_x = -1, mask_fail_y = -1;
@@ -443,14 +431,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                         break;
                     }
                 }
-            }
-            
-            spdlog::info("MASK CHECK: simple_rectangular_region={}, mask_shape={}, region={}x{}, origin=[{},{}], x_min={}, y_min={}",
-                        simple_rectangular_region, mask_shape.toString(), region_width, region_height, 
-                        origin[0], origin[1], x_min, y_min);
-            if (!simple_rectangular_region) {
-                spdlog::info("MASK CHECK FAILED: reason='{}', fail_position=({},{}), using SLOW PATH with mask filtering", 
-                            mask_fail_reason, mask_fail_x, mask_fail_y);
             }
             
             if (simple_rectangular_region) {
@@ -486,20 +466,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                         }
                     }
                     
-                    // Debug output for first channel
-                    if (ch_offset == 0) {
-                        spdlog::info("XTENSOR: Channel 0 collected {} valid pixels out of {} total",
-                                    valid_pixels.size(), region_width * region_height);
-                        if (valid_pixels.size() > 0) {
-                            spdlog::info("  First 5 valid values: {:.6e}, {:.6e}, {:.6e}, {:.6e}, {:.6e}",
-                                        valid_pixels[0], 
-                                        valid_pixels.size() > 1 ? valid_pixels[1] : 0,
-                                        valid_pixels.size() > 2 ? valid_pixels[2] : 0,
-                                        valid_pixels.size() > 3 ? valid_pixels[3] : 0,
-                                        valid_pixels.size() > 4 ? valid_pixels[4] : 0);
-                        }
-                    }
-                    
                     // Step 2: Use xtensor on clean data (no NaN, all masked pixels filtered)
                     uint64_t valid_count = valid_pixels.size();
                     
@@ -514,20 +480,12 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                         float min_val = xt::amin(valid_arr)();
                         float max_val = xt::amax(valid_arr)();
                         
-                        if (ch_offset == 0) {
-                            spdlog::info("XTENSOR: Channel 0 stats - sum={:.6e}, min={:.6e}, max={:.6e}",
-                                        sum, min_val, max_val);
-                        }
-                        
                         channel_stats[ch_offset][0] = valid_count;
                         channel_stats[ch_offset][1] = sum;
                         channel_stats[ch_offset][2] = sum_sq;
                         channel_stats[ch_offset][3] = min_val;
                         channel_stats[ch_offset][4] = max_val;
                     } else {
-                        if (ch_offset < 3) {
-                            spdlog::warn("XTENSOR: Channel {} has zero valid pixels!", ch_offset);
-                        }
                         channel_stats[ch_offset][0] = 0;
                         channel_stats[ch_offset][1] = 0.0;
                         channel_stats[ch_offset][2] = 0.0;
@@ -695,7 +653,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         }
         
         // All channels processed - calculate derived statistics (like Hdf5Loader)
-        spdlog::info("=== Computing derived statistics for {} channels ===", profile_size);
         for (int z = 0; z < profile_size; ++z) {
             uint64_t num_pixels = num_pixels_vec[z];
             if (num_pixels > 0) {
@@ -710,24 +667,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 // Calculate flux density if beam area is available
                 if (has_flux) {
                     flux_vec[z] = sum / beam_area;
-                }
-                
-                // Output detailed values for first 5 channels and every 10th channel
-                if (z < 5 || z % 10 == 0) {
-                    spdlog::info("Channel {}: num_pixels={}, sum={:.6e}, sum_sq={:.6e}",
-                                z, num_pixels, sum, sum_sq);
-                    spdlog::info("  -> min={:.6e}, max={:.6e}, mean={:.6e}",
-                                min_vec[z], max_vec[z], mean_vec[z]);
-                    spdlog::info("  -> rms={:.6e}, sigma={:.6e}, extrema={:.6e}",
-                                rms_vec[z], sigma_vec[z], extrema_vec[z]);
-                    if (has_flux) {
-                        spdlog::info("  -> flux={:.6e} (sum/beam_area, beam_area={:.6e})",
-                                    flux_vec[z], beam_area);
-                    }
-                }
-            } else {
-                if (z < 5) {
-                    spdlog::warn("Channel {}: num_pixels=0 (no valid pixels)", z);
                 }
             }
         }
@@ -1014,6 +953,194 @@ bool ZarrLoader::GetSpectralDataOptimized(std::vector<float>& data, int stokes, 
         
     } catch (std::exception& e) {
         spdlog::error("ZarrLoader::GetSpectralDataOptimized: Exception: {}", e.what());
+        return false;
+    }
+}
+
+bool ZarrLoader::GetSpatialProfileX(std::vector<float>& data, int x_start, int x_end, int y, int z, int stokes, std::mutex& image_mutex) {
+    // Read X spatial profile (horizontal line) directly from TensorStore
+    std::lock_guard<std::mutex> lock(image_mutex);
+    
+    try {
+        if (!_image) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: No image available");
+            return false;
+        }
+        
+        auto zarr_image = std::dynamic_pointer_cast<CartaZarrImage>(_image);
+        if (!zarr_image) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: Image is not a CartaZarrImage");
+            return false;
+        }
+        
+        casacore::IPosition shape = _image->shape();
+        int img_width = shape[0];
+        int img_height = shape[1];
+        
+        // Validate parameters
+        if (y < 0 || y >= img_height) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: y={} out of bounds (height={})", y, img_height);
+            return false;
+        }
+        
+        if (x_start < 0 || x_end >= img_width || x_start > x_end) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: Invalid x range [{},{}] (width={})", x_start, x_end, img_width);
+            return false;
+        }
+        
+        if (shape.size() > 3 && (stokes < 0 || stokes >= shape[3])) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: Stokes {} out of bounds (max: {})", stokes, shape[3] - 1);
+            return false;
+        }
+        
+        int profile_length = x_end - x_start + 1;
+        data.resize(profile_length);
+        
+        // Read horizontal line from TensorStore
+        casacore::IPosition start, length;
+        
+        if (shape.size() == 5) {
+            // 5D ZARR: [time, freq, stokes, l, m] where l=x(width), m=y(height)
+            start = casacore::IPosition(5, 0, z, stokes, x_start, y);
+            length = casacore::IPosition(5, 1, 1, 1, profile_length, 1);
+        } else if (shape.size() == 4) {
+            // 4D: [x, y, z, stokes]
+            start = casacore::IPosition(4, x_start, y, z, stokes);
+            length = casacore::IPosition(4, profile_length, 1, 1, 1);
+        } else if (shape.size() == 3) {
+            // 3D: [x, y, z]
+            start = casacore::IPosition(3, x_start, y, z);
+            length = casacore::IPosition(3, profile_length, 1, 1);
+        } else if (shape.size() == 2) {
+            // 2D: [x, y]
+            start = casacore::IPosition(2, x_start, y);
+            length = casacore::IPosition(2, profile_length, 1);
+        } else {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: Unsupported dimensions: {}", shape.size());
+            return false;
+        }
+        
+        casacore::Array<float> profile_array;
+        casacore::Slicer slicer(start, length);
+        
+        spdlog::debug("GetSpatialProfileX: Reading x=[{},{}] at y={}, z={}, stokes={}", x_start, x_end, y, z, stokes);
+        
+        // Use direct TensorStore read to bypass cache
+        if (!zarr_image->readPixelFromTensorStore(profile_array, slicer)) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: readPixelFromTensorStore failed");
+            return false;
+        }
+        
+        if (profile_array.nelements() != profile_length) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: Expected {} elements, got {}", profile_length, profile_array.nelements());
+            return false;
+        }
+        
+        // Copy to output vector
+        const float* array_data = profile_array.data();
+        for (int i = 0; i < profile_length; ++i) {
+            data[i] = array_data[i];
+        }
+        
+        spdlog::debug("GetSpatialProfileX: Success - read {} pixels", profile_length);
+        return true;
+        
+    } catch (std::exception& e) {
+        spdlog::error("ZarrLoader::GetSpatialProfileX: Exception: {}", e.what());
+        return false;
+    }
+}
+
+bool ZarrLoader::GetSpatialProfileY(std::vector<float>& data, int x, int y_start, int y_end, int z, int stokes, std::mutex& image_mutex) {
+    // Read Y spatial profile (vertical line) directly from TensorStore
+    std::lock_guard<std::mutex> lock(image_mutex);
+    
+    try {
+        if (!_image) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: No image available");
+            return false;
+        }
+        
+        auto zarr_image = std::dynamic_pointer_cast<CartaZarrImage>(_image);
+        if (!zarr_image) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: Image is not a CartaZarrImage");
+            return false;
+        }
+        
+        casacore::IPosition shape = _image->shape();
+        int img_width = shape[0];
+        int img_height = shape[1];
+        
+        // Validate parameters
+        if (x < 0 || x >= img_width) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: x={} out of bounds (width={})", x, img_width);
+            return false;
+        }
+        
+        if (y_start < 0 || y_end >= img_height || y_start > y_end) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: Invalid y range [{},{}] (height={})", y_start, y_end, img_height);
+            return false;
+        }
+        
+        if (shape.size() > 3 && (stokes < 0 || stokes >= shape[3])) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: Stokes {} out of bounds (max: {})", stokes, shape[3] - 1);
+            return false;
+        }
+        
+        int profile_length = y_end - y_start + 1;
+        data.resize(profile_length);
+        
+        // Read vertical line from TensorStore
+        casacore::IPosition start, length;
+        
+        if (shape.size() == 5) {
+            // 5D ZARR: [time, freq, stokes, l, m] where l=x(width), m=y(height)
+            start = casacore::IPosition(5, 0, z, stokes, x, y_start);
+            length = casacore::IPosition(5, 1, 1, 1, 1, profile_length);
+        } else if (shape.size() == 4) {
+            // 4D: [x, y, z, stokes]
+            start = casacore::IPosition(4, x, y_start, z, stokes);
+            length = casacore::IPosition(4, 1, profile_length, 1, 1);
+        } else if (shape.size() == 3) {
+            // 3D: [x, y, z]
+            start = casacore::IPosition(3, x, y_start, z);
+            length = casacore::IPosition(3, 1, profile_length, 1);
+        } else if (shape.size() == 2) {
+            // 2D: [x, y]
+            start = casacore::IPosition(2, x, y_start);
+            length = casacore::IPosition(2, 1, profile_length);
+        } else {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: Unsupported dimensions: {}", shape.size());
+            return false;
+        }
+        
+        casacore::Array<float> profile_array;
+        casacore::Slicer slicer(start, length);
+        
+        spdlog::debug("GetSpatialProfileY: Reading y=[{},{}] at x={}, z={}, stokes={}", y_start, y_end, x, z, stokes);
+        
+        // Use direct TensorStore read to bypass cache
+        if (!zarr_image->readPixelFromTensorStore(profile_array, slicer)) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: readPixelFromTensorStore failed");
+            return false;
+        }
+        
+        if (profile_array.nelements() != profile_length) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: Expected {} elements, got {}", profile_length, profile_array.nelements());
+            return false;
+        }
+        
+        // Copy to output vector
+        const float* array_data = profile_array.data();
+        for (int i = 0; i < profile_length; ++i) {
+            data[i] = array_data[i];
+        }
+        
+        spdlog::debug("GetSpatialProfileY: Success - read {} pixels", profile_length);
+        return true;
+        
+    } catch (std::exception& e) {
+        spdlog::error("ZarrLoader::GetSpatialProfileY: Exception: {}", e.what());
         return false;
     }
 }
