@@ -110,10 +110,15 @@ private:
     bool hasFileChanged();
     bool parseWCSFromZattrs(const nlohmann::json& zattrs);
     bool parseWCSFromCoordinateArrays(const std::filesystem::path& ra_path, const std::filesystem::path& dec_path, const std::filesystem::path& freq_path);
+    bool parseWCSFromLMArrays(const std::filesystem::path& l_path, const std::filesystem::path& m_path, const std::filesystem::path& freq_path);
     bool parseWCSFromMetadata(const nlohmann::json& zattrs);
     bool buildDirectionCoordinateFromArrays(double ra_rad, double dec_rad, double freq_hz, 
                                            double ra_cdelt_deg, double dec_cdelt_deg, double freq_cdelt_hz,
                                            size_t height, size_t width, size_t depth);
+    bool buildDirectionCoordinateFromLM(double ref_ra_rad, double ref_dec_rad, double freq_hz,
+                                       double l_cdelt_deg, double m_cdelt_deg, double freq_cdelt_hz,
+                                       double crpix_l, double crpix_m,
+                                       size_t nl, size_t nm, size_t depth);
     void createMinimalCoordinateSystem();
     void initializeTensorStore();
     
@@ -124,6 +129,9 @@ private:
     
     // Get direction reference system from ZARR metadata (handles ICRS, FK5, FK4)
     casacore::MDirection::Types GetDirectionType();
+    
+    // Get projection type from ZARR metadata (handles SIN, CAR, TAN, etc.)
+    casacore::Projection GetProjectionType();
     
     // Channel cache methods - now support region-based caching
     bool loadChannelCache(int freq_channel = 0, int stokes_channel = 0);

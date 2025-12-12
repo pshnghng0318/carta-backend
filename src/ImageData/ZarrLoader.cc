@@ -550,13 +550,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         spdlog::info("GetRegionSpectralData: Returned {} statistics types: NumPixels, NanCount, Sum, Mean, RMS, Sigma, SumSq, Min, Max, Extrema{}",
                      results.size(), has_flux ? ", FluxDensity" : "");
         
-        // Sample first 3 channels to verify all stats are valid
-        for (int i = 0; i < std::min(3, profile_size); ++i) {
-            spdlog::info("  Channel {}: NumPixels={:.0f}, Sum={:.6e}, Mean={:.6e}, RMS={:.6e}, Sigma={:.6e}, Min={:.6e}, Max={:.6e}{}",
-                        i, num_pixels_vec[i], sum_vec[i], mean_vec[i], rms_vec[i], sigma_vec[i], min_vec[i], max_vec[i],
-                        has_flux ? fmt::format(", FluxDensity={:.6e}", flux_vec[i]) : "");
-        }
-        
         return true;
         
     } catch (std::exception& e) {

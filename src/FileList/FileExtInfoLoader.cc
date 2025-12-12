@@ -32,6 +32,33 @@
 
 using namespace carta;
 
+// Helper function to convert casacore MFrequency::Types to FITS standard 8-character names
+static std::string GetFitsSpectralFrameName(casacore::MFrequency::Types freq_type) {
+    switch (freq_type) {
+        case casacore::MFrequency::TOPO:
+            return "TOPOCENT";
+        case casacore::MFrequency::GEO:
+            return "GEOCENTR";
+        case casacore::MFrequency::BARY:
+            return "BARYCENT";
+        case casacore::MFrequency::GALACTO:
+            return "GALACTOC";
+        case casacore::MFrequency::LGROUP:
+            return "LOCALGRP";
+        case casacore::MFrequency::CMB:
+            return "CMBDIPOL";
+        case casacore::MFrequency::REST:
+            return "SOURCE";
+        case casacore::MFrequency::LSRK:
+            return "LSRK";
+        case casacore::MFrequency::LSRD:
+            return "LSRD";
+        default:
+            // For unknown types, fall back to casacore name
+            return casacore::MFrequency::showType(freq_type);
+    }
+}
+
 FileExtInfoLoader::FileExtInfoLoader(std::shared_ptr<FileLoader> loader) : _loader(loader) {}
 
 bool FileExtInfoLoader::FillFitsFileInfoMap(
@@ -947,7 +974,8 @@ void FileExtInfoLoader::AddComputedEntries(CARTA::FileInfoExtended& extended_inf
             entry->set_entry_type(CARTA::EntryType::STRING);
         }
         if (coord_system.hasSpectralAxis()) {
-            casacore::String spectral_frame = casacore::MFrequency::showType(coord_system.spectralCoordinate().frequencySystem(true));
+            casacore::MFrequency::Types freq_type = coord_system.spectralCoordinate().frequencySystem(true);
+            std::string spectral_frame = GetFitsSpectralFrameName(freq_type);
             auto entry = extended_info.add_computed_entries();
             entry->set_name("Spectral frame");
             entry->set_value(spectral_frame);
