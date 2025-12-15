@@ -8,6 +8,7 @@
 #include "CartaZarrImage.h"
 #include "Logger/Logger.h"
 #include "Util/Image.h"
+#include "Main/ProgramSettings.h"
 
 #include <filesystem>
 #include <memory>
@@ -321,11 +322,11 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             num_threads = 1;  // 1-3 CPUs: use 1 thread
         }
         
-        // FIXED CONFIGURATION: 4 CPUs, each reading 8 channels
-        // Total batch size = 4 CPUs × 8 channels = 32 channels per batch
+        // CONFIGURABLE: Number of channels per CPU thread (via --cpu_ch flag)
+        // Get from ProgramSettings, default is 8 channels per CPU
         const int PARALLEL_THREADS = 4;  // Fixed: use 4 CPUs
-        const int CHANNELS_PER_THREAD = 8;  // Fixed: 8 channels per CPU
-        const int BATCH_SIZE = 32;  // Fixed: 32 channels per batch (4×8)
+        const int CHANNELS_PER_THREAD = carta::ProgramSettings::GetInstance().cpu_ch;
+        const int BATCH_SIZE = PARALLEL_THREADS * CHANNELS_PER_THREAD;  // Dynamic batch size
         
         size_t memory_per_batch_mb = (BATCH_SIZE * region_area * sizeof(float)) / (1024 * 1024);
         double memory_per_batch_gb = memory_per_batch_mb / 1024.0;
