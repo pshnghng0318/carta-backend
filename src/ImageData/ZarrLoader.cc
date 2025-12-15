@@ -352,7 +352,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
 #endif
         
         // Process channels in batches - each thread reads CHANNELS_PER_THREAD channels at once
-        std::vector<bool> channel_success(profile_size, false);
+        // Use uint8_t instead of bool for thread-safety (vector<bool> is not thread-safe even for different indices)
+        std::vector<uint8_t> channel_success(profile_size, 0);
         
         // Process all channels in parallel batches
         for (int batch_start = z_start; batch_start <= z_end; batch_start += BATCH_SIZE) {
@@ -395,8 +396,13 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 casacore::Slicer slicer(start, length);
                 
                 if (!zarr_image->readPixelFromTensorStore(batch_array, slicer)) {
+                    #pragma omp critical
+                    {
+                        spdlog::error("  Thread {}: Failed readPixelFromTensorStore for channels {}-{} (start={}, length={})",
+                                     thread_idx, thread_start_z, thread_end_z, start.toString(), length.toString());
+                    }
                     for (int z = thread_start_z; z <= thread_end_z; ++z) {
-                        channel_success[z - z_start] = false;
+                        channel_success[z - z_start] = 0;
                     }
                     continue;
                 }
@@ -412,6 +418,15 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 for (int ch_offset = 0; ch_offset < num_channels; ++ch_offset) {
                     int z = thread_start_z + ch_offset;
                     int profile_index = z - z_start;
+                    
+                    if (profile_index < 0 || profile_index >= profile_size) {
+                        #pragma omp critical
+                        {
+                            spdlog::error("Thread {}: Invalid profile_index {} for channel {} (z_start={}, profile_size={})",
+                                         thread_idx, profile_index, z, z_start, profile_size);
+                        }
+                        continue;
+                    }
                     
                     // Get pointer to this channel's data
                     const float* channel_data = data_ptr + (ch_offset * pixels_per_channel);
@@ -461,7 +476,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                         max_vec[profile_index] = std::numeric_limits<float>::quiet_NaN();
                     }
                     
-                    channel_success[profile_index] = true;
+                    channel_success[profile_index] = 1;
                 }
                 
                 auto compute_end = std::chrono::high_resolution_clock::now();
@@ -494,10 +509,24 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         bool all_success = true;
         for (size_t i = 0; i < channel_success.size(); ++i) {
             if (!channel_success[i]) {
-                spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to process channel {}", z_start + i);
+                spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to process channel {} (profile_index={}, channel_success[{}]={})", 
+                    z_start + i, i, i, channel_success[i]);
                 all_success = false;
             }
         }
+        
+        // Debug: Show which channels succeeded
+        spdlog::debug("Channel success status (z_start={}, total={}): [{}]", 
+            z_start, channel_success.size(),
+            [&]() {
+                std::string status;
+                for (size_t i = 0; i < channel_success.size(); ++i) {
+                    if (i > 0) status += ", ";
+                    status += std::to_string(z_start + i) + ":" + (channel_success[i] ? "OK" : "FAIL");
+                }
+                return status;
+            }()
+        );
         
         if (!all_success) {
             progress = 1.0;
