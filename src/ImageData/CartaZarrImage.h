@@ -31,7 +31,9 @@ namespace carta {
 class CartaZarrImage : public casacore::ImageInterface<float> {
 public:
     explicit CartaZarrImage(const std::string& filename);
-    virtual ~CartaZarrImage() = default;
+    // Copy constructor for efficient SubImage creation (shares TensorStore and cache)
+    CartaZarrImage(const CartaZarrImage& other);
+    virtual ~CartaZarrImage();
 
     // ImageInterface implementation
     casacore::String imageType() const override;
@@ -99,6 +101,9 @@ private:
     int _cache_freq_start = 0;             // Starting frequency index in 4D cache
     int _cache_stokes_start = 0;           // Starting stokes index in 4D cache
     bool _is_full_channel_cache = false;   // Whether cache contains full channel or just a region
+    
+    // Copy tracking - whether this is a shallow copy sharing TensorStore and cache
+    bool _is_copy = false;
     
     // File modification time tracking for metadata caching
     std::time_t _file_last_modified = 0;

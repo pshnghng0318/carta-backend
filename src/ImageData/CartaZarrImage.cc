@@ -44,7 +44,7 @@ using namespace casacore;
 
 namespace carta {
 
-CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<float>(), _name(filename) {
+CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<float>(), _name(filename), _is_copy(false) {
     // Initialize TensorStore context with memory limit
     // Note: Full context initialization happens in initializeTensorStore()
     // This is just a placeholder that will be replaced
@@ -195,6 +195,50 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
     // Load brightness unit and image info (beam) once per file at the end of constructor
     readBrightnessUnitIfNeeded();
     setupImageInfoIfNeeded();
+}
+
+// Copy constructor for efficient SubImage creation (shares TensorStore and cache)
+CartaZarrImage::CartaZarrImage(const CartaZarrImage& other)
+    : ImageInterface<float>(other),
+      _coord_sys(other._coord_sys),
+      _shape(other._shape),
+      _original_zarr_shape(other._original_zarr_shape),
+      _name(other._name),
+      _ndim(other._ndim),
+      _context(other._context),
+      _tensorstore(other._tensorstore),  // Share TensorStore instance!
+      _tensorstore_initialized(other._tensorstore_initialized),
+      _actual_data_type(other._actual_data_type),
+      _channel_cache(other._channel_cache),  // Share cache!
+      _channel_cache_loaded(other._channel_cache_loaded),
+      _cached_channel(other._cached_channel),
+      _num_cached_channels(other._num_cached_channels),
+      _cache_width(other._cache_width),
+      _cache_height(other._cache_height),
+      _cache_start_x(other._cache_start_x),
+      _cache_start_y(other._cache_start_y),
+      _cache_num_freq(other._cache_num_freq),
+      _cache_num_stokes(other._cache_num_stokes),
+      _cache_freq_start(other._cache_freq_start),
+      _cache_stokes_start(other._cache_stokes_start),
+      _is_full_channel_cache(other._is_full_channel_cache),
+      _is_copy(true),  // Mark as copy!
+      _file_last_modified(other._file_last_modified),
+      _coordinate_system_initialized(other._coordinate_system_initialized),
+      _frequency_type_cached(other._frequency_type_cached),
+      _cached_frequency_type(other._cached_frequency_type) {
+    spdlog::debug("CartaZarrImage copy constructor: sharing TensorStore and cache for file: {}", _name);
+    setCoordinateInfo(_coord_sys);
+}
+
+// Destructor - only original instances clean up shared resources
+CartaZarrImage::~CartaZarrImage() {
+    if (_is_copy) {
+        spdlog::debug("CartaZarrImage destructor: skipping cleanup for copy (file: {})", _name);
+    } else {
+        spdlog::debug("CartaZarrImage destructor: cleaning up original instance (file: {})", _name);
+        // Default cleanup for non-copy instances
+    }
 }
 
 void CartaZarrImage::setupCoordinateSystem() {
@@ -2325,7 +2369,9 @@ const LatticeRegion* CartaZarrImage::getRegionPtr() const {
 }
 
 ImageInterface<float>* CartaZarrImage::cloneII() const {
-    return new CartaZarrImage(_name);
+    // Use copy constructor to share TensorStore and cache (like CartaFitsImage)
+    spdlog::debug("CartaZarrImage::cloneII called - using copy constructor for efficiency");
+    return new CartaZarrImage(*this);
 }
 
 const CoordinateSystem& CartaZarrImage::coordinates() const {
