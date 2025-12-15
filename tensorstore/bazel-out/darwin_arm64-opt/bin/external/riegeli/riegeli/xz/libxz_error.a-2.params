@@ -1,6 +1,0 @@
--D
--no_warning_for_no_symbols
--static
--o
-bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/xz/libxz_error.a
-bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/xz/_objs/xz_error/xz_error.o

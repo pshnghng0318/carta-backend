@@ -1,5 +1,0 @@
-cc_library(
-    name = "tinyxml2",
-    linkopts = ["-ltinyxml2"],
-    visibility = ["//visibility:public"],
-)

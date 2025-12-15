@@ -1,6 +1,0 @@
-admin/refresh_spdx/licenses.json
-bazel-bin
-bazel-out
-bazel-rules_license
-bazel-testlogs
-MODULE.bazel.lock

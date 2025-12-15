@@ -1,4 +1,0 @@
-[1mexternal/xz/src/liblzma/simple/arm64.c:111:1: [0m[0;1;35mwarning: [0m[1munused function 'arm64_coder_init' [-Wunused-function][0m
-  111 | arm64_coder_init(lzma_next_coder *next, [0;34mconst[0m lzma_allocator *allocator,[0m
-      | [0;1;32m^~~~~~~~~~~~~~~~
-[0m1 warning generated.

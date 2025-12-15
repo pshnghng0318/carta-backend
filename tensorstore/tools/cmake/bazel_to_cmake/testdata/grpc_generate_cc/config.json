@@ -1,5 +1,0 @@
-{
-    "modules": [
-        ".bzl_library.grpc_generate_cc"
-    ]
-}

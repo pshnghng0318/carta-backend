@@ -1,6 +1,0 @@
--D
--no_warning_for_no_symbols
--static
--o
-bazel-out/darwin_arm64-opt/bin/tensorstore/index_space/libdimension_units.a
-bazel-out/darwin_arm64-opt/bin/tensorstore/index_space/_objs/dimension_units/dimension_units.o

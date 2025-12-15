@@ -1,6 +1,0 @@
--D
--no_warning_for_no_symbols
--static
--o
-bazel-out/darwin_arm64-opt/bin/tensorstore/libdata_type.a
-bazel-out/darwin_arm64-opt/bin/tensorstore/_objs/data_type/data_type.o

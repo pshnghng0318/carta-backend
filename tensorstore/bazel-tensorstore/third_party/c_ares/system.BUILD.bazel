@@ -1,5 +1,0 @@
-cc_library(
-    name = "ares",
-    linkopts = ["-lcares"],
-    visibility = ["//visibility:public"],
-)

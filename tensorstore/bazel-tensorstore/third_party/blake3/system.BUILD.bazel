@@ -1,5 +1,0 @@
-cc_library(
-    name = "blake3",
-    linkopts = ["-lblake3"],
-    visibility = ["//visibility:public"],
-)

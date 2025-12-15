@@ -1,2 +1,0 @@
-# Packages required to run the examples.
-numpy

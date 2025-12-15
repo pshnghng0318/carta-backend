@@ -1,3 +1,0 @@
-_repo_mapping /private/var/tmp/_bazel_pshuang/27898a449dbbc68511c015c6e0d8588f/execroot/tensorstore/bazel-out/darwin_arm64-opt-exec-ST-a828a81199fe/bin/external/com_google_protobuf/upb_generator/c/protoc-gen-upb_stage1.repo_mapping
-com_google_protobuf/upb_generator/c/protoc-gen-upb_stage1 /private/var/tmp/_bazel_pshuang/27898a449dbbc68511c015c6e0d8588f/execroot/tensorstore/bazel-out/darwin_arm64-opt-exec-ST-a828a81199fe/bin/external/com_google_protobuf/upb_generator/c/protoc-gen-upb_stage1
-tensorstore/external/com_google_protobuf/upb_generator/c/protoc-gen-upb_stage1 /private/var/tmp/_bazel_pshuang/27898a449dbbc68511c015c6e0d8588f/execroot/tensorstore/bazel-out/darwin_arm64-opt-exec-ST-a828a81199fe/bin/external/com_google_protobuf/upb_generator/c/protoc-gen-upb_stage1

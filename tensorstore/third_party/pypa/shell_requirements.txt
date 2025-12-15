@@ -1,3 +1,0 @@
-# Packages required by the //python/tensorstore:shell target.
-ipython
-absl-py

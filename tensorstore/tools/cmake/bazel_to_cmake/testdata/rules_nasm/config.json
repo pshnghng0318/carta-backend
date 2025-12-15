@@ -1,5 +1,0 @@
-{
-    "modules": [
-        ".bzl_library.rules_nasm"
-    ]
-}

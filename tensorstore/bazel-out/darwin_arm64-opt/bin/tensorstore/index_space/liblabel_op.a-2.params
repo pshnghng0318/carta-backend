@@ -1,6 +1,0 @@
--D
--no_warning_for_no_symbols
--static
--o
-bazel-out/darwin_arm64-opt/bin/tensorstore/index_space/liblabel_op.a
-bazel-out/darwin_arm64-opt/bin/tensorstore/index_space/_objs/label_op/label_op.o

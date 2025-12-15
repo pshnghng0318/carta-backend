@@ -1,6 +1,0 @@
--D
--no_warning_for_no_symbols
--static
--o
-bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/base/libshared_buffer.a
-bazel-out/darwin_arm64-opt/bin/external/riegeli/riegeli/base/_objs/shared_buffer/shared_buffer.o
