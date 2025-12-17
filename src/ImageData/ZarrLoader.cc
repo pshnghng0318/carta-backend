@@ -476,8 +476,15 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                         max_vec[profile_index] = std::numeric_limits<float>::quiet_NaN();
                     }
                     
+                    // Explicitly clear valid_pixels to free memory immediately
+                    valid_pixels.clear();
+                    valid_pixels.shrink_to_fit();
+                    
                     channel_success[profile_index] = 1;
                 }
+                
+                // Explicitly clear batch_array to free memory before next thread iteration
+                batch_array.resize(casacore::IPosition(1, 0));
                 
                 auto compute_end = std::chrono::high_resolution_clock::now();
                 auto compute_ms = std::chrono::duration_cast<std::chrono::milliseconds>(compute_end - compute_start).count();
@@ -516,17 +523,17 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         }
         
         // Debug: Show which channels succeeded
-        spdlog::debug("Channel success status (z_start={}, total={}): [{}]", 
-            z_start, channel_success.size(),
-            [&]() {
-                std::string status;
-                for (size_t i = 0; i < channel_success.size(); ++i) {
-                    if (i > 0) status += ", ";
-                    status += std::to_string(z_start + i) + ":" + (channel_success[i] ? "OK" : "FAIL");
-                }
-                return status;
-            }()
-        );
+        // spdlog::debug("Channel success status (z_start={}, total={}): [{}]", 
+        //     z_start, channel_success.size(),
+        //     [&]() {
+        //         std::string status;
+        //         for (size_t i = 0; i < channel_success.size(); ++i) {
+        //             if (i > 0) status += ", ";
+        //             status += std::to_string(z_start + i) + ":" + (channel_success[i] ? "OK" : "FAIL");
+        //         }
+        //         return status;
+        //     }()
+        // );
         
         if (!all_success) {
             progress = 1.0;
