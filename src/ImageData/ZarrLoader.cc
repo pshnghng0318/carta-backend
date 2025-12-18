@@ -126,7 +126,7 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
         // FIXED: For CARTA internal shape [x, y, freq, stokes] format:
         int img_width = shape[0];     // x dimension  
         int img_height = shape[1];    // y dimension
-        int num_channels = shape[2];  // freq dimension (was incorrectly shape[1])
+        int num_channels = shape[2];  // freq dimension
         
         if (cursor_x < 0 || cursor_y < 0 || cursor_x >= img_width || cursor_y >= img_height) {
             spdlog::error("ZarrLoader::GetCursorSpectralData: Cursor out of bounds: ({},{}) (image: {}x{})", 
@@ -139,61 +139,117 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
             return false;
         }
         
-        spdlog::debug("GetCursorSpectralData: Using direct TensorStore read for {} channels at point ({},{}) stokes={}", 
-                     num_channels, cursor_x, cursor_y, stokes);
+        // Handle 2D images
+        if (shape.size() == 2 || num_channels == 1) {
+            data.resize(1);
+            casacore::IPosition start(shape.size());
+            start[0] = cursor_x;
+            start[1] = cursor_y;
+            if (shape.size() > 3) start[3] = stokes;
+            
+            casacore::IPosition length(shape.size(), 1);
+            casacore::Array<float> pixel_array;
+            casacore::Slicer section(start, length);
+            
+            if (!zarr_image->readPixelFromTensorStore(pixel_array, section)) {
+                spdlog::error("ZarrLoader::GetCursorSpectralData: readPixelFromTensorStore failed");
+                return false;
+            }
+            data[0] = pixel_array.data()[0];
+            return true;
+        }
+        
+        // Batch processing for spectral profiles
+        // Initial batch size: 32 channels
+        size_t init_delta_z = 32;
+        
+        // Detect CPU count for dynamic batch sizing
+        unsigned int num_cpus = std::thread::hardware_concurrency();
+        if (num_cpus == 0) num_cpus = 8;  // fallback
+        
+        size_t delta_z = init_delta_z;  // Will be adjusted after first batch
+        size_t target_delta_time = TARGET_DELTA_TIME;  // 50ms per batch (from Image.h)
+        
+        spdlog::debug("GetCursorSpectralData: Batch processing {} channels at ({},{}) stokes={}, init_batch_size={}, num_cpus={}", 
+                     num_channels, cursor_x, cursor_y, stokes, init_delta_z, num_cpus);
         
         data.resize(num_channels);
+        size_t processed = 0;
         
-        // Use direct TensorStore read to avoid cache loading and ensure success
-        // Read all channels at once as a single spectral profile
-        casacore::IPosition start, length;
-        
-        if (shape.size() == 5) {
-            // 5D ZARR: [time, freq, stokes, x, y] - read all freq channels for single pixel
-            start = casacore::IPosition(5, 0, 0, stokes, cursor_x, cursor_y);
-            length = casacore::IPosition(5, 1, num_channels, 1, 1, 1);
-        } else if (shape.size() == 4) {
-            // 4D: CARTA internal format [x, y, freq, stokes] - read all freq channels for single pixel
-            start = casacore::IPosition(4, cursor_x, cursor_y, 0, stokes);
-            length = casacore::IPosition(4, 1, 1, num_channels, 1);
-        } else if (shape.size() == 3) {
-            // 3D: [x, y, freq] - read all freq channels for single pixel
-            start = casacore::IPosition(3, cursor_x, cursor_y, 0);
-            length = casacore::IPosition(3, 1, 1, num_channels);
-        } else if (shape.size() == 2) {
-            // 2D: [x, y] - single channel only
-            start = casacore::IPosition(2, cursor_x, cursor_y);
-            length = casacore::IPosition(2, 1, 1);
-            data[0] = 0.0f; // Placeholder for 2D data
-            spdlog::debug("GetCursorSpectralData: 2D image - returning single placeholder value");
-            return true;
-        } else {
-            spdlog::error("ZarrLoader::GetCursorSpectralData: Unsupported number of dimensions: {}", shape.size());
-            return false;
+        while (processed < num_channels) {
+            auto t_start = std::chrono::high_resolution_clock::now();
+            
+            // Calculate batch size for this iteration
+            size_t batch_size = std::min(delta_z, static_cast<size_t>(num_channels - processed));
+            
+            // Prepare slicer for current batch
+            casacore::IPosition start, length;
+            
+            if (shape.size() == 5) {
+                // 5D ZARR: [time, freq, stokes, x, y]
+                start = casacore::IPosition(5, 0, processed, stokes, cursor_x, cursor_y);
+                length = casacore::IPosition(5, 1, batch_size, 1, 1, 1);
+            } else if (shape.size() == 4) {
+                // 4D: CARTA internal format [x, y, freq, stokes]
+                start = casacore::IPosition(4, cursor_x, cursor_y, processed, stokes);
+                length = casacore::IPosition(4, 1, 1, batch_size, 1);
+            } else if (shape.size() == 3) {
+                // 3D: [x, y, freq]
+                start = casacore::IPosition(3, cursor_x, cursor_y, processed);
+                length = casacore::IPosition(3, 1, 1, batch_size);
+            } else {
+                spdlog::error("ZarrLoader::GetCursorSpectralData: Unsupported dimensions: {}", shape.size());
+                return false;
+            }
+            
+            // Read batch via TensorStore
+            casacore::Array<float> batch_array;
+            casacore::Slicer section(start, length);
+            
+            if (!zarr_image->readPixelFromTensorStore(batch_array, section)) {
+                spdlog::error("ZarrLoader::GetCursorSpectralData: Failed to read batch at channel {}", processed);
+                return false;
+            }
+            
+            // Copy batch data to output vector
+            if (batch_array.nelements() != batch_size) {
+                spdlog::error("ZarrLoader::GetCursorSpectralData: Expected {} elements, got {}", 
+                             batch_size, batch_array.nelements());
+                return false;
+            }
+            
+            const float* batch_data = batch_array.data();
+            for (size_t i = 0; i < batch_size; ++i) {
+                data[processed + i] = batch_data[i];
+            }
+            
+            auto t_end = std::chrono::high_resolution_clock::now();
+            auto dt_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            
+            // After first batch, adjust delta_z based on actual timing
+            // Goal: each batch takes ~TARGET_DELTA_TIME (50ms)
+            // After adjustment: delta_z = 4 × num_cpus (e.g., 32 for 8 CPUs)
+            if (processed == 0 && dt_ms > 0) {
+                // Calculate optimal batch size based on timing
+                double time_per_channel = dt_ms / batch_size;
+                size_t optimal_channels = static_cast<size_t>(target_delta_time / time_per_channel);
+                
+                // Clamp to reasonable range and align with CPU count
+                size_t cpu_based_batch = 4 * num_cpus;  // 4 × cpu_count (32 for 8 CPUs)
+                delta_z = std::max(size_t(1), std::min(optimal_channels, cpu_based_batch));
+                delta_z = std::min(delta_z, static_cast<size_t>(num_channels));
+                
+                spdlog::debug("GetCursorSpectralData: First batch took {:.2f}ms for {} channels, adjusted batch_size to {} (cpu_based={})",
+                             dt_ms, batch_size, delta_z, cpu_based_batch);
+            }
+            
+            processed += batch_size;
+            
+            spdlog::debug("GetCursorSpectralData: Processed {}/{} channels ({:.1f}%), batch_time={:.2f}ms",
+                         processed, num_channels, 100.0 * processed / num_channels, dt_ms);
         }
         
-        // Use direct TensorStore read via readPixelFromTensorStore to bypass cache entirely
-        casacore::Array<float> pixel_array;
-        casacore::Slicer section(start, length);
-        
-        if (!zarr_image->readPixelFromTensorStore(pixel_array, section)) {
-            spdlog::error("ZarrLoader::GetCursorSpectralData: readPixelFromTensorStore failed for spectral profile");
-            return false;
-        }
-        
-        // Copy array data to output vector
-        if (pixel_array.nelements() != num_channels) {
-            spdlog::error("ZarrLoader::GetCursorSpectralData: Expected {} elements, got {}", 
-                         num_channels, pixel_array.nelements());
-            return false;
-        }
-        
-        const float* pixel_data = pixel_array.data();
-        for (int z = 0; z < num_channels; ++z) {
-            data[z] = pixel_data[z];
-        }
-        
-        spdlog::debug("GetCursorSpectralData: Successfully read {} channels one by one for point ({},{})", 
+        spdlog::debug("GetCursorSpectralData: Successfully read {} channels in batches for point ({},{})", 
                      num_channels, cursor_x, cursor_y);
         return true;
         
@@ -232,8 +288,11 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
     const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin,
     std::mutex& image_mutex, std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) {
     
-    spdlog::info("ZarrLoader::GetRegionSpectralData: BATCH PROCESSING CALLED - region_id={}, spectral_range={}:{}, stokes={}", 
-                region_id, spectral_range.from, spectral_range.to, stokes);
+    // Use a map to track processing state per region_id
+    static std::map<int, int> region_batch_state;  // region_id -> next_batch_start_z
+    
+    spdlog::info("ZarrLoader::GetRegionSpectralData: BATCH PROCESSING CALLED - region_id={}, spectral_range={}:{}, stokes={}, progress={}", 
+                region_id, spectral_range.from, spectral_range.to, stokes, progress);
     
     std::lock_guard<std::mutex> lock(image_mutex);
     
@@ -295,18 +354,53 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             spdlog::warn("GetRegionSpectralData: Image pointer is null!");
         }
 
-        // Initialize results vectors for all statistics types (like Hdf5Loader)
-        std::vector<double> num_pixels_vec(profile_size, 0);
-        std::vector<double> nan_count_vec(profile_size, 0);
-        std::vector<double> sum_vec(profile_size, 0.0);
-        std::vector<double> mean_vec(profile_size, NAN);
-        std::vector<double> rms_vec(profile_size, NAN);
-        std::vector<double> sigma_vec(profile_size, NAN);
-        std::vector<double> sum_sq_vec(profile_size, 0.0);
-        std::vector<double> min_vec(profile_size, std::numeric_limits<float>::max());
-        std::vector<double> max_vec(profile_size, std::numeric_limits<float>::lowest());
-        std::vector<double> extrema_vec(profile_size, NAN);
-        std::vector<double> flux_vec(profile_size, NAN);
+        // Use static storage for intermediate results (persists across calls)
+        struct RegionSpectralState {
+            std::vector<double> num_pixels_vec;
+            std::vector<double> nan_count_vec;
+            std::vector<double> sum_vec;
+            std::vector<double> mean_vec;
+            std::vector<double> rms_vec;
+            std::vector<double> sigma_vec;
+            std::vector<double> sum_sq_vec;
+            std::vector<double> min_vec;
+            std::vector<double> max_vec;
+            std::vector<double> extrema_vec;
+            std::vector<double> flux_vec;
+        };
+        static std::map<int, RegionSpectralState> region_results_cache;  // region_id -> intermediate results
+        
+        // Get or initialize result vectors
+        RegionSpectralState& state = region_results_cache[region_id];
+        bool need_init = (state.num_pixels_vec.size() != profile_size);
+        
+        if (need_init) {
+            spdlog::info("GetRegionSpectralData: Initializing result vectors for region_id={}, profile_size={}", region_id, profile_size);
+            state.num_pixels_vec.assign(profile_size, 0);
+            state.nan_count_vec.assign(profile_size, 0);
+            state.sum_vec.assign(profile_size, 0.0);
+            state.mean_vec.assign(profile_size, NAN);
+            state.rms_vec.assign(profile_size, NAN);
+            state.sigma_vec.assign(profile_size, NAN);
+            state.sum_sq_vec.assign(profile_size, 0.0);
+            state.min_vec.assign(profile_size, std::numeric_limits<float>::max());
+            state.max_vec.assign(profile_size, std::numeric_limits<float>::lowest());
+            state.extrema_vec.assign(profile_size, NAN);
+            state.flux_vec.assign(profile_size, NAN);
+        }
+        
+        // References for convenience
+        auto& num_pixels_vec = state.num_pixels_vec;
+        auto& nan_count_vec = state.nan_count_vec;
+        auto& sum_vec = state.sum_vec;
+        auto& mean_vec = state.mean_vec;
+        auto& rms_vec = state.rms_vec;
+        auto& sigma_vec = state.sigma_vec;
+        auto& sum_sq_vec = state.sum_sq_vec;
+        auto& min_vec = state.min_vec;
+        auto& max_vec = state.max_vec;
+        auto& extrema_vec = state.extrema_vec;
+        auto& flux_vec = state.flux_vec;
         
         // OPTIMIZED THREAD STRATEGY for I/O-bound operations
         // Fewer threads = less I/O contention, better throughput
@@ -352,16 +446,29 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
 #endif
         
         // Process channels in batches - each thread reads CHANNELS_PER_THREAD channels at once
-        // Use uint8_t instead of bool for thread-safety (vector<bool> is not thread-safe even for different indices)
-        std::vector<uint8_t> channel_success(profile_size, 0);
+        // Determine which batch to process based on state
+        int next_batch_start = (region_batch_state.count(region_id) > 0) ? region_batch_state[region_id] : z_start;
         
-        // Process all channels in parallel batches
-        for (int batch_start = z_start; batch_start <= z_end; batch_start += BATCH_SIZE) {
-            int batch_end = std::min(batch_start + BATCH_SIZE - 1, z_end);
-            auto batch_time_start = std::chrono::high_resolution_clock::now();
-            
-            spdlog::info("Processing batch: channels {}-{} ({} channels total)", 
-                        batch_start, batch_end, batch_end - batch_start + 1);
+        // Check if this is a new request (first batch)
+        bool is_first_batch = (next_batch_start == z_start);
+        
+        // If already complete, return immediately
+        if (next_batch_start > z_end) {
+            spdlog::info("GetRegionSpectralData: region_id={} already complete, cleaning up state", region_id);
+            region_batch_state.erase(region_id);
+            progress = 1.0;
+            return true;
+        }
+        
+        // Calculate this batch's range
+        int batch_start = next_batch_start;
+        int batch_end = std::min(batch_start + BATCH_SIZE - 1, z_end);
+        int channels_processed = batch_start - z_start;  // How many channels were processed before this batch
+        
+        auto batch_time_start = std::chrono::high_resolution_clock::now();
+        
+        spdlog::info("Processing batch: channels {}-{} ({} channels total) - is_first_batch={}, progress={:.1f}%", 
+                    batch_start, batch_end, batch_end - batch_start + 1, is_first_batch, progress * 100.0);
             
 #pragma omp parallel for schedule(static)
             for (int thread_idx = 0; thread_idx < PARALLEL_THREADS; ++thread_idx) {
@@ -400,9 +507,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                     {
                         spdlog::error("  Thread {}: Failed readPixelFromTensorStore for channels {}-{} (start={}, length={})",
                                      thread_idx, thread_start_z, thread_end_z, start.toString(), length.toString());
-                    }
-                    for (int z = thread_start_z; z <= thread_end_z; ++z) {
-                        channel_success[z - z_start] = 0;
                     }
                     continue;
                 }
@@ -479,8 +583,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                     // Explicitly clear valid_pixels to free memory immediately
                     valid_pixels.clear();
                     valid_pixels.shrink_to_fit();
-                    
-                    channel_success[profile_index] = 1;
                 }
                 
                 // Explicitly clear batch_array to free memory before next thread iteration
@@ -508,43 +610,17 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             int actual_batch_size = batch_end - batch_start + 1;
             size_t batch_mb = (actual_batch_size * region_width * region_height * sizeof(float)) / (1024*1024);
             double batch_speed_gbs = (batch_mb / 1024.0) / (batch_ms / 1000.0);
-            spdlog::info("Batch complete: {} ms for {} channels ({} MB, {:.2f} GB/s)", 
-                        batch_ms, actual_batch_size, batch_mb, batch_speed_gbs);
-        }
+            
+            // Update progress after this batch
+            channels_processed += actual_batch_size;
+            progress = static_cast<float>(channels_processed) / static_cast<float>(profile_size);
+            
+            spdlog::info("Batch complete: {} ms for {} channels ({} MB, {:.2f} GB/s) - Progress: {}/{} ({:.1f}%)", 
+                        batch_ms, actual_batch_size, batch_mb, batch_speed_gbs,
+                        channels_processed, profile_size, progress * 100.0);
         
-        // Check if all channels succeeded
-        bool all_success = true;
-        for (size_t i = 0; i < channel_success.size(); ++i) {
-            if (!channel_success[i]) {
-                spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to process channel {} (profile_index={}, channel_success[{}]={})", 
-                    z_start + i, i, i, channel_success[i]);
-                all_success = false;
-            }
-        }
-        
-        // Debug: Show which channels succeeded
-        // spdlog::debug("Channel success status (z_start={}, total={}): [{}]", 
-        //     z_start, channel_success.size(),
-        //     [&]() {
-        //         std::string status;
-        //         for (size_t i = 0; i < channel_success.size(); ++i) {
-        //             if (i > 0) status += ", ";
-        //             status += std::to_string(z_start + i) + ":" + (channel_success[i] ? "OK" : "FAIL");
-        //         }
-        //         return status;
-        //     }()
-        // );
-        
-        if (!all_success) {
-            progress = 1.0;
-            return false;
-        }
-        
-        auto end_time = std::chrono::high_resolution_clock::now();
-        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
-        
-        // All channels processed - calculate derived statistics (like Hdf5Loader)
-        for (int z = 0; z < profile_size; ++z) {
+        // Calculate derived statistics for channels processed so far
+        for (int z = 0; z < channels_processed; ++z) {
             uint64_t num_pixels = num_pixels_vec[z];
             if (num_pixels > 0) {
                 double sum = sum_vec[z];
@@ -578,14 +654,26 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         if (has_flux) {
             results[CARTA::StatsType::FluxDensity] = flux_vec;
         }
+            
+        // Update state for next call - MUST BE AFTER copying results to avoid dangling references
+        int next_batch = batch_end + 1;
+        if (next_batch > z_end) {
+            // All batches complete - clean up state
+            region_batch_state.erase(region_id);
+            region_results_cache.erase(region_id);
+            progress = 1.0;
+            spdlog::info("GetRegionSpectralData: All batches complete for region_id={}, cleaned up cache", region_id);
+        } else {
+            // More batches to process
+            region_batch_state[region_id] = next_batch;
+            spdlog::info("GetRegionSpectralData: Saved state for region_id={}, next_batch_start={}", region_id, next_batch);
+        }
         
-        progress = 1.0;
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
         
-        // Log comprehensive statistics summary
-        spdlog::info("GetRegionSpectralData: Successfully processed {} channels for region {}x{} - TOTAL TIME: {} ms ({:.2f} ms/channel)", 
-                     profile_size, region_width, region_height, total_ms, static_cast<double>(total_ms) / profile_size);
-        spdlog::info("GetRegionSpectralData: Returned {} statistics types: NumPixels, NanCount, Sum, Mean, RMS, Sigma, SumSq, Min, Max, Extrema{}",
-                     results.size(), has_flux ? ", FluxDensity" : "");
+        spdlog::info("GetRegionSpectralData: Returning with progress={:.1f}%, processed {}/{} channels, batch_time={} ms",
+                     progress * 100.0, channels_processed, profile_size, total_ms);
         
         return true;
         

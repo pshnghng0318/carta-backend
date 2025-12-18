@@ -1567,17 +1567,11 @@ void CartaZarrImage::initializeTensorStore() {
         
         // Create TensorStore context with aggressive parallelization
         // Using all available CPU cores for maximum I/O and decode throughput
-        // 
-        // MEMORY OPTIMIZATION: Disable cache_pool to avoid double-caching
-        // We already have _channel_cache in CartaZarrImage (140 MB per channel)
-        // + copy constructor shares cache between SubImages
-        // TensorStore's cache_pool would create redundant caching:
-        //   - _channel_cache: 140 MB (our optimized cache)
-        //   - cache_pool: 512 MB (TensorStore's persistent LRU cache)
-        // Setting cache_pool to 0 eliminates memory waste and double-caching
+        // Cache size calculation: 4 channels × 7763×4742 pixels × 4 bytes/pixel = ~560MB
+        // Set to 128MB to test smaller cache for PV diagram performance
         nlohmann::json context_spec = {
             {"cache_pool", {
-                {"total_bytes_limit", 0}  // Disable cache_pool - we use _channel_cache instead
+                {"total_bytes_limit", 128ULL << 20}  // 128MB cache limit - testing smaller cache
             }},
             {"data_copy_concurrency", {
                 {"limit", num_cpus}  // Use all CPU cores for chunk decode operations
@@ -1590,7 +1584,7 @@ void CartaZarrImage::initializeTensorStore() {
         auto context_result = tensorstore::Context::FromJson(context_spec);
         if (context_result.ok()) {
             _context = context_result.value();
-            spdlog::info("TensorStore context initialized: {} CPU cores, cache_pool DISABLED (using _channel_cache), {}-thread data_copy_concurrency, {}-thread file_io_concurrency",
+            spdlog::info("TensorStore context initialized: {} CPU cores, 128MB cache, {}-thread data_copy_concurrency, {}-thread file_io_concurrency",
                         num_cpus, num_cpus, num_cpus);
         } else {
             spdlog::warn("Failed to create TensorStore context with cache and concurrency: {}, using default", 
