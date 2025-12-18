@@ -56,8 +56,6 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
     static std::unordered_map<std::string, IPosition> cached_original_shapes;
     static std::unordered_map<std::string, casacore::DataType> cached_data_types;
     static std::unordered_map<std::string, CoordinateSystem> cached_coord_sys;
-    // REMOVED: cached_tensorstores - TensorStore objects can hold large internal state (~1-2GB per file)
-    // Instead, we re-initialize TensorStore each time (fast) and rely on the 512MB shared cache_pool
     static std::unordered_map<std::string, std::string> cached_zarr_paths;
     static std::unordered_map<std::string, bool> brightness_unit_loaded;
     static std::unordered_map<std::string, bool> image_info_loaded;
@@ -73,8 +71,6 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
         _coord_sys = cached_coord_sys[filename];
         _ndim = _shape.size();
         
-        // Always re-initialize TensorStore (fast operation, uses shared 512MB cache_pool)
-        // This avoids caching large TensorStore objects that can hold 1-2GB of internal state
         initializeTensorStore();
         
         // Set coordinate system in ImageInterface base class
@@ -183,11 +179,6 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
     cached_original_shapes[filename] = _original_zarr_shape;
     cached_data_types[filename] = _actual_data_type;
     cached_coord_sys[filename] = _coord_sys;
-    // REMOVED: TensorStore caching - TensorStore objects hold large internal state (1-2GB per file)
-    // We re-initialize TensorStore each time (fast) and rely on the 512MB shared cache_pool
-    // if (_tensorstore_initialized) {
-    //     cached_tensorstores[filename] = _tensorstore;
-    // }
     
     // Set coordinate system in ImageInterface base class
     setCoordinateInfo(_coord_sys);
@@ -1568,10 +1559,10 @@ void CartaZarrImage::initializeTensorStore() {
         // Create TensorStore context with aggressive parallelization
         // Using all available CPU cores for maximum I/O and decode throughput
         // Cache size calculation: 4 channels × 7763×4742 pixels × 4 bytes/pixel = ~560MB
-        // Set to 512MB to accommodate typical multi-channel viewing without excessive memory usage
+        // Set to 128MB to accommodate typical multi-channel viewing without excessive memory usage
         nlohmann::json context_spec = {
             {"cache_pool", {
-                {"total_bytes_limit", 512ULL << 20}  // 512MB cache limit - sufficient for ~4 full channels
+                {"total_bytes_limit", 128ULL << 20}  // 128MB cache limit - sufficient for ~4 full channels
             }},
             {"data_copy_concurrency", {
                 {"limit", num_cpus}  // Use all CPU cores for chunk decode operations
@@ -1584,7 +1575,7 @@ void CartaZarrImage::initializeTensorStore() {
         auto context_result = tensorstore::Context::FromJson(context_spec);
         if (context_result.ok()) {
             _context = context_result.value();
-            spdlog::info("TensorStore context initialized: {} CPU cores, 512MB cache, {}-thread data_copy_concurrency, {}-thread file_io_concurrency",
+            spdlog::info("TensorStore context initialized: {} CPU cores, 128MB cache, {}-thread data_copy_concurrency, {}-thread file_io_concurrency",
                         num_cpus, num_cpus, num_cpus);
         } else {
             spdlog::warn("Failed to create TensorStore context with cache and concurrency: {}, using default", 
@@ -1834,10 +1825,6 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         // debug_call_count++;
         
         int freq_index, stokes_index;
-        
-        // PATTERN DETECTION: From the error logs, we can see the reordering pattern:
-        // GetChunk request: [512,4096,0,0] -> doGetSlice receives: [0,0,4096,512]
-        // This suggests: [x,y,freq,stokes] -> [freq,stokes,y,x]
         
         if (coordinates_reordered) {
             // After coordinate reordering, freq and stokes are now in their correct positions
