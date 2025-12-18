@@ -8,11 +8,28 @@
 #include "CartaZarrImage.h"
 #include "Logger/Logger.h"
 #include "Util/Image.h"
+#include "Main/ProgramSettings.h"
 
 #include <filesystem>
 #include <memory>
 #include <iostream>
 #include <algorithm>
+#include <chrono>
+#include <thread>
+#include <future>
+#include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+// xtensor 0.26.0 for optimized array operations (C++17 compatible)
+#include <xtensor/containers/xadapt.hpp>   // Wrap raw pointer as xtensor array
+#include <xtensor/views/xview.hpp>         // Array slicing and views
+#include <xtensor/core/xmath.hpp>          // nansum, nanmean, nanmin, nanmax, nanvar, nanstd, count_nonnan
+#include <xtensor/generators/xbuilder.hpp> // Array construction utilities
+
+#define XUSE_XSIMD  // Enable SIMD optimizations in xtensor
 
 using namespace carta;
 
@@ -259,133 +276,309 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         int z_end = spectral_range.to;
         int profile_size = z_end - z_start + 1;
 
-        std::vector<double> profile_data(profile_size, 0.0);
+        // Calculate beam area for flux density calculation (like Hdf5Loader)
+        double beam_area = CalculateBeamArea();
+        bool has_flux = !std::isnan(beam_area);
         
-        // BATCHED TENSOR STORE STRATEGY: Process multiple channels at once for efficiency
-        // Limited to 8 channels to prevent memory overflow (10000x10000 float32 = 400MB per channel, 8 channels = 3.2GB)
-        const int BATCH_SIZE = 8;  // Process 8 channels at a time (safe for large datacubes)
+        spdlog::info("GetRegionSpectralData: beam_area={}, has_flux={}", beam_area, has_flux);
         
-        spdlog::debug("GetRegionSpectralData: Processing {} channels in batches of {}", profile_size, BATCH_SIZE);
+        // Additional debug: check image info
+        auto image = GetImage();
+        if (image) {
+            auto& info = image->imageInfo();
+            if (info.hasSingleBeam()) {
+                spdlog::info("GetRegionSpectralData: Image has single beam");
+            } else {
+                spdlog::warn("GetRegionSpectralData: Image does NOT have single beam!");
+            }
+        } else {
+            spdlog::warn("GetRegionSpectralData: Image pointer is null!");
+        }
+
+        // Initialize results vectors for all statistics types (like Hdf5Loader)
+        std::vector<double> num_pixels_vec(profile_size, 0);
+        std::vector<double> nan_count_vec(profile_size, 0);
+        std::vector<double> sum_vec(profile_size, 0.0);
+        std::vector<double> mean_vec(profile_size, NAN);
+        std::vector<double> rms_vec(profile_size, NAN);
+        std::vector<double> sigma_vec(profile_size, NAN);
+        std::vector<double> sum_sq_vec(profile_size, 0.0);
+        std::vector<double> min_vec(profile_size, std::numeric_limits<float>::max());
+        std::vector<double> max_vec(profile_size, std::numeric_limits<float>::lowest());
+        std::vector<double> extrema_vec(profile_size, NAN);
+        std::vector<double> flux_vec(profile_size, NAN);
         
+        // OPTIMIZED THREAD STRATEGY for I/O-bound operations
+        // Fewer threads = less I/O contention, better throughput
+        unsigned int hardware_cpus = std::thread::hardware_concurrency();
+        int num_threads;
+        if (hardware_cpus >= 11) {
+            num_threads = 6;  // 11-14+ CPUs: use 6 threads
+        } else if (hardware_cpus >= 7) {
+            num_threads = 4;  // 7-10 CPUs: use 4 threads
+        } else if (hardware_cpus >= 4) {
+            num_threads = 2;  // 4-6 CPUs: use 2 threads
+        } else {
+            num_threads = 1;  // 1-3 CPUs: use 1 thread
+        }
+        
+        // CONFIGURABLE: Number of channels per CPU thread (via --cpu_ch flag)
+        // Get from ProgramSettings, default is 8 channels per CPU
+        const int PARALLEL_THREADS = 4;  // Fixed: use 4 CPUs
+        const int CHANNELS_PER_THREAD = carta::ProgramSettings::GetInstance().cpu_ch;
+        const int BATCH_SIZE = PARALLEL_THREADS * CHANNELS_PER_THREAD;  // Dynamic batch size
+        
+        size_t memory_per_batch_mb = (BATCH_SIZE * region_area * sizeof(float)) / (1024 * 1024);
+        double memory_per_batch_gb = memory_per_batch_mb / 1024.0;
+        
+        spdlog::info("GetRegionSpectralData: Processing {} channels, region={}x{} pixels ({} total pixels)", 
+                    profile_size, region_width, region_height, region_area);
+        spdlog::info("  Thread strategy: {} CPUs detected -> using {} threads for I/O", hardware_cpus, PARALLEL_THREADS);
+#ifdef _OPENMP
+        int omp_threads = omp_get_max_threads();
+        spdlog::info("  OpenMP enabled: {} threads available for parallel statistics computation", omp_threads);
+#else
+        spdlog::warn("  OpenMP NOT enabled - statistics will run sequentially");
+#endif
+        spdlog::info("  Batch config: {} threads × {} channels/thread = {} channels/batch ({:.2f} GB/batch)", 
+                    PARALLEL_THREADS, CHANNELS_PER_THREAD, BATCH_SIZE, memory_per_batch_gb);
+        auto start_time = std::chrono::high_resolution_clock::now();
+        
+        // Enable nested OpenMP parallelism for I/O threads + compute parallelism
+#ifdef _OPENMP
+        omp_set_max_active_levels(2);  // Enable 2-level parallelism: I/O threads + compute threads
+        omp_set_num_threads(PARALLEL_THREADS);
+        spdlog::info("Using OpenMP with {} I/O threads, nested parallelism enabled for compute", PARALLEL_THREADS);
+#endif
+        
+        // Process channels in batches - each thread reads CHANNELS_PER_THREAD channels at once
+        // Use uint8_t instead of bool for thread-safety (vector<bool> is not thread-safe even for different indices)
+        std::vector<uint8_t> channel_success(profile_size, 0);
+        
+        // Process all channels in parallel batches
         for (int batch_start = z_start; batch_start <= z_end; batch_start += BATCH_SIZE) {
             int batch_end = std::min(batch_start + BATCH_SIZE - 1, z_end);
-            int batch_size = batch_end - batch_start + 1;
+            auto batch_time_start = std::chrono::high_resolution_clock::now();
             
-            // spdlog::debug("Processing batch: channels {} to {} ({} channels)", 
-            //              batch_start, batch_end, batch_size);
+            spdlog::info("Processing batch: channels {}-{} ({} channels total)", 
+                        batch_start, batch_end, batch_end - batch_start + 1);
             
-            // Read multiple channels from TensorStore in one operation
-            casacore::IPosition start, length;
-            if (shape.size() == 5) {
-                // 5D ZARR: [time, freq, stokes, x, y] - read batch_size freq channels
-                start = casacore::IPosition(5, 0, batch_start, stokes, x_min, y_min);
-                length = casacore::IPosition(5, 1, batch_size, 1, region_width, region_height);
-                // spdlog::info("5D ZARR BATCH: start=[0,{},{},{},{}], length=[1,{},1,{},{}] - {} channels",
-                //            batch_start, stokes, x_min, y_min, batch_size, region_width, region_height, batch_size);
-            } else if (shape.size() == 4) {
-                // 4D: Use CARTA standard order [x, y, freq, stokes] - read batch_size freq channels
-                start = casacore::IPosition(4, x_min, y_min, batch_start, stokes);
-                length = casacore::IPosition(4, region_width, region_height, batch_size, 1);
-                // spdlog::info("4D BATCH: start=[{},{},{},{}], length=[{},{},{},1] - {} channels",
-                //            x_min, y_min, batch_start, stokes, region_width, region_height, batch_size, batch_size);
-            } else if (shape.size() == 3) {
-                // 3D: Use CARTA standard order [x, y, freq] - read batch_size freq channels
-                start = casacore::IPosition(3, x_min, y_min, batch_start);
-                length = casacore::IPosition(3, region_width, region_height, batch_size);
-                // spdlog::info("3D BATCH: start=[{},{},{}], length=[{},{},{}] - {} channels",
-                //            x_min, y_min, batch_start, region_width, region_height, batch_size, batch_size);
-            } else if (shape.size() == 2) {
-                // 2D: Use CARTA standard order [x, y] (only one channel)
-                start = casacore::IPosition(2, x_min, y_min);
-                length = casacore::IPosition(2, region_width, region_height);
-                // spdlog::info("2D: start=[{},{}], length=[{},{}] - 1 channel",
-                //            x_min, y_min, region_width, region_height);
-            } else {
-                spdlog::error("ZarrLoader::GetRegionSpectralData: Unsupported number of dimensions: {}", shape.size());
-                progress = 1.0;
-                return false;
-            }
-            
-            casacore::Array<float> batch_array;
-            casacore::Slicer batch_slicer(start, length);
-            
-            if (!zarr_image->readPixelFromTensorStore(batch_array, batch_slicer)) {
-                spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to read batch channels {} to {} from TensorStore", 
-                             batch_start, batch_end);
-                progress = 1.0;
-                return false;
-            }
-            
-            // Process each channel in the batch
-            const float* data_ptr = batch_array.data();
-            casacore::IPosition array_shape = batch_array.shape();
-            
-            for (int z_offset = 0; z_offset < batch_size; ++z_offset) {
-                int z = batch_start + z_offset;
-                int profile_index = z - z_start;
-                // Calculate mean for this channel
-                double sum = 0.0;
-                int valid_count = 0;
-                for (int y = 0; y < region_height; ++y) {
-                    for (int x = 0; x < region_width; ++x) {
-                        // mask index: region pixel (x, y) 對應 mask 內 (x + x_min - origin[0], y + y_min - origin[1])
+#pragma omp parallel for schedule(static)
+            for (int thread_idx = 0; thread_idx < PARALLEL_THREADS; ++thread_idx) {
+                auto thread_start_time = std::chrono::high_resolution_clock::now();
+                
+                int thread_start_z = batch_start + thread_idx * CHANNELS_PER_THREAD;
+                int thread_end_z = std::min(thread_start_z + CHANNELS_PER_THREAD - 1, batch_end);
+                
+                if (thread_start_z > batch_end) continue;
+                
+                int num_channels = thread_end_z - thread_start_z + 1;
+                
+                // Read CHANNELS_PER_THREAD channels at once (length = num_channels)
+                casacore::IPosition start, length;
+                if (shape.size() == 5) {
+                    start = casacore::IPosition(5, 0, thread_start_z, stokes, x_min, y_min);
+                    length = casacore::IPosition(5, 1, num_channels, 1, region_width, region_height);
+                } else if (shape.size() == 4) {
+                    start = casacore::IPosition(4, x_min, y_min, thread_start_z, stokes);
+                    length = casacore::IPosition(4, region_width, region_height, num_channels, 1);
+                } else if (shape.size() == 3) {
+                    start = casacore::IPosition(3, x_min, y_min, thread_start_z);
+                    length = casacore::IPosition(3, region_width, region_height, num_channels);
+                } else if (shape.size() == 2) {
+                    start = casacore::IPosition(2, x_min, y_min);
+                    length = casacore::IPosition(2, region_width, region_height);
+                }
+                
+                // Time the I/O operation
+                auto io_start = std::chrono::high_resolution_clock::now();
+                casacore::Array<float> batch_array;
+                casacore::Slicer slicer(start, length);
+                
+                if (!zarr_image->readPixelFromTensorStore(batch_array, slicer)) {
+                    #pragma omp critical
+                    {
+                        spdlog::error("  Thread {}: Failed readPixelFromTensorStore for channels {}-{} (start={}, length={})",
+                                     thread_idx, thread_start_z, thread_end_z, start.toString(), length.toString());
+                    }
+                    for (int z = thread_start_z; z <= thread_end_z; ++z) {
+                        channel_success[z - z_start] = 0;
+                    }
+                    continue;
+                }
+                auto io_end = std::chrono::high_resolution_clock::now();
+                auto io_ms = std::chrono::duration_cast<std::chrono::milliseconds>(io_end - io_start).count();
+                
+                // Process each channel in the batch with OpenMP parallelization
+                auto compute_start = std::chrono::high_resolution_clock::now();
+                const float* data_ptr = batch_array.data();
+                size_t pixels_per_channel = region_width * region_height;
+                
+#pragma omp parallel for schedule(dynamic)
+                for (int ch_offset = 0; ch_offset < num_channels; ++ch_offset) {
+                    int z = thread_start_z + ch_offset;
+                    int profile_index = z - z_start;
+                    
+                    if (profile_index < 0 || profile_index >= profile_size) {
+                        #pragma omp critical
+                        {
+                            spdlog::error("Thread {}: Invalid profile_index {} for channel {} (z_start={}, profile_size={})",
+                                         thread_idx, profile_index, z, z_start, profile_size);
+                        }
+                        continue;
+                    }
+                    
+                    // Get pointer to this channel's data
+                    const float* channel_data = data_ptr + (ch_offset * pixels_per_channel);
+                    
+                    // Collect valid pixels
+                    std::vector<float> valid_pixels;
+                    valid_pixels.reserve(pixels_per_channel / 2);
+                    
+                    for (size_t i = 0; i < pixels_per_channel; ++i) {
+                        int y = i / region_width;
+                        int x = i % region_width;
                         int mask_x = x + x_min - origin[0];
                         int mask_y = y + y_min - origin[1];
-                        if (mask_x >= 0 && mask_x < mask_shape[0] && mask_y >= 0 && mask_y < mask_shape[1] && 
-                            mask(casacore::IPosition(2, mask_x, mask_y))) {
-                            // 計算正確的 linear_index，考慮 batch 內 channel 的 offset
-                            size_t linear_index = 0;
-                            if (array_shape.size() == 5) {
-                                // [1, batch_size, 1, region_width, region_height]
-                                // layout: [time, freq, stokes, x, y]
-                                // freq (z_offset) 變化最快
-                                linear_index = z_offset * region_width * region_height + x * region_height + y;
-                            } else if (array_shape.size() == 4) {
-                                // [region_width, region_height, batch_size, 1]
-                                // layout: [x, y, freq, stokes]
-                                linear_index = x + y * region_width + z_offset * region_width * region_height;
-                            } else if (array_shape.size() == 3) {
-                                // [region_width, region_height, batch_size]
-                                // layout: [x, y, freq]
-                                linear_index = x + y * region_width + z_offset * region_width * region_height;
-                            } else {
-                                // 2D case - no batching
-                                linear_index = y * region_width + x;
-                            }
-                            if (linear_index < batch_array.nelements()) {
-                                float value = data_ptr[linear_index];
+                        
+                        if (mask_x >= 0 && mask_x < mask_shape[0] && mask_y >= 0 && mask_y < mask_shape[1]) {
+                            casacore::IPosition mask_pos(2, mask_x, mask_y);
+                            if (mask(mask_pos)) {
+                                float value = channel_data[i];
                                 if (std::isfinite(value)) {
-                                    sum += value;
-                                    valid_count++;
+                                    valid_pixels.push_back(value);
                                 }
                             }
                         }
                     }
+                    
+                    uint64_t valid_count = valid_pixels.size();
+                    if (valid_count > 0) {
+                        // Use xtensor for SIMD-accelerated statistics
+                        std::vector<size_t> shape_1d = {valid_pixels.size()};
+                        auto valid_arr = xt::adapt(valid_pixels.data(), valid_pixels.size(), xt::no_ownership(), shape_1d);
+                        
+                        double sum = xt::sum(valid_arr)();
+                        double sum_sq = xt::sum(xt::square(valid_arr))();
+                        float min_val = xt::amin(valid_arr)();
+                        float max_val = xt::amax(valid_arr)();
+                        
+                        num_pixels_vec[profile_index] = valid_count;
+                        sum_vec[profile_index] = sum;
+                        sum_sq_vec[profile_index] = sum_sq;
+                        min_vec[profile_index] = min_val;
+                        max_vec[profile_index] = max_val;
+                    } else {
+                        num_pixels_vec[profile_index] = 0;
+                        sum_vec[profile_index] = 0.0;
+                        sum_sq_vec[profile_index] = 0.0;
+                        min_vec[profile_index] = std::numeric_limits<float>::quiet_NaN();
+                        max_vec[profile_index] = std::numeric_limits<float>::quiet_NaN();
+                    }
+                    
+                    channel_success[profile_index] = 1;
                 }
-                // Calculate mean for this channel
-                if (valid_count > 0) {
-                    profile_data[profile_index] = sum / static_cast<double>(valid_count);
-                } else {
-                    profile_data[profile_index] = std::numeric_limits<double>::quiet_NaN();
+                
+                auto compute_end = std::chrono::high_resolution_clock::now();
+                auto compute_ms = std::chrono::duration_cast<std::chrono::milliseconds>(compute_end - compute_start).count();
+                auto thread_end_time = std::chrono::high_resolution_clock::now();
+                auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(thread_end_time - thread_start_time).count();
+                
+                // Calculate per-thread statistics
+                size_t thread_mb = (num_channels * region_width * region_height * sizeof(float)) / (1024*1024);
+                double io_speed_gbs = (io_ms > 0) ? (thread_mb / 1024.0) / (io_ms / 1000.0) : 0.0;
+                
+                #pragma omp critical
+                {
+                    spdlog::info("  Thread {}: channels {}-{} ({} channels) - I/O {} ms ({:.2f} GB/s), compute {} ms, total {} ms",
+                                thread_idx, thread_start_z, thread_end_z, num_channels, 
+                                io_ms, io_speed_gbs, compute_ms, total_ms);
                 }
-                // if (z <= batch_end) {
-                //     spdlog::debug("Batch channel {} - region {}x{}, valid {} pixels, sum = {}, mean = {}", 
-                //                  z, region_width, region_height, valid_count, sum, profile_data[profile_index]);
-                // }
             }
             
-            // Handle 2D case where we only process one channel
-            if (shape.size() == 2) {
-                break;
+            auto batch_time_end = std::chrono::high_resolution_clock::now();
+            auto batch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(batch_time_end - batch_time_start).count();
+            int actual_batch_size = batch_end - batch_start + 1;
+            size_t batch_mb = (actual_batch_size * region_width * region_height * sizeof(float)) / (1024*1024);
+            double batch_speed_gbs = (batch_mb / 1024.0) / (batch_ms / 1000.0);
+            spdlog::info("Batch complete: {} ms for {} channels ({} MB, {:.2f} GB/s)", 
+                        batch_ms, actual_batch_size, batch_mb, batch_speed_gbs);
+        }
+        
+        // Check if all channels succeeded
+        bool all_success = true;
+        for (size_t i = 0; i < channel_success.size(); ++i) {
+            if (!channel_success[i]) {
+                spdlog::error("ZarrLoader::GetRegionSpectralData: Failed to process channel {} (profile_index={}, channel_success[{}]={})", 
+                    z_start + i, i, i, channel_success[i]);
+                all_success = false;
             }
         }
         
-        // All channels processed
-        results[CARTA::StatsType::Mean] = profile_data;
+        // Debug: Show which channels succeeded
+        // spdlog::debug("Channel success status (z_start={}, total={}): [{}]", 
+        //     z_start, channel_success.size(),
+        //     [&]() {
+        //         std::string status;
+        //         for (size_t i = 0; i < channel_success.size(); ++i) {
+        //             if (i > 0) status += ", ";
+        //             status += std::to_string(z_start + i) + ":" + (channel_success[i] ? "OK" : "FAIL");
+        //         }
+        //         return status;
+        //     }()
+        // );
+        
+        if (!all_success) {
+            progress = 1.0;
+            return false;
+        }
+        
+        auto end_time = std::chrono::high_resolution_clock::now();
+        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+        
+        // All channels processed - calculate derived statistics (like Hdf5Loader)
+        for (int z = 0; z < profile_size; ++z) {
+            uint64_t num_pixels = num_pixels_vec[z];
+            if (num_pixels > 0) {
+                double sum = sum_vec[z];
+                double sum_sq = sum_sq_vec[z];
+                
+                mean_vec[z] = sum / num_pixels;
+                rms_vec[z] = std::sqrt(sum_sq / num_pixels);
+                sigma_vec[z] = num_pixels > 1 ? std::sqrt((sum_sq - (sum * sum / num_pixels)) / (num_pixels - 1)) : 0;
+                extrema_vec[z] = (std::abs(min_vec[z]) > std::abs(max_vec[z])) ? min_vec[z] : max_vec[z];
+                
+                // Calculate flux density if beam area is available
+                if (has_flux) {
+                    flux_vec[z] = sum / beam_area;
+                }
+            }
+        }
+        
+        // Store all statistics in results map
+        results[CARTA::StatsType::NumPixels] = num_pixels_vec;
+        results[CARTA::StatsType::NanCount] = nan_count_vec;
+        results[CARTA::StatsType::Sum] = sum_vec;
+        results[CARTA::StatsType::Mean] = mean_vec;
+        results[CARTA::StatsType::RMS] = rms_vec;
+        results[CARTA::StatsType::Sigma] = sigma_vec;
+        results[CARTA::StatsType::SumSq] = sum_sq_vec;
+        results[CARTA::StatsType::Min] = min_vec;
+        results[CARTA::StatsType::Max] = max_vec;
+        results[CARTA::StatsType::Extrema] = extrema_vec;
+        
+        // Add flux density if available
+        if (has_flux) {
+            results[CARTA::StatsType::FluxDensity] = flux_vec;
+        }
+        
         progress = 1.0;
         
-        spdlog::debug("GetRegionSpectralData: Successfully processed {} channels in batches for region {}x{}", 
-                     profile_size, region_width, region_height);
+        // Log comprehensive statistics summary
+        spdlog::info("GetRegionSpectralData: Successfully processed {} channels for region {}x{} - TOTAL TIME: {} ms ({:.2f} ms/channel)", 
+                     profile_size, region_width, region_height, total_ms, static_cast<double>(total_ms) / profile_size);
+        spdlog::info("GetRegionSpectralData: Returned {} statistics types: NumPixels, NanCount, Sum, Mean, RMS, Sigma, SumSq, Min, Max, Extrema{}",
+                     results.size(), has_flux ? ", FluxDensity" : "");
         
         return true;
         
@@ -645,6 +838,194 @@ bool ZarrLoader::GetSpectralDataOptimized(std::vector<float>& data, int stokes, 
         
     } catch (std::exception& e) {
         spdlog::error("ZarrLoader::GetSpectralDataOptimized: Exception: {}", e.what());
+        return false;
+    }
+}
+
+bool ZarrLoader::GetSpatialProfileX(std::vector<float>& data, int x_start, int x_end, int y, int z, int stokes, std::mutex& image_mutex) {
+    // Read X spatial profile (horizontal line) directly from TensorStore
+    std::lock_guard<std::mutex> lock(image_mutex);
+    
+    try {
+        if (!_image) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: No image available");
+            return false;
+        }
+        
+        auto zarr_image = std::dynamic_pointer_cast<CartaZarrImage>(_image);
+        if (!zarr_image) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: Image is not a CartaZarrImage");
+            return false;
+        }
+        
+        casacore::IPosition shape = _image->shape();
+        int img_width = shape[0];
+        int img_height = shape[1];
+        
+        // Validate parameters
+        if (y < 0 || y >= img_height) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: y={} out of bounds (height={})", y, img_height);
+            return false;
+        }
+        
+        if (x_start < 0 || x_end >= img_width || x_start > x_end) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: Invalid x range [{},{}] (width={})", x_start, x_end, img_width);
+            return false;
+        }
+        
+        if (shape.size() > 3 && (stokes < 0 || stokes >= shape[3])) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: Stokes {} out of bounds (max: {})", stokes, shape[3] - 1);
+            return false;
+        }
+        
+        int profile_length = x_end - x_start + 1;
+        data.resize(profile_length);
+        
+        // Read horizontal line from TensorStore
+        casacore::IPosition start, length;
+        
+        if (shape.size() == 5) {
+            // 5D ZARR: [time, freq, stokes, l, m] where l=x(width), m=y(height)
+            start = casacore::IPosition(5, 0, z, stokes, x_start, y);
+            length = casacore::IPosition(5, 1, 1, 1, profile_length, 1);
+        } else if (shape.size() == 4) {
+            // 4D: [x, y, z, stokes]
+            start = casacore::IPosition(4, x_start, y, z, stokes);
+            length = casacore::IPosition(4, profile_length, 1, 1, 1);
+        } else if (shape.size() == 3) {
+            // 3D: [x, y, z]
+            start = casacore::IPosition(3, x_start, y, z);
+            length = casacore::IPosition(3, profile_length, 1, 1);
+        } else if (shape.size() == 2) {
+            // 2D: [x, y]
+            start = casacore::IPosition(2, x_start, y);
+            length = casacore::IPosition(2, profile_length, 1);
+        } else {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: Unsupported dimensions: {}", shape.size());
+            return false;
+        }
+        
+        casacore::Array<float> profile_array;
+        casacore::Slicer slicer(start, length);
+        
+        spdlog::debug("GetSpatialProfileX: Reading x=[{},{}] at y={}, z={}, stokes={}", x_start, x_end, y, z, stokes);
+        
+        // Use direct TensorStore read to bypass cache
+        if (!zarr_image->readPixelFromTensorStore(profile_array, slicer)) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: readPixelFromTensorStore failed");
+            return false;
+        }
+        
+        if (profile_array.nelements() != profile_length) {
+            spdlog::error("ZarrLoader::GetSpatialProfileX: Expected {} elements, got {}", profile_length, profile_array.nelements());
+            return false;
+        }
+        
+        // Copy to output vector
+        const float* array_data = profile_array.data();
+        for (int i = 0; i < profile_length; ++i) {
+            data[i] = array_data[i];
+        }
+        
+        spdlog::debug("GetSpatialProfileX: Success - read {} pixels", profile_length);
+        return true;
+        
+    } catch (std::exception& e) {
+        spdlog::error("ZarrLoader::GetSpatialProfileX: Exception: {}", e.what());
+        return false;
+    }
+}
+
+bool ZarrLoader::GetSpatialProfileY(std::vector<float>& data, int x, int y_start, int y_end, int z, int stokes, std::mutex& image_mutex) {
+    // Read Y spatial profile (vertical line) directly from TensorStore
+    std::lock_guard<std::mutex> lock(image_mutex);
+    
+    try {
+        if (!_image) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: No image available");
+            return false;
+        }
+        
+        auto zarr_image = std::dynamic_pointer_cast<CartaZarrImage>(_image);
+        if (!zarr_image) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: Image is not a CartaZarrImage");
+            return false;
+        }
+        
+        casacore::IPosition shape = _image->shape();
+        int img_width = shape[0];
+        int img_height = shape[1];
+        
+        // Validate parameters
+        if (x < 0 || x >= img_width) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: x={} out of bounds (width={})", x, img_width);
+            return false;
+        }
+        
+        if (y_start < 0 || y_end >= img_height || y_start > y_end) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: Invalid y range [{},{}] (height={})", y_start, y_end, img_height);
+            return false;
+        }
+        
+        if (shape.size() > 3 && (stokes < 0 || stokes >= shape[3])) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: Stokes {} out of bounds (max: {})", stokes, shape[3] - 1);
+            return false;
+        }
+        
+        int profile_length = y_end - y_start + 1;
+        data.resize(profile_length);
+        
+        // Read vertical line from TensorStore
+        casacore::IPosition start, length;
+        
+        if (shape.size() == 5) {
+            // 5D ZARR: [time, freq, stokes, l, m] where l=x(width), m=y(height)
+            start = casacore::IPosition(5, 0, z, stokes, x, y_start);
+            length = casacore::IPosition(5, 1, 1, 1, 1, profile_length);
+        } else if (shape.size() == 4) {
+            // 4D: [x, y, z, stokes]
+            start = casacore::IPosition(4, x, y_start, z, stokes);
+            length = casacore::IPosition(4, 1, profile_length, 1, 1);
+        } else if (shape.size() == 3) {
+            // 3D: [x, y, z]
+            start = casacore::IPosition(3, x, y_start, z);
+            length = casacore::IPosition(3, 1, profile_length, 1);
+        } else if (shape.size() == 2) {
+            // 2D: [x, y]
+            start = casacore::IPosition(2, x, y_start);
+            length = casacore::IPosition(2, 1, profile_length);
+        } else {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: Unsupported dimensions: {}", shape.size());
+            return false;
+        }
+        
+        casacore::Array<float> profile_array;
+        casacore::Slicer slicer(start, length);
+        
+        spdlog::debug("GetSpatialProfileY: Reading y=[{},{}] at x={}, z={}, stokes={}", y_start, y_end, x, z, stokes);
+        
+        // Use direct TensorStore read to bypass cache
+        if (!zarr_image->readPixelFromTensorStore(profile_array, slicer)) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: readPixelFromTensorStore failed");
+            return false;
+        }
+        
+        if (profile_array.nelements() != profile_length) {
+            spdlog::error("ZarrLoader::GetSpatialProfileY: Expected {} elements, got {}", profile_length, profile_array.nelements());
+            return false;
+        }
+        
+        // Copy to output vector
+        const float* array_data = profile_array.data();
+        for (int i = 0; i < profile_length; ++i) {
+            data[i] = array_data[i];
+        }
+        
+        spdlog::debug("GetSpatialProfileY: Success - read {} pixels", profile_length);
+        return true;
+        
+    } catch (std::exception& e) {
+        spdlog::error("ZarrLoader::GetSpatialProfileY: Exception: {}", e.what());
         return false;
     }
 }

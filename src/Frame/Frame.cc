@@ -1233,7 +1233,24 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
                 }
 
                 if (is_current_stokes) {
-                    if (_use_tile_cache) { // Use tile cache to return full resolution data or prepare data for decimation
+                    // ZARR optimization: Use ZarrLoader direct read to bypass corrupted cache
+                    auto zarr_loader = std::dynamic_pointer_cast<ZarrLoader>(_loader);
+                    if (zarr_loader) {
+                        // Use direct TensorStore read for ZARR files
+                        profile.resize(end - start);
+                        
+                        if (config.coordinate().back() == 'x') {
+                            have_profile = zarr_loader->GetSpatialProfileX(profile, start, end - 1, y, CurrentZ(), stokes, _image_mutex);
+                            if (have_profile) {
+                                spdlog::debug("Frame: ZarrLoader GetSpatialProfileX succeeded for x=[{},{}] at y={}", start, end-1, y);
+                            }
+                        } else if (config.coordinate().back() == 'y') {
+                            have_profile = zarr_loader->GetSpatialProfileY(profile, x, start, end - 1, CurrentZ(), stokes, _image_mutex);
+                            if (have_profile) {
+                                spdlog::debug("Frame: ZarrLoader GetSpatialProfileY succeeded for y=[{},{}] at x={}", start, end-1, x);
+                            }
+                        }
+                    } else if (_use_tile_cache) { // Use tile cache to return full resolution data or prepare data for decimation
                         profile.resize(end - start);
 
                         if (config.coordinate().back() == 'x') {

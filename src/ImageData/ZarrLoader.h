@@ -48,6 +48,10 @@ public:
     // Optimized method for reading large spectral ranges at once
     bool GetSpectralDataOptimized(std::vector<float>& data, int stokes, int x, int y, 
                                  int z_start, int z_end, std::mutex& image_mutex);
+    
+    // Spatial profile methods (read directly from TensorStore, bypass cache)
+    bool GetSpatialProfileX(std::vector<float>& data, int x_start, int x_end, int y, int z, int stokes, std::mutex& image_mutex);
+    bool GetSpatialProfileY(std::vector<float>& data, int x, int y_start, int y_end, int z, int stokes, std::mutex& image_mutex);
         
     const casacore::IPosition GetStatsDataShape(FileInfo::Data ds) override;
     std::unique_ptr<casacore::ArrayBase> GetStatsData(FileInfo::Data ds) override;

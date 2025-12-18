@@ -31,7 +31,9 @@ namespace carta {
 class CartaZarrImage : public casacore::ImageInterface<float> {
 public:
     explicit CartaZarrImage(const std::string& filename);
-    virtual ~CartaZarrImage() = default;
+    // Copy constructor for efficient SubImage creation (shares TensorStore and cache)
+    CartaZarrImage(const CartaZarrImage& other);
+    virtual ~CartaZarrImage();
 
     // ImageInterface implementation
     casacore::String imageType() const override;
@@ -89,6 +91,7 @@ private:
     std::vector<float> _channel_cache;     // Cached data for current region
     bool _channel_cache_loaded = false;    // Whether cache is loaded
     int _cached_channel = 0;               // Which channel is cached (default: first channel)
+    int _num_cached_channels = 1;          // Number of channels in cache (for multi-channel caching)
     int _cache_width = 0;                  // Width of cached data
     int _cache_height = 0;                 // Height of cached data
     int _cache_start_x = 0;                // Start X coordinate of cached region
@@ -98,6 +101,9 @@ private:
     int _cache_freq_start = 0;             // Starting frequency index in 4D cache
     int _cache_stokes_start = 0;           // Starting stokes index in 4D cache
     bool _is_full_channel_cache = false;   // Whether cache contains full channel or just a region
+    
+    // Copy tracking - whether this is a shallow copy sharing TensorStore and cache
+    bool _is_copy = false;
     
     // File modification time tracking for metadata caching
     std::time_t _file_last_modified = 0;
@@ -109,10 +115,15 @@ private:
     bool hasFileChanged();
     bool parseWCSFromZattrs(const nlohmann::json& zattrs);
     bool parseWCSFromCoordinateArrays(const std::filesystem::path& ra_path, const std::filesystem::path& dec_path, const std::filesystem::path& freq_path);
+    bool parseWCSFromLMArrays(const std::filesystem::path& l_path, const std::filesystem::path& m_path, const std::filesystem::path& freq_path);
     bool parseWCSFromMetadata(const nlohmann::json& zattrs);
     bool buildDirectionCoordinateFromArrays(double ra_rad, double dec_rad, double freq_hz, 
                                            double ra_cdelt_deg, double dec_cdelt_deg, double freq_cdelt_hz,
                                            size_t height, size_t width, size_t depth);
+    bool buildDirectionCoordinateFromLM(double ref_ra_rad, double ref_dec_rad, double freq_hz,
+                                       double l_cdelt_deg, double m_cdelt_deg, double freq_cdelt_hz,
+                                       double crpix_l, double crpix_m,
+                                       size_t nl, size_t nm, size_t depth);
     void createMinimalCoordinateSystem();
     void initializeTensorStore();
     
@@ -123,6 +134,9 @@ private:
     
     // Get direction reference system from ZARR metadata (handles ICRS, FK5, FK4)
     casacore::MDirection::Types GetDirectionType();
+    
+    // Get projection type from ZARR metadata (handles SIN, CAR, TAN, etc.)
+    casacore::Projection GetProjectionType();
     
     // Channel cache methods - now support region-based caching
     bool loadChannelCache(int freq_channel = 0, int stokes_channel = 0);
