@@ -27,7 +27,7 @@
 	shallow = true
 [submodule "schemas"]
 	path = schemas
-	url = https://github.com/CARTAvis/schemas.git
+	url = https://github.com/pshnghng0318/schemas.git
 [submodule "third-party/json-schema-validator"]
 	path = third-party/json-schema-validator
 	url = https://github.com/pboettch/json-schema-validator
