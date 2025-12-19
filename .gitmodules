@@ -27,10 +27,10 @@
 	shallow = true
 [submodule "schemas"]
 	path = schemas
-	url = https://github.com/CARTAvis/schemas.git
+	url = https://github.com/pshnghng0318/schemas.git
 [submodule "third-party/json-schema-validator"]
 	path = third-party/json-schema-validator
-	url = https://github.com/pboettch/json-schema-validator
+	url = https://github.com/pshnghng0318/json-schema-validator
 	shallow = true
 [submodule "third-party/nlohmann_json"]
 	path = third-party/nlohmann_json
@@ -47,9 +47,3 @@
 [submodule "tensorstore"]
 	path = tensorstore
 	url = https://github.com/google/tensorstore.git
-[submodule "third-party/xtensor"]
-	path = third-party/xtensor
-	url = https://github.com/xtensor-stack/xtensor.git
-[submodule "third-party/xtl"]
-	path = third-party/xtl
-	url = https://github.com/xtensor-stack/xtl.git

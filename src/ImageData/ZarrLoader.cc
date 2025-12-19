@@ -417,10 +417,16 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         }
         
         // CONFIGURABLE: Number of channels per CPU thread (via --cpu_ch flag)
-        // Get from ProgramSettings, default is 8 channels per CPU
+        // Get from ProgramSettings EACH TIME this method is called, allowing runtime changes
         const int PARALLEL_THREADS = 4;  // Fixed: use 4 CPUs
-        const int CHANNELS_PER_THREAD = carta::ProgramSettings::GetInstance().cpu_ch;
-        const int BATCH_SIZE = PARALLEL_THREADS * CHANNELS_PER_THREAD;  // Dynamic batch size
+        auto& settings = carta::ProgramSettings::GetInstance();
+        const int CHANNELS_PER_THREAD = settings.cpu_ch;
+        const int BATCH_SIZE = PARALLEL_THREADS * CHANNELS_PER_THREAD;  // Dynamic batch size recalculated per call
+        
+        spdlog::warn("🔍 DEBUG: Reading cpu_ch from ProgramSettings");
+        spdlog::warn("🔍 DEBUG: ProgramSettings address = {}", static_cast<void*>(&settings));
+        spdlog::warn("🔍 DEBUG: cpu_ch value = {} (CHANNELS_PER_THREAD={})", settings.cpu_ch, CHANNELS_PER_THREAD);
+        spdlog::warn("🔍 DEBUG: BATCH_SIZE = {} × {} = {}", PARALLEL_THREADS, CHANNELS_PER_THREAD, BATCH_SIZE);
         
         size_t memory_per_batch_mb = (BATCH_SIZE * region_area * sizeof(float)) / (1024 * 1024);
         double memory_per_batch_gb = memory_per_batch_mb / 1024.0;
@@ -434,8 +440,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
 #else
         spdlog::warn("  OpenMP NOT enabled - statistics will run sequentially");
 #endif
-        spdlog::info("  Batch config: {} threads × {} channels/thread = {} channels/batch ({:.2f} GB/batch)", 
-                    PARALLEL_THREADS, CHANNELS_PER_THREAD, BATCH_SIZE, memory_per_batch_gb);
+        spdlog::info("  Batch config: {} threads × {} channels/thread = {} channels/batch ({:.2f} GB/batch) [cpu_ch={}, dynamically loaded]", 
+                    PARALLEL_THREADS, CHANNELS_PER_THREAD, BATCH_SIZE, memory_per_batch_gb, CHANNELS_PER_THREAD);
         auto start_time = std::chrono::high_resolution_clock::now();
         
         // Enable nested OpenMP parallelism for I/O threads + compute parallelism
