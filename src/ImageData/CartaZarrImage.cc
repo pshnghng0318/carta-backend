@@ -103,7 +103,7 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
             // Read dtype from .zarray metadata
             if (zarray_json.contains("dtype")) {
                 std::string dtype_str = zarray_json["dtype"].get<std::string>();
-                spdlog::info("ZARR dtype: {}", dtype_str);
+                spdlog::debug("ZARR dtype: {}", dtype_str);
                 
                 // Parse ZARR dtype to casacore DataType
                 if (dtype_str == "<f4" || dtype_str == ">f4" || dtype_str == "float32") {
@@ -118,7 +118,7 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
                     spdlog::warn("Unknown ZARR dtype {}, defaulting to float32", dtype_str);
                     _actual_data_type = casacore::DataType::TpFloat;
                 }
-                spdlog::info("Mapped ZARR dtype {} to casacore DataType", dtype_str);
+                spdlog::debug("Mapped ZARR dtype {} to casacore DataType", dtype_str);
             }
             
             // Read shape from .zarray metadata
@@ -147,8 +147,8 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
                     
                     _shape = IPosition(reordered_shape);
                     _original_zarr_shape = IPosition(shape_vec); // Keep original for TensorStore access
-                    spdlog::info("Zarr image shape (CARTA order): {}", _shape.toString());
-                    spdlog::info("Original ZARR shape: {}", _original_zarr_shape.toString());
+                    spdlog::debug("Zarr image shape (CARTA order): {}", _shape.toString());
+                    spdlog::debug("Original ZARR shape: {}", _original_zarr_shape.toString());
                 } else {
                     _shape = IPosition(2, 1, 1);  // Default fallback
                 }
@@ -338,7 +338,7 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
         bool use_lm_coords = std::filesystem::exists(l_path) && std::filesystem::exists(m_path);
         
         if (use_lm_coords) {
-            spdlog::info("ZARR WCS: Using l,m coordinate arrays for SIN projection");
+            spdlog::debug("ZARR WCS: Using l,m coordinate arrays for SIN projection");
             return parseWCSFromLMArrays(l_path, m_path, freq_path);
         }
         
@@ -355,7 +355,7 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
         // spdlog::debug("ZARR WCS: Coordinate arrays shape: {}x{}", height, width);
         
         // Read actual RA coordinate data using TensorStore
-        spdlog::info("ZARR COORDS: Reading RA coordinate array: {}x{}", height, width);
+        spdlog::debug("ZARR COORDS: Reading RA coordinate array: {}x{}", height, width);
         
         // Create TensorStore spec for RA array
         nlohmann::json ra_spec = {
@@ -429,7 +429,7 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
             ra_rad = ra_samples[ra_samples.size()/2];  // Use middle sample as reference
         }
         // Read actual DEC coordinate data using TensorStore
-        spdlog::info("ZARR COORDS: Reading DEC coordinate array: {}x{}", height, width);
+        spdlog::debug("ZARR COORDS: Reading DEC coordinate array: {}x{}", height, width);
         
         // Create TensorStore spec for DEC array
         nlohmann::json dec_spec = {
@@ -544,7 +544,7 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
         auto freq_shape = freq_meta["shape"];
         size_t depth = freq_shape[0].get<size_t>();  // channel numbers
 
-        spdlog::info("ZARR COORDS: Reading frequency coordinate array, {} channels", depth);
+        spdlog::debug("ZARR COORDS: Reading frequency coordinate array, {} channels", depth);
         
         // Read actual frequency coordinate data using TensorStore
         nlohmann::json freq_spec = {
@@ -629,7 +629,7 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
         double ra_cdelt_deg = ra_cdelt * 180.0 / M_PI;  // Convert to degrees
         double dec_cdelt_deg = dec_cdelt * 180.0 / M_PI;  // Convert to degrees
         
-        spdlog::info("ZARR COORDS: Final coordinate parameters:");
+        spdlog::debug("ZARR COORDS: Final coordinate parameters:");
         spdlog::info("  RA center: {:.6f}° (cdelt: {:.6f}°/pix)", ra_deg, ra_cdelt_deg);
         spdlog::info("  DEC center: {:.6f}° (cdelt: {:.6f}°/pix)", dec_deg, dec_cdelt_deg);
         spdlog::info("  FREQ reference: {:.3f} MHz (cdelt: {:.3f} MHz/ch)", freq_hz / 1e6, freq_cdelt / 1e6);
@@ -643,7 +643,7 @@ bool CartaZarrImage::parseWCSFromCoordinateArrays(const std::filesystem::path& r
 
 bool CartaZarrImage::parseWCSFromLMArrays(const std::filesystem::path& l_path, const std::filesystem::path& m_path, const std::filesystem::path& freq_path) {
     try {
-        spdlog::info("ZARR WCS: Parsing WCS from l,m coordinate arrays (SIN projection)");
+        spdlog::debug("ZARR WCS: Parsing WCS from l,m coordinate arrays (SIN projection)");
         
         // Read l array metadata
         std::ifstream l_zarray(l_path / ".zarray");
@@ -657,7 +657,7 @@ bool CartaZarrImage::parseWCSFromLMArrays(const std::filesystem::path& l_path, c
         m_zarray >> m_meta;
         size_t nm = m_meta["shape"][0].get<size_t>();
         
-        spdlog::info("ZARR WCS: l,m array dimensions: {} x {}", nl, nm);
+        spdlog::debug("ZARR WCS: l,m array dimensions: {} x {}", nl, nm);
         
         // Read reference coordinates (phase center) from main .zattrs
         std::filesystem::path main_zattrs = l_path.parent_path() / ".zattrs";
@@ -924,7 +924,7 @@ bool CartaZarrImage::buildDirectionCoordinateFromArrays(double ra_rad, double de
         inc(0) = -ra_cdelt_deg * M_PI / 180.0;    // RA increment in radians (negative for RA)
         inc(1) = dec_cdelt_deg * M_PI / 180.0;    // DEC increment in radians
         
-        spdlog::info("ZARR WCS: Using calculated pixel increments:");
+        spdlog::debug("ZARR WCS: Using calculated pixel increments:");
         spdlog::info("  RA increment: {:.6e} rad ({:.3f} arcsec)", inc(0), inc(0) * 180.0 * 3600.0 / M_PI);
         spdlog::info("  DEC increment: {:.6e} rad ({:.3f} arcsec)", inc(1), inc(1) * 180.0 * 3600.0 / M_PI);
         
@@ -3497,8 +3497,8 @@ Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer
         // The issue is that ZarrLoader is passing coordinates in ZARR order already!
         // We need to map the incoming slicer coordinates correctly
         
-        spdlog::debug("readPixelFromTensorStore: section start={}, length={}, shape={}", 
-                     start.toString(), length.toString(), _original_zarr_shape.toString());
+        // spdlog::debug("readPixelFromTensorStore: section start={}, length={}, shape={}", 
+        //              start.toString(), length.toString(), _original_zarr_shape.toString());
         
         std::vector<tensorstore::Index> box_origin;
         std::vector<tensorstore::Index> box_shape;
@@ -3588,10 +3588,10 @@ Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer
             }
         }
         
-        spdlog::debug("DIRECT PIXEL READ: TensorStore slice [time={}, freq={}, stokes={}, x={}:{}, y={}:{}]",
-                     box_origin[0], box_origin[1], box_origin[2], 
-                     box_origin[3], box_origin[3] + box_shape[3] - 1,
-                     box_origin[4], box_origin[4] + box_shape[4] - 1);
+        // spdlog::debug("DIRECT PIXEL READ: TensorStore slice [time={}, freq={}, stokes={}, x={}:{}, y={}:{}]",
+        //              box_origin[0], box_origin[1], box_origin[2], 
+        //              box_origin[3], box_origin[3] + box_shape[3] - 1,
+        //              box_origin[4], box_origin[4] + box_shape[4] - 1);
         
         tensorstore::Box<> cache_box(box_origin, box_shape);
         

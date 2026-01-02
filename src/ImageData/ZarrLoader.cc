@@ -37,7 +37,7 @@ ZarrLoader::ZarrLoader(const std::string& filename) : FileLoader(filename) {
     _num_dims = 0;
     _has_pixel_mask = false;
     
-    spdlog::info("ZarrLoader created for: {}", _filename);
+    spdlog::debug("ZarrLoader created for: {}", _filename);
 }
 
 void ZarrLoader::AllocateImage(const std::string& hdu) {
@@ -56,7 +56,7 @@ void ZarrLoader::AllocateImage(const std::string& hdu) {
             // Set image shape for coordinate axis finding
             _image_shape = shape;
             
-            spdlog::info("Created CartaZarrImage: {} dims={}, has_mask={}", _filename, _num_dims, _has_pixel_mask);
+            spdlog::debug("Created CartaZarrImage: {} dims={}, has_mask={}", _filename, _num_dims, _has_pixel_mask);
         }
     } catch (std::exception& e) {
         spdlog::error("Failed to create CartaZarrImage for {}: {}", _filename, e.what());
@@ -245,8 +245,8 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
             
             processed += batch_size;
             
-            spdlog::debug("GetCursorSpectralData: Processed {}/{} channels ({:.1f}%), batch_time={:.2f}ms",
-                         processed, num_channels, 100.0 * processed / num_channels, dt_ms);
+            // spdlog::debug("GetCursorSpectralData: Processed {}/{} channels ({:.1f}%), batch_time={:.2f}ms",
+            //              processed, num_channels, 100.0 * processed / num_channels, dt_ms);
         }
         
         spdlog::debug("GetCursorSpectralData: Successfully read {} channels in batches for point ({},{})", 
@@ -260,13 +260,12 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
 }
 
 bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, std::mutex& image_mutex) {
-    spdlog::info("=== UseRegionSpectralData CALLED ===");
-    spdlog::info("Region shape: [{} dimensions] = [{}]", region_shape.size(), 
+    spdlog::debug("UseRegionSpectralData CALLED, Region shape: [{} dimensions] = [{}]", region_shape.size(), 
                  region_shape.size() >= 2 ? fmt::format("{}, {}", region_shape[0], region_shape[1]) : "N/A");
     
     // Always use optimized path for point spectral (cursor) 
     if (region_shape.size() >= 2 && region_shape[0] == 1 && region_shape[1] == 1) {
-        spdlog::info("UseRegionSpectralData: RETURNING TRUE for optimized point spectral data (1x1 region)");
+        spdlog::debug("UseRegionSpectralData: point spectral data (1x1)");
         return true;
     }
 
@@ -274,12 +273,12 @@ bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, 
         int region_size = region_shape[0] * region_shape[1];
         
         // Always use batch processing for region spectral data since we use direct read without cache
-        spdlog::info("UseRegionSpectralData: RETURNING TRUE for region spectral data ({}x{} region, size: {} pixels) - using multi-channel batch processing", 
+        spdlog::debug("UseRegionSpectralData: region {}x{} ({} px)", 
                      region_shape[0], region_shape[1], region_size);
         return true;
     }
 
-    spdlog::info("UseRegionSpectralData: RETURNING FALSE - Using default image slicing for {}x{} region", 
+    spdlog::debug("UseRegionSpectralData: default slicing {}x{}", 
                  region_shape[0], region_shape[1]);
     return false;
 }
@@ -291,8 +290,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
     // Use a map to track processing state per region_id
     static std::map<int, int> region_batch_state;  // region_id -> next_batch_start_z
     
-    spdlog::info("ZarrLoader::GetRegionSpectralData: BATCH PROCESSING CALLED - region_id={}, spectral_range={}:{}, stokes={}, progress={}", 
-                region_id, spectral_range.from, spectral_range.to, stokes, progress);
+    // spdlog::debug("GetRegionSpectralData: region_id={}, range={}:{}, stokes={}, progress={:.1f}%", 
+    //             region_id, spectral_range.from, spectral_range.to, stokes, progress * 100);
     
     std::lock_guard<std::mutex> lock(image_mutex);
     
@@ -339,20 +338,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         double beam_area = CalculateBeamArea();
         bool has_flux = !std::isnan(beam_area);
         
-        spdlog::info("GetRegionSpectralData: beam_area={}, has_flux={}", beam_area, has_flux);
-        
-        // Additional debug: check image info
-        auto image = GetImage();
-        if (image) {
-            auto& info = image->imageInfo();
-            if (info.hasSingleBeam()) {
-                spdlog::info("GetRegionSpectralData: Image has single beam");
-            } else {
-                spdlog::warn("GetRegionSpectralData: Image does NOT have single beam!");
-            }
-        } else {
-            spdlog::warn("GetRegionSpectralData: Image pointer is null!");
-        }
+        // spdlog::debug("GetRegionSpectralData: beam_area={}, has_flux={}", beam_area, has_flux);
 
         // Use static storage for intermediate results (persists across calls)
         struct RegionSpectralState {
@@ -375,7 +361,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         bool need_init = (state.num_pixels_vec.size() != profile_size);
         
         if (need_init) {
-            spdlog::info("GetRegionSpectralData: Initializing result vectors for region_id={}, profile_size={}", region_id, profile_size);
+            spdlog::debug("GetRegionSpectralData: Init vectors region_id={}, size={}", region_id, profile_size);
             state.num_pixels_vec.assign(profile_size, 0);
             state.nan_count_vec.assign(profile_size, 0);
             state.sum_vec.assign(profile_size, 0.0);
@@ -423,32 +409,23 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         const int CHANNELS_PER_THREAD = settings.cpu_ch;
         const int BATCH_SIZE = PARALLEL_THREADS * CHANNELS_PER_THREAD;  // Dynamic batch size recalculated per call
         
-        spdlog::warn("🔍 DEBUG: Reading cpu_ch from ProgramSettings");
-        spdlog::warn("🔍 DEBUG: ProgramSettings address = {}", static_cast<void*>(&settings));
-        spdlog::warn("🔍 DEBUG: cpu_ch value = {} (CHANNELS_PER_THREAD={})", settings.cpu_ch, CHANNELS_PER_THREAD);
-        spdlog::warn("🔍 DEBUG: BATCH_SIZE = {} × {} = {}", PARALLEL_THREADS, CHANNELS_PER_THREAD, BATCH_SIZE);
+        // Debug info removed to reduce log spam
         
         size_t memory_per_batch_mb = (BATCH_SIZE * region_area * sizeof(float)) / (1024 * 1024);
         double memory_per_batch_gb = memory_per_batch_mb / 1024.0;
         
-        spdlog::info("GetRegionSpectralData: Processing {} channels, region={}x{} pixels ({} total pixels)", 
-                    profile_size, region_width, region_height, region_area);
-        spdlog::info("  Thread strategy: {} CPUs detected -> using {} threads for I/O", hardware_cpus, PARALLEL_THREADS);
-#ifdef _OPENMP
-        int omp_threads = omp_get_max_threads();
-        spdlog::info("  OpenMP enabled: {} threads available for parallel statistics computation", omp_threads);
-#else
-        spdlog::warn("  OpenMP NOT enabled - statistics will run sequentially");
-#endif
-        spdlog::info("  Batch config: {} threads × {} channels/thread = {} channels/batch ({:.2f} GB/batch) [cpu_ch={}, dynamically loaded]", 
-                    PARALLEL_THREADS, CHANNELS_PER_THREAD, BATCH_SIZE, memory_per_batch_gb, CHANNELS_PER_THREAD);
+        // Only log summary on first batch
+        if (need_init) {
+            spdlog::info("GetRegionSpectralData: {} channels, region {}x{}, batch_size={} ({:.2f} GB/batch)", 
+                        profile_size, region_width, region_height, BATCH_SIZE, memory_per_batch_gb);
+        }
         auto start_time = std::chrono::high_resolution_clock::now();
         
         // Enable nested OpenMP parallelism for I/O threads + compute parallelism
 #ifdef _OPENMP
         omp_set_max_active_levels(2);  // Enable 2-level parallelism: I/O threads + compute threads
         omp_set_num_threads(PARALLEL_THREADS);
-        spdlog::info("Using OpenMP with {} I/O threads, nested parallelism enabled for compute", PARALLEL_THREADS);
+        // spdlog::debug("Using OpenMP with {} I/O threads, nested parallelism enabled for compute", PARALLEL_THREADS);
 #endif
         
         // Process channels in batches - each thread reads CHANNELS_PER_THREAD channels at once
@@ -460,7 +437,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         
         // If already complete, return immediately
         if (next_batch_start > z_end) {
-            spdlog::info("GetRegionSpectralData: region_id={} already complete, cleaning up state", region_id);
+            // spdlog::debug("GetRegionSpectralData: region_id={} complete", region_id);
             region_batch_state.erase(region_id);
             progress = 1.0;
             return true;
@@ -472,9 +449,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         int channels_processed = batch_start - z_start;  // How many channels were processed before this batch
         
         auto batch_time_start = std::chrono::high_resolution_clock::now();
-        
-        spdlog::info("Processing batch: channels {}-{} ({} channels total) - is_first_batch={}, progress={:.1f}%", 
-                    batch_start, batch_end, batch_end - batch_start + 1, is_first_batch, progress * 100.0);
             
 #pragma omp parallel for schedule(static)
             for (int thread_idx = 0; thread_idx < PARALLEL_THREADS; ++thread_idx) {
@@ -603,12 +577,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                 size_t thread_mb = (num_channels * region_width * region_height * sizeof(float)) / (1024*1024);
                 double io_speed_gbs = (io_ms > 0) ? (thread_mb / 1024.0) / (io_ms / 1000.0) : 0.0;
                 
-                #pragma omp critical
-                {
-                    spdlog::info("  Thread {}: channels {}-{} ({} channels) - I/O {} ms ({:.2f} GB/s), compute {} ms, total {} ms",
-                                thread_idx, thread_start_z, thread_end_z, num_channels, 
-                                io_ms, io_speed_gbs, compute_ms, total_ms);
-                }
+                // Thread-level logging removed to reduce spam
             }
             
             auto batch_time_end = std::chrono::high_resolution_clock::now();
@@ -620,10 +589,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             // Update progress after this batch
             channels_processed += actual_batch_size;
             progress = static_cast<float>(channels_processed) / static_cast<float>(profile_size);
-            
-            spdlog::info("Batch complete: {} ms for {} channels ({} MB, {:.2f} GB/s) - Progress: {}/{} ({:.1f}%)", 
-                        batch_ms, actual_batch_size, batch_mb, batch_speed_gbs,
-                        channels_processed, profile_size, progress * 100.0);
         
         // Calculate derived statistics for channels processed so far
         for (int z = 0; z < channels_processed; ++z) {
@@ -668,18 +633,16 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             region_batch_state.erase(region_id);
             region_results_cache.erase(region_id);
             progress = 1.0;
-            spdlog::info("GetRegionSpectralData: All batches complete for region_id={}, cleaned up cache", region_id);
+            spdlog::debug("GetRegionSpectralData: All batches complete for region_id={}, cleaned up cache", region_id);
         } else {
             // More batches to process
             region_batch_state[region_id] = next_batch;
-            spdlog::info("GetRegionSpectralData: Saved state for region_id={}, next_batch_start={}", region_id, next_batch);
         }
         
         auto end_time = std::chrono::high_resolution_clock::now();
         auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
         
-        spdlog::info("GetRegionSpectralData: Returning with progress={:.1f}%, processed {}/{} channels, batch_time={} ms",
-                     progress * 100.0, channels_processed, profile_size, total_ms);
+        // Return status logged above if needed
         
         return true;
         
@@ -762,7 +725,7 @@ bool ZarrLoader::GetChunk(std::vector<float>& data, int& data_width, int& data_h
         }
         
         casacore::Array<float> chunk_array;
-        spdlog::info("GetChunk: Reading chunk with start={} length={}", 
+        spdlog::debug("GetChunk: Reading chunk with start={} length={}", 
                      fmt::join(start.asStdVector(), ","), fmt::join(length.asStdVector(), ","));
         if (!zarr_image->doGetSlice(chunk_array, casacore::Slicer(start, length))) {
             spdlog::error("ZarrLoader::GetChunk: doGetSlice failed");

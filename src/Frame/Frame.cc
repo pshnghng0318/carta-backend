@@ -1826,8 +1826,6 @@ bool Frame::GetLoaderPointSpectralData(std::vector<float>& profile, int stokes, 
 bool Frame::GetLoaderSpectralData(int region_id, const AxisRange& z_range, int stokes, const casacore::ArrayLattice<casacore::Bool>& mask,
     const casacore::IPosition& origin, std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) {
     // Get spectral data from loader (add image mutex for swizzled data)
-    spdlog::info("Frame::GetLoaderSpectralData: CALLED - region_id={}, z_range={}:{}, stokes={}", 
-                region_id, z_range.from, z_range.to, stokes);
     return _loader->GetRegionSpectralData(region_id, z_range, stokes, mask, origin, _image_mutex, results, progress);
 }
 
