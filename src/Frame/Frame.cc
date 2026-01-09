@@ -1777,10 +1777,12 @@ bool Frame::GetSlicerData(const StokesSlicer& stokes_slicer, float* data) {
         data_ok = true;
     } else {
         // Use loader to slice image
+        spdlog::info("Frame::GetZMatrix - Requesting data slice from loader");
         std::unique_lock<std::mutex> ulock(_image_mutex);
         data_ok = _loader->GetSlice(tmp, stokes_slicer);
         _loader->CloseImageIfUpdated();
         ulock.unlock();
+        spdlog::info("Frame::GetZMatrix - Data slice received, data_ok={}", data_ok);
     }
     return data_ok;
 }

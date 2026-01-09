@@ -796,6 +796,43 @@ bool ZarrLoader::GetSlice(casacore::Array<float>& data, const StokesSlicer& stok
         }
 
         spdlog::debug("ZarrLoader::GetSlice: Successfully read slice of size {}", data.size());
+        
+        // Check if we need to populate _z_stats for this channel using cached statistics
+        int z = slicer.start()[2];  // freq dimension
+        int stokes = (slicer.start().size() > 3) ? slicer.start()[3] : 0;
+        
+        const CartaZarrImage::ChannelStats* cached_stats = zarr_image->GetCachedChannelStats(z, stokes);
+        if (cached_stats && cached_stats->valid) {
+            // Ensure _z_stats is properly sized
+            if (_z_stats.size() <= stokes) {
+                _z_stats.resize(stokes + 1);
+            }
+            if (_z_stats[stokes].size() <= z) {
+                _z_stats[stokes].resize(z + 1);
+            }
+            
+            // Check if we need to populate this channel's stats
+            if (!_z_stats[stokes][z].valid || _z_stats[stokes][z].basic_stats.empty()) {
+                double mean = cached_stats->sum / cached_stats->valid_pixels;
+                double rms = std::sqrt(cached_stats->sum_sq / cached_stats->valid_pixels);
+                double variance = (cached_stats->sum_sq / cached_stats->valid_pixels) - (mean * mean);
+                double std_dev = (variance > 0) ? std::sqrt(variance) : 0.0;
+                
+                _z_stats[stokes][z].basic_stats[CARTA::StatsType::NumPixels] = static_cast<double>(cached_stats->valid_pixels);
+                _z_stats[stokes][z].basic_stats[CARTA::StatsType::Sum] = cached_stats->sum;
+                _z_stats[stokes][z].basic_stats[CARTA::StatsType::Mean] = mean;
+                _z_stats[stokes][z].basic_stats[CARTA::StatsType::Sigma] = std_dev;
+                _z_stats[stokes][z].basic_stats[CARTA::StatsType::Min] = cached_stats->min_val;
+                _z_stats[stokes][z].basic_stats[CARTA::StatsType::Max] = cached_stats->max_val;
+                _z_stats[stokes][z].basic_stats[CARTA::StatsType::RMS] = rms;
+                _z_stats[stokes][z].basic_stats[CARTA::StatsType::SumSq] = cached_stats->sum_sq;
+                _z_stats[stokes][z].valid = true;
+                
+                spdlog::info("ZarrLoader: Populated _z_stats for channel z={}, stokes={} from cache (min={:.6e}, max={:.6e})", 
+                            z, stokes, cached_stats->min_val, cached_stats->max_val);
+            }
+        }
+        
         return true;
 
     } catch (std::exception& e) {

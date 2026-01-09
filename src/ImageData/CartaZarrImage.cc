@@ -56,33 +56,62 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
     static std::unordered_map<std::string, IPosition> cached_original_shapes;
     static std::unordered_map<std::string, casacore::DataType> cached_data_types;
     static std::unordered_map<std::string, CoordinateSystem> cached_coord_sys;
-    // REMOVED: cached_tensorstores - TensorStore objects can hold large internal state (~1-2GB per file)
-    // Instead, we re-initialize TensorStore each time (fast) and rely on the 512MB shared cache_pool
+    // Cache TensorStore and Context objects for performance - reuse across multiple image instances
+    static std::unordered_map<std::string, tensorstore::TensorStore<>> cached_tensorstores;
+    static std::unordered_map<std::string, tensorstore::Context> cached_contexts;
     static std::unordered_map<std::string, std::string> cached_zarr_paths;
     static std::unordered_map<std::string, bool> brightness_unit_loaded;
     static std::unordered_map<std::string, bool> image_info_loaded;
     
     bool is_repeat_init = initialized_files[filename];
     if (is_repeat_init) {
-        spdlog::debug("CartaZarrImage: Using cached metadata for already initialized file: {}", filename);
+        auto t0 = std::chrono::high_resolution_clock::now();
+        spdlog::info("CartaZarrImage: Using cached metadata for already initialized file: {}", filename);
         
         // Use cached values to avoid expensive re-initialization
+        auto t1 = std::chrono::high_resolution_clock::now();
         _shape = cached_shapes[filename];
         _original_zarr_shape = cached_original_shapes[filename];
         _actual_data_type = cached_data_types[filename];
         _coord_sys = cached_coord_sys[filename];
         _ndim = _shape.size();
+        auto t2 = std::chrono::high_resolution_clock::now();
+        auto copy_cached_us = std::chrono::duration_cast<std::chrono::microseconds>(t2 - t1).count();
+        spdlog::info("  Copy cached metadata: {} μs", copy_cached_us);
         
-        // Always re-initialize TensorStore (fast operation, uses shared 512MB cache_pool)
-        // This avoids caching large TensorStore objects that can hold 1-2GB of internal state
-        initializeTensorStore();
+        // Reuse cached TensorStore and Context - much faster than re-initializing
+        auto t3 = std::chrono::high_resolution_clock::now();
+        if (cached_tensorstores.find(filename) != cached_tensorstores.end()) {
+            _tensorstore = cached_tensorstores[filename];
+            _context = cached_contexts[filename];
+            _tensorstore_initialized = true;
+            spdlog::info("  Reusing cached TensorStore (no re-initialization needed)");
+        } else {
+            // Fallback: initialize if not in cache (shouldn't happen)
+            spdlog::warn("  TensorStore not in cache, re-initializing...");
+            initializeTensorStore();
+        }
+        auto t4 = std::chrono::high_resolution_clock::now();
+        auto init_ts_us = std::chrono::duration_cast<std::chrono::microseconds>(t4 - t3).count();
+        spdlog::info("  TensorStore setup: {} μs ({:.2f} ms)", init_ts_us, init_ts_us / 1000.0);
         
         // Set coordinate system in ImageInterface base class
+        auto t5 = std::chrono::high_resolution_clock::now();
         setCoordinateInfo(_coord_sys);
+        auto t6 = std::chrono::high_resolution_clock::now();
+        auto set_coord_us = std::chrono::duration_cast<std::chrono::microseconds>(t6 - t5).count();
+        spdlog::info("  setCoordinateInfo: {} μs", set_coord_us);
         
         // Only read brightness unit and setup image info once per file
+        auto t7 = std::chrono::high_resolution_clock::now();
         readBrightnessUnitIfNeeded();
         setupImageInfoIfNeeded();
+        auto t8 = std::chrono::high_resolution_clock::now();
+        auto setup_info_us = std::chrono::duration_cast<std::chrono::microseconds>(t8 - t7).count();
+        spdlog::info("  readBrightnessUnit + setupImageInfo: {} μs", setup_info_us);
+        
+        auto total_us = std::chrono::duration_cast<std::chrono::microseconds>(t8 - t0).count();
+        spdlog::info("Total cached metadata init: {} μs ({:.2f} ms)", total_us, total_us / 1000.0);
         
         return;
     } else {
@@ -183,11 +212,12 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
     cached_original_shapes[filename] = _original_zarr_shape;
     cached_data_types[filename] = _actual_data_type;
     cached_coord_sys[filename] = _coord_sys;
-    // REMOVED: TensorStore caching - TensorStore objects hold large internal state (1-2GB per file)
-    // We re-initialize TensorStore each time (fast) and rely on the 512MB shared cache_pool
-    // if (_tensorstore_initialized) {
-    //     cached_tensorstores[filename] = _tensorstore;
-    // }
+    // Cache TensorStore and Context for fast reuse (shares data via cache_pool)
+    if (_tensorstore_initialized) {
+        cached_tensorstores[filename] = _tensorstore;
+        cached_contexts[filename] = _context;
+        spdlog::info("Cached TensorStore and Context for future reuse");
+    }
     
     // Set coordinate system in ImageInterface base class
     setCoordinateInfo(_coord_sys);
@@ -1560,6 +1590,7 @@ void CartaZarrImage::createMinimalCoordinateSystem() {
 }
 
 void CartaZarrImage::initializeTensorStore() {
+    auto ts_start = std::chrono::high_resolution_clock::now();
     try {
         // Detect number of CPU cores for optimal parallelization
         unsigned int num_cpus = std::thread::hardware_concurrency();
@@ -1581,11 +1612,14 @@ void CartaZarrImage::initializeTensorStore() {
             }}
         };
         
+        auto t_ctx_start = std::chrono::high_resolution_clock::now();
         auto context_result = tensorstore::Context::FromJson(context_spec);
         if (context_result.ok()) {
             _context = context_result.value();
-            spdlog::info("TensorStore context initialized: {} CPU cores, 128MB cache, {}-thread data_copy_concurrency, {}-thread file_io_concurrency",
-                        num_cpus, num_cpus, num_cpus);
+            auto t_ctx_end = std::chrono::high_resolution_clock::now();
+            auto ctx_us = std::chrono::duration_cast<std::chrono::microseconds>(t_ctx_end - t_ctx_start).count();
+            spdlog::info("    Context creation: {} μs - {} CPU cores, 128MB cache, {}-thread data_copy_concurrency",
+                        ctx_us, num_cpus, num_cpus);
         } else {
             spdlog::warn("Failed to create TensorStore context with cache and concurrency: {}, using default", 
                         context_result.status().ToString());
@@ -1643,6 +1677,7 @@ void CartaZarrImage::initializeTensorStore() {
         auto input_spec = spec_result.value();
         
         // Open input tensorstore and resolve the bounds using the pattern from extract_slice.cc
+        auto t_open_start = std::chrono::high_resolution_clock::now();
         auto open_future = tensorstore::Open(
             input_spec, 
             _context, 
@@ -1652,6 +1687,10 @@ void CartaZarrImage::initializeTensorStore() {
         );
         
         auto open_result = open_future.result();
+        auto t_open_end = std::chrono::high_resolution_clock::now();
+        auto open_us = std::chrono::duration_cast<std::chrono::microseconds>(t_open_end - t_open_start).count();
+        spdlog::info("    TensorStore::Open: {} μs ({:.2f} ms)", open_us, open_us / 1000.0);
+        
         if (!open_result.ok()) {
             spdlog::error("Failed to open TensorStore for {}: {}", _name, open_result.status().ToString());
             return;
@@ -1712,6 +1751,10 @@ void CartaZarrImage::initializeTensorStore() {
                         return result;
                     }());
         
+        auto ts_end = std::chrono::high_resolution_clock::now();
+        auto ts_total_us = std::chrono::duration_cast<std::chrono::microseconds>(ts_end - ts_start).count();
+        spdlog::info("  initializeTensorStore total: {} μs ({:.2f} ms)", ts_total_us, ts_total_us / 1000.0);
+        
     } catch (std::exception& e) {
         spdlog::error("Exception in initializeTensorStore for {}: {}", _name, e.what());
         _tensorstore_initialized = false;
@@ -1727,6 +1770,8 @@ DataType CartaZarrImage::dataType() const {
 }
 
 Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
+    spdlog::info("STEP 1: doGetSlice - Request received");
+    
     if (!_tensorstore_initialized) {
         spdlog::error("TensorStore not initialized for {}", _name);
         return false;
@@ -1748,14 +1793,24 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         
         // Detect coordinate reordering for cache logic (but don't transform coordinates)
         bool coordinates_reordered = false;
+        
+        // Detect coordinate reordering based on the pattern observed in error logs
+        // Pattern: GetChunk request [512,4096,0,0] -> doGetSlice receives [0,0,4096,512]
+        // This suggests coordinates are reordered from [x,y,freq,stokes] to [freq,stokes,y,x]
         if (start.size() >= 4) {
-            // Detect if coordinates are reordered based on ZARR format vs CARTA format
-            // This is used for cache logic, not coordinate transformation
-            bool zero_spatial = (start[0] == 0 && start[1] == 0);  
-            bool large_freq_stokes = (start[2] > 100 || start[3] > 10);  
-            bool spatial_lengths = (length.size() >= 4 && length[2] > 1 && length[3] > 1);
+            bool zero_in_spatial_pos = (start[0] == 0 && start[1] == 0);
+            bool large_values_in_freq_stokes = (start[2] > 1000 || start[3] > 100);
+            bool length_pattern_matches = (length.size() >= 4 && length[0] == 1 && length[1] == 1 && 
+                                          (length[2] > 1 || length[3] > 1));
+            coordinates_reordered = zero_in_spatial_pos && large_values_in_freq_stokes && length_pattern_matches;
             
-            coordinates_reordered = zero_spatial && large_freq_stokes && spatial_lengths;
+            if (coordinates_reordered) {
+                spdlog::debug("doGetSlice: Coordinate reordering detected - start={}, length={}", 
+                             start.toString(), length.toString());
+            }
+            
+            // Store the current coordinate reordering state for use in getSliceFromCache
+            _current_coordinates_reordered = coordinates_reordered;
         }
         
         // Detect if this call is likely for histogram/statistics calculation
@@ -1789,7 +1844,7 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             int current_stokes = (start.size() > 3) ? start[3] : 0;
             
             // Check if coordinates are reordered for statistics calls
-            if (start.size() >= 4 && start[0] == 0 && start[1] == 0) {
+            if (coordinates_reordered) {
                 current_freq = start[0];
                 current_stokes = start[1];
             }
@@ -1933,8 +1988,9 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         // NEVER use direct read - spatial profiles should ALWAYS use cache system
         // For histogram/statistics calculation, ALWAYS use full channel cache for efficiency
         // CRITICAL: For ALL spectral operations (pixel + region), use direct TensorStore read to avoid cache overhead
+        // ADDITIONAL: If coordinates are reordered, prefer full channel cache to avoid boundary issues
         bool use_region_cache = !is_1d_profile && !is_histogram_call && !is_pixel_spectral && !is_region_spectral &&
-                               (req_width < full_width / 4 && req_height < full_height / 4);
+                               (req_width < full_width / 4 && req_height < full_height / 4) && !coordinates_reordered;
         bool use_direct_read = is_pixel_spectral || is_region_spectral;  // ENABLED for ALL spectral operations
         
         spdlog::debug("CACHE STRATEGY DECISION:");
@@ -1965,10 +2021,28 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         bool cache_suitable = (_channel_cache_loaded && _cached_channel == current_channel);
         bool cache_type_suitable = true;
         
-        // For statistics/histogram, ensure we have full channel cache (like CartaFitsImage loads full data subset)
-        if (is_histogram_call && (!_is_full_channel_cache || !cache_suitable)) {
-            cache_type_suitable = false;
-            spdlog::debug("ZARR doGetSlice: Statistics/histogram requires full channel cache - loading now");
+        // For coordinate reordered requests (channel switches), skip cache system entirely
+        bool skip_cache_system = coordinates_reordered;
+        
+        // OPTIMIZED: For histogram requests, use cached statistics instead of loading full channel
+        if (is_histogram_call) {
+            // Check if we have cached histogram for this channel
+            int channel_id = freq_index * 1000 + stokes_index;
+            auto it = _all_channel_stats.find(channel_id);
+            bool have_cached_histogram = (it != _all_channel_stats.end() && it->second.valid && !it->second.histogram_bins.empty());
+            
+            if (have_cached_histogram) {
+                // Return cached histogram data without loading _channel_cache
+                spdlog::debug("Using cached histogram for channel z={}, stokes={} - no need to load pixel data", 
+                             freq_index, stokes_index);
+                // The histogram data will be retrieved by ZarrLoader from _all_channel_stats
+                return true;  // Skip loading _channel_cache
+            } else {
+                // Need to compute histogram - but DON'T load into _channel_cache
+                spdlog::debug("ZARR doGetSlice: Computing histogram for channel z={}, stokes={} without loading full cache", 
+                             freq_index, stokes_index);
+                return computeAndCacheHistogram(freq_index, stokes_index, buffer, section);
+            }
         }
         
         // For region requests, check if we want region cache instead of full cache
@@ -1977,9 +2051,9 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         }
         
         // Load appropriate cache if needed (like CartaFitsImage's GetDataSubset template selection)
-        if (!cache_suitable || !cache_type_suitable) {
+        if ((!cache_suitable || !cache_type_suitable) && !skip_cache_system) {
             
-            // BACKGROUND PRELOAD STRATEGY (inspired by FITS approach):
+            // BACKGROUND PRELOAD STRATEGY (FITS approach):
             // 1. Load current channel immediately (foreground)
             // 2. Queue background loading of next few channels (4-9 channels ahead)
             // 3. Maintain LRU cache to avoid memory overflow
@@ -2097,7 +2171,43 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                             freq_index, stokes_index);
                 
                 if (loadChannelCache(freq_index, stokes_index)) {
-                    cache_hit = getSliceFromCache(buffer, section);
+                    // OPTIMIZATION: For full channel requests without offset, copy cache directly
+                    bool can_copy_directly = false;
+                    if (_is_full_channel_cache && _channel_cache_loaded) {
+                        // Check if this is a full channel request (no offset, matches cache dimensions)
+                        int req_start_x, req_start_y, req_width, req_height;
+                        if (coordinates_reordered) {
+                            req_start_x = start[2];
+                            req_start_y = start[3];
+                            req_width = length[2];
+                            req_height = length[3];
+                        } else {
+                            req_start_x = start[1];
+                            req_start_y = start[0];
+                            req_width = length[1];
+                            req_height = length[0];
+                        }
+                        spdlog::info("length[0]={}, length[1]={}, length[2]={}, length[3]={}", 
+                                    length[0], length[1], length[2], length[3]);
+                        
+                        // For simple channel switches: request entire image without offset
+                        if (req_start_x == 0 && req_start_y == 0 && 
+                            req_width == _cache_width && req_height == _cache_height) {
+                            can_copy_directly = true;
+                            spdlog::info("STEP 6 OPTIMIZATION: Direct cache copy after loading full channel - skipping getSliceFromCache");
+                            
+                            // Direct copy from cache to buffer
+                            buffer.resize(length);
+                            float* dest_data = buffer.data();
+                            std::copy(_channel_cache.begin(), _channel_cache.end(), dest_data);
+                            
+                            cache_hit = true;
+                        }
+                    }
+                    
+                    if (!can_copy_directly) {
+                        cache_hit = getSliceFromCache(buffer, section);
+                    }
                 }
                 
                 if (!cache_hit) {
@@ -2106,11 +2216,52 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
             }
         } else {
             // Cache is already loaded and suitable, use it (like CartaFitsImage using already loaded data)
-            cache_hit = getSliceFromCache(buffer, section);
+            // But skip cache system for coordinate reordered requests (channel switches)
+            if (!skip_cache_system) {
+                // OPTIMIZATION: For full channel requests without offset, copy cache directly
+                bool can_copy_directly = false;
+                if (_is_full_channel_cache && _channel_cache_loaded) {
+                    // Check if this is a full channel request (no offset, matches cache dimensions)
+                    int req_start_x, req_start_y, req_width, req_height;
+                    if (coordinates_reordered) {
+                        req_start_x = start[2];
+                        req_start_y = start[3];
+                        req_width = length[2];
+                        req_height = length[3];
+                    } else {
+                        req_start_x = start[1];
+                        req_start_y = start[0];
+                        req_width = length[1];
+                        req_height = length[0];
+                    }
+                    spdlog::info("length[0]={}, length[1]={}, length[2]={}, length[3]={}", 
+                                    length[0], length[1], length[2], length[3]);
+                    
+                    // For simple channel switches: request entire image without offset
+                    if (req_start_x == 0 && req_start_y == 0 && 
+                        req_width == _cache_width && req_height == _cache_height) {
+                        can_copy_directly = true;
+                        spdlog::info("STEP 6 OPTIMIZATION: Direct cache copy for full channel request - skipping getSliceFromCache");
+                        
+                        // Direct copy from cache to buffer
+                        buffer.resize(length);
+                        float* dest_data = buffer.data();
+                        std::copy(_channel_cache.begin(), _channel_cache.end(), dest_data);
+                        
+                        cache_hit = true;
+                    }
+                }
+                
+                if (!can_copy_directly) {
+                    cache_hit = getSliceFromCache(buffer, section);
+                }
+            }
         }
         
         // If cache served the request successfully, return (like CartaFitsImage successful GetDataSubset)
         if (cache_hit) {
+            spdlog::info("STEP 7: Cache Hit - Successfully served {} from cache", 
+                        is_histogram_call ? "statistics/histogram" : "data");
             spdlog::debug("ZARR doGetSlice: Successfully served {} from cache (FITS-style efficient access)",
                          is_histogram_call ? "statistics/histogram" : "data");
             return true;
@@ -2209,6 +2360,13 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
                          zarr_start[4], zarr_start[4] + zarr_length[4]);
         }
         
+        // Skip TensorStore read for reordered coordinates as requested
+        if (coordinates_reordered) {
+            spdlog::info("req_width={}, req_height={}, coordinates_reordered=true - skipping TensorStore read", 
+                        req_width, req_height);
+            return false;
+        }
+        
         // Create a Box for slicing all dimensions at once
         std::vector<tensorstore::Index> box_origin(zarr_start.size());
         std::vector<tensorstore::Index> box_shape(zarr_start.size());
@@ -2242,8 +2400,8 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         if (_original_zarr_shape.size() == 5 && start.size() >= 4) {
             // For 5D case, use the clipped dimensions
             actual_read_shape.resize(4);
-            actual_read_shape[0] = zarr_length[4];  // width (x)
-            actual_read_shape[1] = zarr_length[3];  // height (y)
+            actual_read_shape[0] = zarr_length[3];  // width (x) - ZARR l dimension
+            actual_read_shape[1] = zarr_length[4];  // height (y) - ZARR m dimension
             actual_read_shape[2] = zarr_length[1];  // freq (should be 1)
             actual_read_shape[3] = zarr_length[2];  // stokes (should be 1)
         } else {
@@ -2379,13 +2537,24 @@ const CoordinateSystem& CartaZarrImage::coordinates() const {
 }
 
 bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
+    spdlog::info("STEP 2: loadChannelCache - Starting to load channel cache [freq={}, stokes={}]", freq_channel, stokes_channel);
+    
     if (!_tensorstore_initialized) {
         spdlog::error("TensorStore not initialized for channel cache loading");
         return false;
     }
     
-    // Clear old cache before loading new channel to prevent memory accumulation
-    if (_channel_cache_loaded) {
+    // Check if this channel is already cached - if so, just return success
+    int requested_channel_id = freq_channel * 1000 + stokes_channel;
+    if (_channel_cache_loaded && _cached_channel == requested_channel_id) {
+        spdlog::debug("Channel z={}, stokes={} already cached, skipping reload", freq_channel, stokes_channel);
+        return true;
+    }
+    
+    // IMPORTANT: Do NOT clear or load _channel_cache for histogram calculations
+    // Histogram data is now cached in _all_channel_stats[channel_id].histogram_bins
+    // Only clear _channel_cache when switching viewing channels (not for stats)
+    if (_channel_cache_loaded && _cached_channel != requested_channel_id) {
         std::vector<float>().swap(_channel_cache);  // Force deallocation
         _channel_cache_loaded = false;
         spdlog::debug("Cleared old channel cache before loading new channel");
@@ -2438,6 +2607,8 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
             
             tensorstore::Box<> cache_box(box_origin, box_shape);
             
+            spdlog::info("STEP 3: TensorStore I/O - Reading {}x{} pixels from disk", _cache_width, _cache_height);
+            
             // Apply the box slice to the TensorStore
             auto constrained_store = _tensorstore | tensorstore::AllDims().BoxSlice(cache_box);
             if (!constrained_store.ok()) {
@@ -2457,16 +2628,16 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
             // DEBUG: Comprehensive TensorStore data validation
             const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
             
-            // Check array dimensions from TensorStore
-            spdlog::info("DEBUG: TensorStore array info:");
-            spdlog::info("  Shape: {}", zarr_array.shape().size());
-            for (size_t i = 0; i < zarr_array.shape().size(); ++i) {
-                spdlog::info("    Dimension[{}]: {}", i, zarr_array.shape()[i]);
-            }
-            spdlog::info("  Total elements: {}", zarr_array.num_elements());
-            spdlog::info("  Expected elements: {} * {} * {} = {}", 
-                        num_cache_channels, _cache_width, _cache_height,
-                        num_cache_channels * _cache_width * _cache_height);
+            // // Check array dimensions from TensorStore
+            // spdlog::info("DEBUG: TensorStore array info:");
+            // spdlog::info("  Shape: {}", zarr_array.shape().size());
+            // for (size_t i = 0; i < zarr_array.shape().size(); ++i) {
+            //     spdlog::info("    Dimension[{}]: {}", i, zarr_array.shape()[i]);
+            // }
+            // spdlog::info("  Total elements: {}", zarr_array.num_elements());
+            // spdlog::info("  Expected elements: {} * {} * {} = {}", 
+            //             num_cache_channels, _cache_width, _cache_height,
+            //             num_cache_channels * _cache_width * _cache_height);
             
             // CRITICAL: TensorStore 5D array layout analysis
             // Shape: [time=1, freq=4, stokes=1, l=7763, m=4742]
@@ -2532,6 +2703,8 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
             
             std::copy(src_data, src_data + total_elements, _channel_cache.data());
             
+            spdlog::info("STEP 4: Data Copy - Copied {} elements to cache", total_elements);
+            
             // Store the cached channel identifier and number of channels
             _cached_channel = freq_channel * 1000 + stokes_channel;
             _num_cached_channels = num_cache_channels;
@@ -2544,6 +2717,46 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
                         freq_channel, stokes_channel,
                         _cache_width, _cache_height, 
                         (total_elements * sizeof(float)) / (1024 * 1024));
+            
+            // Calculate and cache statistics for this channel (only if not already computed)
+            int channel_id = freq_channel * 1000 + stokes_channel;
+            auto it = _all_channel_stats.find(channel_id);
+            bool need_compute_stats = (it == _all_channel_stats.end() || !it->second.valid);
+            
+            if (need_compute_stats) {
+                ChannelStats& stats = _all_channel_stats[channel_id];
+                stats.freq_channel = freq_channel;
+                stats.stokes_channel = stokes_channel;
+                stats.valid_pixels = 0;
+                stats.sum = 0.0;
+                stats.sum_sq = 0.0;
+                stats.min_val = std::numeric_limits<float>::max();
+                stats.max_val = std::numeric_limits<float>::lowest();
+                
+                for (size_t i = 0; i < total_elements; ++i) {
+                    float val = _channel_cache[i];
+                    if (!std::isnan(val) && std::isfinite(val)) {
+                        stats.valid_pixels++;
+                        stats.sum += val;
+                        stats.sum_sq += val * val;
+                        stats.min_val = std::min(stats.min_val, (double)val);
+                        stats.max_val = std::max(stats.max_val, (double)val);
+                    }
+                }
+                stats.valid = (stats.valid_pixels > 0);
+                
+                if (stats.valid) {
+                    spdlog::info("Computed stats for channel z={}, stokes={}: min={:.6e}, max={:.6e}, valid_pixels={}", 
+                                freq_channel, stokes_channel, 
+                                stats.min_val, stats.max_val, 
+                                stats.valid_pixels);
+                }
+                spdlog::info("STEP 5: Statistics - Computed channel statistics");
+            } else {
+                spdlog::debug("Using cached stats for channel z={}, stokes={} (min={:.6e}, max={:.6e})", 
+                             freq_channel, stokes_channel,
+                             it->second.min_val, it->second.max_val);
+            }
             
             // DEBUG: Output y=1000 x-profile for first channel to verify cache storage
             // if (_cache_height > 1000) {
@@ -2752,10 +2965,114 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
     }
 }
 
+bool CartaZarrImage::computeAndCacheHistogram(int freq_channel, int stokes_channel, 
+                                              casacore::Array<float>& buffer, const casacore::Slicer& section) {
+    try {
+        if (_original_zarr_shape.size() != 5) {
+            spdlog::error("computeAndCacheHistogram: Only 5D ZARR supported");
+            return false;
+        }
+        
+        size_t width = _original_zarr_shape[3];
+        size_t height = _original_zarr_shape[4];
+        
+        // Read channel data directly from TensorStore for statistics calculation
+        std::vector<tensorstore::Index> box_origin = {0, freq_channel, stokes_channel, 0, 0};
+        std::vector<tensorstore::Index> box_shape = {1, 1, 1, static_cast<tensorstore::Index>(width), static_cast<tensorstore::Index>(height)};
+        tensorstore::Box<> cache_box(box_origin, box_shape);
+        
+        auto constrained_store = _tensorstore | tensorstore::AllDims().BoxSlice(cache_box);
+        if (!constrained_store.ok()) {
+            spdlog::error("computeAndCacheHistogram: Failed to create slice: {}", constrained_store.status().ToString());
+            return false;
+        }
+        
+        auto read_result = tensorstore::Read<tensorstore::zero_origin>(constrained_store.value()).result();
+        if (!read_result.ok()) {
+            spdlog::error("computeAndCacheHistogram: Failed to read data: {}", read_result.status().ToString());
+            return false;
+        }
+        
+        auto zarr_array = std::move(read_result.value());
+        const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
+        size_t total_elements = width * height;
+        
+        // Compute basic statistics
+        int channel_id = freq_channel * 1000 + stokes_channel;
+        ChannelStats& stats = _all_channel_stats[channel_id];
+        stats.freq_channel = freq_channel;
+        stats.stokes_channel = stokes_channel;
+        stats.valid_pixels = 0;
+        stats.sum = 0.0;
+        stats.sum_sq = 0.0;
+        stats.min_val = std::numeric_limits<float>::max();
+        stats.max_val = std::numeric_limits<float>::lowest();
+        
+        for (size_t i = 0; i < total_elements; ++i) {
+            float val = src_data[i];
+            if (!std::isnan(val) && std::isfinite(val)) {
+                stats.valid_pixels++;
+                stats.sum += val;
+                stats.sum_sq += val * val;
+                stats.min_val = std::min(stats.min_val, (double)val);
+                stats.max_val = std::max(stats.max_val, (double)val);
+            }
+        }
+        
+        if (stats.valid_pixels == 0) {
+            spdlog::warn("computeAndCacheHistogram: No valid pixels in channel z={}, stokes={}", freq_channel, stokes_channel);
+            stats.valid = false;
+            return false;
+        }
+        
+        // Compute histogram (default 10000 bins like FITS)
+        int num_bins = 10000;
+        double range = stats.max_val - stats.min_val;
+        double bin_width = range / num_bins;
+        
+        stats.histogram_bins.resize(num_bins, 0);
+        stats.num_bins = num_bins;
+        stats.bin_width = bin_width;
+        stats.bin_center = stats.min_val;
+        
+        for (size_t i = 0; i < total_elements; ++i) {
+            float val = src_data[i];
+            if (!std::isnan(val) && std::isfinite(val)) {
+                int bin = static_cast<int>((val - stats.min_val) / bin_width);
+                if (bin >= num_bins) bin = num_bins - 1;
+                if (bin < 0) bin = 0;
+                stats.histogram_bins[bin]++;
+            }
+        }
+        
+        stats.valid = true;
+        
+        spdlog::info("Computed and cached histogram for channel z={}, stokes={}: {} bins, min={:.6e}, max={:.6e}, valid_pixels={}", 
+                    freq_channel, stokes_channel, num_bins,
+                    stats.min_val, stats.max_val, stats.valid_pixels);
+        
+        // Fill buffer with the histogram data (if requested)
+        if (buffer.size() == num_bins) {
+            float* dest = buffer.data();
+            for (int i = 0; i < num_bins; ++i) {
+                dest[i] = static_cast<float>(stats.histogram_bins[i]);
+            }
+        }
+        
+        return true;
+        
+    } catch (std::exception& e) {
+        spdlog::error("computeAndCacheHistogram: Exception: {}", e.what());
+        return false;
+    }
+}
+
 bool CartaZarrImage::getSliceFromCache(casacore::Array<float>& buffer, const casacore::Slicer& section) {
     if (!_channel_cache_loaded) {
         return false;
     }
+    
+    spdlog::info("STEP 6: getSliceFromCache - Extracting data from cache");
     
     try {
         const IPosition& start = section.start();
@@ -2765,26 +3082,18 @@ bool CartaZarrImage::getSliceFromCache(casacore::Array<float>& buffer, const cas
         // The same reordering that affects doGetSlice also affects cache access
         int start_x, start_y, req_width, req_height;
         
-        // Detect if coordinates are reordered using the same logic as doGetSlice
-        bool coordinates_reordered = false;
-        if (start.size() >= 4) {
-            bool zero_in_spatial_pos = (start[0] == 0 && start[1] == 0);
-            bool large_values_in_freq_stokes = (start[2] > 1000 || start[3] > 100);
-            bool length_pattern_matches = (length.size() >= 4 && length[0] == 1 && length[1] == 1 && 
-                                          (length[2] > 1 || length[3] > 1));
-            coordinates_reordered = zero_in_spatial_pos && large_values_in_freq_stokes && length_pattern_matches;
-        }
+        // Use the coordinate reordering state detected in doGetSlice
+        bool coordinates_reordered = _current_coordinates_reordered;
         
         if (coordinates_reordered) {
-            // Reverse the reordering: [freq,stokes,y,x] -> [x,y,freq,stokes]
-            // start=[0,0,2560,7680] represents [freq=0, stokes=0, y=2560, x=7680]
-            // We want: [x=7680, y=2560, ...]
-            start_x = start[3];      // x from reordered position 3
-            start_y = start[2];      // y from reordered position 2
-            req_width = length[3];   // width from reordered position 3
-            req_height = length[2];  // height from reordered position 2
+            // Since we fixed the buffer shape in doGetSlice, coordinates are now correct
+            // No need to reorder - use normal CARTA [x, y, freq, stokes] format
+            start_x = start[0];      // x from position 0
+            start_y = start[1];      // y from position 1
+            req_width = length[0];   // width from position 0
+            req_height = length[1];  // height from position 1
             
-            spdlog::debug("getSliceFromCache: Corrected spatial coordinates - x={}, y={}, width={}, height={}", 
+            spdlog::debug("getSliceFromCache: Using corrected coordinates - x={}, y={}, width={}, height={}", 
                          start_x, start_y, req_width, req_height);
         } else {
             // Normal case: assume correct CARTA [x, y, freq, stokes] format
@@ -3476,9 +3785,12 @@ Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slice
         }
         buffer.resize(length);
         
+        spdlog::info("Data copy: Copying {} elements to output buffer", total_elements);
+        
         const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
         std::copy(src_data, src_data + total_elements, buffer.data());
         
+        spdlog::info("DIRECT READ COMPLETE: Successfully read {} elements", total_elements);
         // spdlog::debug("DIRECT READ: Successfully read {} elements (shape={})", total_elements, length.toString());
         return true;
         
@@ -3489,9 +3801,12 @@ Bool CartaZarrImage::readDirectFromTensorStore(Array<float>& buffer, const Slice
 }
 
 Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer& section) {
+    spdlog::info("DIRECT READ PATH: readPixelFromTensorStore - Bypassing cache");
     try {
         const IPosition& start = section.start();
         const IPosition& length = section.length();
+        
+        spdlog::info("   Input slicer: start={}, length={}", start.toString(), length.toString());
         
         // CRITICAL FIX: Handle coordinate mapping based on actual section dimensions
         // The issue is that ZarrLoader is passing coordinates in ZARR order already!
@@ -3569,6 +3884,10 @@ Bool CartaZarrImage::readPixelFromTensorStore(Array<float>& buffer, const Slicer
             return false;
         }
         // spdlog::debug("dim = {}", start.size());
+        
+        spdlog::info("Coordinate mapping: ZARR box origin=[{},{},{},{},{}], shape=[{},{},{},{},{}]",
+                    box_origin[0], box_origin[1], box_origin[2], box_origin[3], box_origin[4],
+                    box_shape[0], box_shape[1], box_shape[2], box_shape[3], box_shape[4]);
         
         // Validate coordinates against ZARR bounds
         for (size_t i = 0; i < box_origin.size(); ++i) {

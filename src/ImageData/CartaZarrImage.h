@@ -71,6 +71,29 @@ public:
     // Public method for direct TensorStore access (needed for optimized small region reads)
     casacore::Bool readDirectFromTensorStore(casacore::Array<float>& buffer, const casacore::Slicer& section);
     casacore::Bool readPixelFromTensorStore(casacore::Array<float>& buffer, const casacore::Slicer& section);
+    
+    // Statistics structure for cached channel rendering data
+    struct ChannelStats {
+        int freq_channel = -1;
+        int stokes_channel = -1;
+        size_t valid_pixels = 0;
+        double min_val = 0.0;
+        double max_val = 0.0;
+        double sum = 0.0;
+        double sum_sq = 0.0;
+        std::vector<int> histogram_bins;  // Histogram data cached here
+        int num_bins = 0;                 // Number of histogram bins
+        double bin_width = 0.0;           // Width of each histogram bin
+        double bin_center = 0.0;          // Center value for bins
+        bool valid = false;
+    };
+    
+    // Get statistics for a specific channel (returns nullptr if not cached)
+    const ChannelStats* GetCachedChannelStats(int freq_channel, int stokes_channel) const {
+        int channel_id = freq_channel * 1000 + stokes_channel;
+        auto it = _all_channel_stats.find(channel_id);
+        return (it != _all_channel_stats.end() && it->second.valid) ? &it->second : nullptr;
+    }
 
 private:
     casacore::CoordinateSystem _coord_sys;
@@ -104,6 +127,12 @@ private:
     
     // Copy tracking - whether this is a shallow copy sharing TensorStore and cache
     bool _is_copy = false;
+    
+    // Rendering statistics cache for all channels (key = freq_channel * 1000 + stokes_channel)
+    std::map<int, ChannelStats> _all_channel_stats;
+    
+    // Current coordinate reordering state (detected in doGetSlice, used in getSliceFromCache)
+    bool _current_coordinates_reordered = false;
     
     // File modification time tracking for metadata caching
     std::time_t _file_last_modified = 0;
@@ -143,6 +172,7 @@ private:
     bool loadRegionCache(int freq_channel, int stokes_channel, int start_x, int start_y, int width, int height);
     bool load4DRegionCache(int start_x, int start_y, int width, int height, int num_freq, int num_stokes, int freq_start = 0, int stokes_start = 0);
     bool getSliceFromCache(casacore::Array<float>& buffer, const casacore::Slicer& section);
+    bool computeAndCacheHistogram(int freq_channel, int stokes_channel, casacore::Array<float>& buffer, const casacore::Slicer& section);
     
     // Brightness unit and beam information reading
     std::string readBrightnessUnit();

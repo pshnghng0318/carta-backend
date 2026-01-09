@@ -16,9 +16,11 @@ namespace carta {
 
 void CalcBasicStats(BasicStats<float>& stats, const float* data, const size_t data_size) {
     // Calculate stats in BasicStats struct
+    spdlog::info("CalcBasicStats - Starting statistics calculation for {} elements", data_size);
     BasicStatsCalculator<float> mm(data, data_size);
     mm.reduce();
     stats = mm.GetStats();
+    spdlog::info("CalcBasicStats - Statistics complete: mean={:.6e}, stdDev={:.6e}", stats.mean, stats.stdDev);
 }
 
 Histogram CalcHistogram(int num_bins, const HistogramBounds& bounds, const float* data, const size_t data_size) {
