@@ -16,6 +16,7 @@
 #include <casacore/lattices/Lattices/TiledShape.h>
 #include <nlohmann/json.hpp>
 #include <memory>
+#include <mutex>
 #include <ctime>
 
 // TensorStore includes  
@@ -90,9 +91,10 @@ public:
     
     // Get statistics for a specific channel (returns nullptr if not cached)
     const ChannelStats* GetCachedChannelStats(int freq_channel, int stokes_channel) const {
+        if (!_all_channel_stats) return nullptr;
         int channel_id = freq_channel * 1000 + stokes_channel;
-        auto it = _all_channel_stats.find(channel_id);
-        return (it != _all_channel_stats.end() && it->second.valid) ? &it->second : nullptr;
+        auto it = _all_channel_stats->find(channel_id);
+        return (it != _all_channel_stats->end() && it->second.valid) ? &it->second : nullptr;
     }
 
 private:
@@ -111,7 +113,8 @@ private:
     casacore::DataType _actual_data_type = casacore::DataType::TpFloat; // Default to float
     
     // Channel cache for fast access - now supports region-based caching
-    std::vector<float> _channel_cache;     // Cached data for current region
+    // Using shared_ptr to prevent cache duplication on SubImage creation
+    std::shared_ptr<std::vector<float>> _channel_cache;     // Cached data for current region
     bool _channel_cache_loaded = false;    // Whether cache is loaded
     int _cached_channel = 0;               // Which channel is cached (default: first channel)
     int _num_cached_channels = 1;          // Number of channels in cache (for multi-channel caching)
@@ -129,7 +132,11 @@ private:
     bool _is_copy = false;
     
     // Rendering statistics cache for all channels (key = freq_channel * 1000 + stokes_channel)
-    std::map<int, ChannelStats> _all_channel_stats;
+    // Using shared_ptr to prevent cache duplication on SubImage creation
+    std::shared_ptr<std::map<int, ChannelStats>> _all_channel_stats;
+    
+    // Mutex for thread-safe cache access
+    mutable std::mutex _cache_mutex;
     
     // Current coordinate reordering state (detected in doGetSlice, used in getSliceFromCache)
     bool _current_coordinates_reordered = false;
