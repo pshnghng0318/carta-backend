@@ -375,6 +375,7 @@ set(SOURCE_FILES
         src/ImageData/StokesFilesConnector.cc
         src/ImageData/CartaZarrImage.cc
         src/ImageData/ZarrLoader.cc
+        src/ImageData/ZarrDataReader.cc
         # Include TensorStore zarr driver to ensure registration
         tensorstore/tensorstore/driver/zarr/driver.cc
         tensorstore/tensorstore/driver/zarr/metadata.cc

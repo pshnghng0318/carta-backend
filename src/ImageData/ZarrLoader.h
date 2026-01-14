@@ -7,59 +7,53 @@
 #ifndef CARTA_SRC_IMAGEDATA_ZARRLOADER_H_
 #define CARTA_SRC_IMAGEDATA_ZARRLOADER_H_
 
-#include "FileLoader.h"
 #include <string>
 
-// Forward declaration
-class CartaZarrImage;
+#include "CartaZarrImage.h"
+#include "FileLoader.h"
 
 namespace carta {
 
+/**
+ * @brief FileLoader implementation for ZARR format files.
+ * 
+ * This loader follows the same pattern as FitsLoader and CasaLoader,
+ * delegating most operations to CartaZarrImage. Supports TileCache
+ * integration for efficient tile-based rendering.
+ */
 class ZarrLoader : public FileLoader {
 public:
     ZarrLoader(const std::string& filename);
-    ~ZarrLoader() = default;
+    ~ZarrLoader() override = default;
 
-    void AllocateImage(const std::string& hdu = "") override;
-    
-    // FileLoader virtual function implementations
-    bool HasData(FileInfo::Data ds) const override;
-    bool HasMip(int mip) const override;
+    // FileLoader interface
+    bool HasData(FileInfo::Data data_type) const override;
+    bool HasMip(int mip_level) const override;
     bool UseTileCache() const override;
     
-    bool GetCursorSpectralData(std::vector<float>& data, int stokes, int cursor_x, int count_x,
-        int cursor_y, int count_y, std::mutex& image_mutex) override;
-    
-    bool UseRegionSpectralData(const casacore::IPosition& region_shape, std::mutex& image_mutex) override;
-    
-    bool GetRegionSpectralData(int region_id, const AxisRange& spectral_range, int stokes,
-        const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin,
-        std::mutex& image_mutex, std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) override;
-        
-    bool GetDownsampledRasterData(std::vector<float>& data, int z, int stokes,
-        CARTA::ImageBounds& bounds, int mip, std::mutex& image_mutex) override;
-        
+    // Tile/chunk access for TileCache integration
     bool GetChunk(std::vector<float>& data, int& data_width, int& data_height,
-        int min_x, int min_y, int z, int stokes, std::mutex& image_mutex) override;
-        
-    // Override GetSlice for ZARR-specific optimizations
-    bool GetSlice(casacore::Array<float>& data, const StokesSlicer& stokes_slicer);
+                  int min_x, int min_y, int channel, int stokes, 
+                  std::mutex& image_mutex) override;
     
-    // Optimized method for reading large spectral ranges at once
-    bool GetSpectralDataOptimized(std::vector<float>& data, int stokes, int x, int y, 
-                                 int z_start, int z_end, std::mutex& image_mutex);
-    
-    // Spatial profile methods (read directly from TensorStore, bypass cache)
-    bool GetSpatialProfileX(std::vector<float>& data, int x_start, int x_end, int y, int z, int stokes, std::mutex& image_mutex);
-    bool GetSpatialProfileY(std::vector<float>& data, int x, int y_start, int y_end, int z, int stokes, std::mutex& image_mutex);
-        
-    const casacore::IPosition GetStatsDataShape(FileInfo::Data ds) override;
-    std::unique_ptr<casacore::ArrayBase> GetStatsData(FileInfo::Data ds) override;
+    // Spectral data access
+    bool GetCursorSpectralData(std::vector<float>& data, int stokes, int cursor_x, 
+                               int count_x, int cursor_y, int count_y, 
+                               std::mutex& image_mutex) override;
+
+    // Spatial profile methods required by Frame.cc for ZARR optimization
+    bool GetSpatialProfileX(std::vector<float>& profile, int start_x, int end_x, 
+                            int cursor_y, int channel, int stokes, 
+                            std::mutex& image_mutex);
+    bool GetSpatialProfileY(std::vector<float>& profile, int cursor_x, 
+                            int start_y, int end_y, int channel, int stokes, 
+                            std::mutex& image_mutex);
 
 private:
-    // Helper methods for Zarr detection
-    bool HasZarrArrayMetadata(const std::string& path) const;
-    bool HasZmetadataFile(const std::string& path) const;
+    void AllocateImage(const std::string& hdu) override;
+    
+    // Helper to get typed image
+    CartaZarrImage* GetZarrImage();
 };
 
 } // namespace carta
