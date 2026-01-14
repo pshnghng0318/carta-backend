@@ -192,7 +192,7 @@ add_subdirectory(third-party/json-schema-validator)
 
 # xtensor 0.26.0 (C++17 compatible) for optimized array operations
 # Add AFTER json-schema-validator to avoid affecting its compilation
-include_directories("${CMAKE_SOURCE_DIR}/third-party/xtensor-0.26.0/include")
+include_directories("${CMAKE_SOURCE_DIR}/third-party/xtensor/include")
 include_directories("/opt/homebrew/include")  # for xtl dependency
 
 # TensorStore configuration
@@ -206,6 +206,9 @@ include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/re2-src")
 include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/riegeli-src")
 include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/absl-src")
 include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/half-src/include")
+
+# TensorStore Bazel external dependencies (riegeli, etc.)
+include_directories("${TENSORSTORE_ROOT}/bazel-tensorstore/external/riegeli")
 
 # Include blosc headers for compression support
 include_directories("/opt/homebrew/opt/c-blosc/include")

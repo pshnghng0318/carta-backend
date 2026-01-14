@@ -47,3 +47,7 @@
 [submodule "tensorstore"]
 	path = tensorstore
 	url = https://github.com/google/tensorstore.git
+[submodule "third-party/xtensor"]
+	path = third-party/xtensor
+	url = https://github.com/xtensor-stack/xtensor.git
+	shallow = true
