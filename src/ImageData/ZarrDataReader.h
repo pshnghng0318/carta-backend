@@ -73,6 +73,20 @@ public:
     bool GetChunk(std::vector<float>& data, int& data_width, int& data_height,
                   int min_x, int min_y, int channel, int stokes);
 
+    /**
+     * @brief Read spectral profile at a single spatial position (all channels).
+     * 
+     * This method reads the entire frequency axis in a single TensorStore request,
+     * which is much more efficient than calling ReadSlice for each channel.
+     * 
+     * @param x The X coordinate (L axis in XRADIO schema)
+     * @param y The Y coordinate (M axis in XRADIO schema)
+     * @param stokes The stokes/polarization index
+     * @param data Output vector with all channel values
+     * @return true if read succeeded
+     */
+    bool ReadSpectralProfile(int x, int y, int stokes, std::vector<float>& data);
+
     // Read a 1D array (e.g. coordinates l, m, frequency) by relative path
     // Returns empty vector on failure
     std::vector<double> ReadVector(const std::string& array_name);

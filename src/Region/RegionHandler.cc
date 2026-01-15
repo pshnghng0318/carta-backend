@@ -2017,10 +2017,10 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
     int delta_z = INIT_DELTA_Z;        // the increment of z for each step
     
     // For ZARR files, use smaller initial delta_z to prevent cache overflow
-    if (_frames.at(file_id)->IsZarrLoader()) {
-        delta_z = 5;  // Smaller channel batch size for ZARR to avoid cache overflow
-        spdlog::info("ZARR: Using reduced initial delta_z = {} for ZARR cache management", delta_z);
-    }
+    // if (_frames.at(file_id)->IsZarrLoader()) {
+    //     delta_z = 5;  // Smaller channel batch size for ZARR to avoid cache overflow
+    //     spdlog::info("ZARR: Using reduced initial delta_z = {} for ZARR cache management", delta_z);
+    // }
     
     int dt_target = TARGET_DELTA_TIME; // the target time elapse for each step, in the unit of milliseconds
     auto t_partial_profile_start = std::chrono::high_resolution_clock::now();

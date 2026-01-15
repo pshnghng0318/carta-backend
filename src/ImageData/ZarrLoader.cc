@@ -83,50 +83,14 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes,
                                         int cursor_x, int count_x,
                                         int cursor_y, int count_y, 
                                         std::mutex& image_mutex) {
-    std::lock_guard<std::mutex> lock(image_mutex);
-    
-    auto* zarr_image = GetZarrImage();
-    if (!zarr_image) {
-        return false;
-    }
-    
-    auto reader = zarr_image->GetReader();
-    if (!reader || !reader->IsInitialized()) {
-        return false;
-    }
-    
-    const auto& shape = reader->GetShape();
-    if (shape.size() < 3) {
-        spdlog::warn("ZarrLoader::GetCursorSpectralData: Image has < 3 dimensions");
-        return false;
-    }
-    
-    int num_channels = shape[2];  // Frequency axis
-    data.resize(num_channels * count_x * count_y);
-    
-    // Read spectral data for each channel
-    try {
-        for (int chan = 0; chan < num_channels; ++chan) {
-            casacore::IPosition start(4, cursor_x, cursor_y, chan, stokes);
-            casacore::IPosition length(4, count_x, count_y, 1, 1);
-            casacore::Slicer section(start, length);
-            
-            casacore::Array<float> channel_data;
-            if (!reader->ReadSlice(section, channel_data)) {
-                return false;
-            }
-            
-            // Copy to output
-            size_t offset = chan * count_x * count_y;
-            std::copy(channel_data.begin(), channel_data.end(), data.begin() + offset);
-        }
-        
-        return true;
-        
-    } catch (const std::exception& ex) {
-        spdlog::error("ZarrLoader::GetCursorSpectralData exception: {}", ex.what());
-        return false;
-    }
+    // Return false to use Frame.cc's incremental reading path with progress updates.
+    // Frame.cc will call GetSlicerData which uses ReadSlice with multi-channel chunks.
+    // This provides progress feedback for large spectral cubes.
+    //
+    // Note: ReadSpectralProfile is available for other use cases where batch reading 
+    // is preferred (e.g., point region spectral profiles).
+    spdlog::debug("ZarrLoader::GetCursorSpectralData: Using Frame.cc fallback path for progress updates");
+    return false;
 }
 
 bool ZarrLoader::GetSpatialProfileX(std::vector<float>& profile, int start_x, int end_x, 

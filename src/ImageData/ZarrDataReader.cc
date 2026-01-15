@@ -258,43 +258,104 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
             return false;
         }
 
-        // Read using dimension permutation
-        // Zarr XRADIO: [0:T, 1:F, 2:S, 3:L, 4:M] in C-order (M fastest)
-        // Use {4, 3, 1, 2, 0} to read with M first (matching C-order), then transpose XY
-        auto read_result = tensorstore::Read(
-            typed_store_result.value() | tensorstore::Dims(0, 1, 2, 3, 4).Transpose({4, 3, 1, 2, 0})
-        ).result();
+        // OPTIMIZATION: Reduce copies from 3 to 2
+        // Read WITHOUT transpose to get contiguous C-order data, then transpose directly to output
+        // This avoids one MakeCopy while keeping correct data access
+        
+        int width_x = length[0];   // target X size (CARTA L)
+        int height_y = length[1];  // target Y size (CARTA M)
+        int num_freq = (length.size() > 2) ? length[2] : 1;
+        int num_stokes = (length.size() > 3) ? length[3] : 1;
+        size_t total_elements = static_cast<size_t>(width_x) * height_y * num_freq * num_stokes;
+        
+        // Pre-allocate output buffer
+        buffer.resize(length);
+        float* dst_ptr = buffer.data();
+        if (!dst_ptr) {
+            spdlog::error("ReadSlice: buffer.data() returned null after resize");
+            return false;
+        }
+        
+        // Read directly - TensorStore returns contiguous C-order data for Zarr
+        auto read_result = tensorstore::Read(typed_store_result.value()).result();
         
         if (!read_result.ok()) {
             spdlog::error("TensorStore read failed: {}", read_result.status().ToString());
             return false;
         }
         
-        auto result_array = read_result.value();
-        auto fortran_result = tensorstore::MakeCopy(result_array, tensorstore::fortran_order);
+        auto& result_array = read_result.value();
         
-        if (static_cast<size_t>(fortran_result.num_elements()) != length.product()) {
-             spdlog::error("ZarrDataReader: Read size mismatch. Expected {}, got {}", 
-                           length.product(), fortran_result.num_elements());
-             return false;
+        // Check if we can use data() directly (contiguous layout)
+        const float* src_ptr = result_array.data();
+        
+        // Keep the copy alive if needed
+        decltype(tensorstore::MakeCopy(result_array, tensorstore::c_order)) contiguous_copy;
+        
+        if (!src_ptr) {
+            // Fallback: make contiguous copy only if necessary
+            contiguous_copy = tensorstore::MakeCopy(result_array, tensorstore::c_order);
+            src_ptr = contiguous_copy.data();
         }
         
-        // Copy to casacore array with XY transpose
-        // fortran_result has [M, L, F, S, T] order with M fastest
-        // We need [L, M, F, S] order with L fastest (i.e., transpose XY plane)
-        buffer.resize(length);
+        if (!src_ptr) {
+            spdlog::error("ReadSlice: data pointer is null");
+            return false;
+        }
         
-        int width_x = length[0];   // target X size (should be L)
-        int height_y = length[1];  // target Y size (should be M)
-        const float* src_ptr = fortran_result.data();
-        float* dst_ptr = buffer.data();
+        if (static_cast<size_t>(result_array.num_elements()) != total_elements) {
+            spdlog::error("ZarrDataReader: Read size mismatch. Expected {}, got {}", 
+                          total_elements, result_array.num_elements());
+            return false;
+        }
         
-        // Transpose the 2D plane:
-        // src is [M, L] with M fastest: src[m, l] at index m + l * M
-        // dst is [L, M] with L fastest: dst[l, m] at index l + m * L
-        for (int iy = 0; iy < height_y; ++iy) {
-            for (int ix = 0; ix < width_x; ++ix) {
-                dst_ptr[ix + (iy * width_x)] = src_ptr[iy + (ix * height_y)];
+        // Source is C-order [T, F, S, L, M] with M fastest (after slicing: [1, num_freq, num_stokes, width_x, height_y])
+        // Destination is Fortran-order [X, Y, F, S] with X fastest
+        // T dimension is always 1, so we can ignore it
+        // Need to: swap L<->X axes AND transpose from C-order to Fortran-order
+        
+        // Fast path: For spectral profile (1x1 spatial), just reorder F,S dimensions
+        if (width_x == 1 && height_y == 1) {
+            // src is [F, S] in C-order (S fastest within each F)
+            // dst is [F, S] in Fortran-order (F fastest)
+            for (int is = 0; is < num_stokes; ++is) {
+                for (int ifreq = 0; ifreq < num_freq; ++ifreq) {
+                    // src index: ifreq * num_stokes + is (C-order: S fastest)
+                    // dst index: is * num_freq + ifreq (Fortran: F fastest) - but casacore uses [F,S] order
+                    // Actually for 1x1, src[f,s] -> dst[f,s], just copy directly
+                    size_t src_idx = static_cast<size_t>(ifreq) * num_stokes + is;
+                    size_t dst_idx = static_cast<size_t>(is) * num_freq + ifreq;
+                    dst_ptr[dst_idx] = src_ptr[src_idx];
+                }
+            }
+        } else {
+            // General case: Full transpose
+            // src is C-order [F, S, L, M] with M fastest (ignoring T=1)
+            // dst is Fortran-order [X, Y, F, S] with X fastest
+            // Mapping: L->X, M->Y
+            size_t plane_size = static_cast<size_t>(width_x) * height_y;
+            
+            for (int is = 0; is < num_stokes; ++is) {
+                for (int ifreq = 0; ifreq < num_freq; ++ifreq) {
+                    // Source plane offset in C-order: (ifreq * num_stokes + is) * plane_size
+                    size_t src_plane_offset = (static_cast<size_t>(ifreq) * num_stokes + is) * plane_size;
+                    // Dest plane offset in Fortran-order: (is * num_freq + ifreq) * plane_size
+                    size_t dst_plane_offset = (static_cast<size_t>(is) * num_freq + ifreq) * plane_size;
+                    
+                    const float* src_plane = src_ptr + src_plane_offset;
+                    float* dst_plane = dst_ptr + dst_plane_offset;
+                    
+                    // Within each plane:
+                    // src is [L, M] C-order: M fastest, index = ix * height_y + iy
+                    // dst is [X, Y] Fortran-order: X fastest, index = ix + iy * width_x
+                    for (int iy = 0; iy < height_y; ++iy) {
+                        for (int ix = 0; ix < width_x; ++ix) {
+                            size_t src_idx = static_cast<size_t>(ix) * height_y + iy;
+                            size_t dst_idx = static_cast<size_t>(ix) + iy * width_x;
+                            dst_plane[dst_idx] = src_plane[src_idx];
+                        }
+                    }
+                }
             }
         }
 
@@ -355,26 +416,39 @@ bool ZarrDataReader::ReadChannel(int channel, int stokes, std::vector<float>& da
             return false;
         }
 
-        // XRADIO always 5D - use {4, 3, 1, 2, 0} to match C-order storage (M fastest)
-        auto read_result = tensorstore::Read(
-            typed_store_result.value() | tensorstore::Dims(0, 1, 2, 3, 4).Transpose({4, 3, 1, 2, 0})
-        ).result();
+        // Read and transpose directly to output
+        data.resize(channel_size);
+        float* dst_ptr = data.data();
+        
+        auto read_result = tensorstore::Read(typed_store_result.value()).result();
         
         if (!read_result.ok()) {
             spdlog::error("TensorStore ReadChannel failed: {}", read_result.status().ToString());
             return false;
         }
 
-        auto result_array = read_result.value();
-        auto fortran_result = tensorstore::MakeCopy(result_array, tensorstore::fortran_order);
+        auto& result_array = read_result.value();
         
-        // XY transpose: src [M, L] -> dst [L, M]
-        data.resize(channel_size);
-        float* dst_ptr = data.data();
-        const float* src_ptr = fortran_result.data();
+        // Use data() directly if contiguous, otherwise fallback to MakeCopy
+        const float* src_ptr = result_array.data();
+        decltype(tensorstore::MakeCopy(result_array, tensorstore::c_order)) contiguous_copy;
+        
+        if (!src_ptr) {
+            contiguous_copy = tensorstore::MakeCopy(result_array, tensorstore::c_order);
+            src_ptr = contiguous_copy.data();
+        }
+        
+        if (!src_ptr) {
+            spdlog::error("ReadChannel: data pointer is null");
+            return false;
+        }
+        
+        // XY transpose: src is [L, M] C-order (M fastest), dst is [X, Y] Fortran (X fastest)
         for (int iy = 0; iy < height; ++iy) {
             for (int ix = 0; ix < width; ++ix) {
-                dst_ptr[ix + (iy * width)] = src_ptr[iy + (ix * height)];
+                size_t src_idx = static_cast<size_t>(ix) * height + iy;
+                size_t dst_idx = static_cast<size_t>(ix) + iy * width;
+                dst_ptr[dst_idx] = src_ptr[src_idx];
             }
         }
         
@@ -445,26 +519,39 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
             return false;
         }
 
-        // XRADIO always 5D - use {4, 3, 1, 2, 0} to match C-order storage (M fastest)
-        auto read_result = tensorstore::Read(
-            typed_store_result.value() | tensorstore::Dims(0, 1, 2, 3, 4).Transpose({4, 3, 1, 2, 0})
-        ).result();
+        // Read and transpose directly to output
+        data.resize(chunk_size);
+        float* dst_ptr = data.data();
+        
+        auto read_result = tensorstore::Read(typed_store_result.value()).result();
         
         if (!read_result.ok()) {
             spdlog::error("TensorStore GetChunk failed: {}", read_result.status().ToString());
             return false;
         }
         
-        auto result_array = read_result.value();
-        auto fortran_result = tensorstore::MakeCopy(result_array, tensorstore::fortran_order);
+        auto& result_array = read_result.value();
         
-        // XY transpose: src [M, L] -> dst [L, M]
-        data.resize(chunk_size);
-        float* dst_ptr = data.data();
-        const float* src_ptr = fortran_result.data();
+        // Use data() directly if contiguous, otherwise fallback to MakeCopy
+        const float* src_ptr = result_array.data();
+        decltype(tensorstore::MakeCopy(result_array, tensorstore::c_order)) contiguous_copy;
+        
+        if (!src_ptr) {
+            contiguous_copy = tensorstore::MakeCopy(result_array, tensorstore::c_order);
+            src_ptr = contiguous_copy.data();
+        }
+        
+        if (!src_ptr) {
+            spdlog::error("GetChunk: data pointer is null");
+            return false;
+        }
+        
+        // XY transpose: src is [L, M] C-order (M fastest), dst is [X, Y] Fortran (X fastest)
         for (int iy = 0; iy < data_height; ++iy) {
             for (int ix = 0; ix < data_width; ++ix) {
-                dst_ptr[ix + (iy * data_width)] = src_ptr[iy + (ix * data_height)];
+                size_t src_idx = static_cast<size_t>(ix) * data_height + iy;
+                size_t dst_idx = static_cast<size_t>(ix) + iy * data_width;
+                dst_ptr[dst_idx] = src_ptr[src_idx];
             }
         }
         
@@ -476,6 +563,102 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
     }
 }
 
+bool ZarrDataReader::ReadSpectralProfile(int x, int y, int stokes, 
+                                          std::vector<float>& data) {
+    if (!_initialized) {
+        spdlog::error("ZarrDataReader not initialized");
+        return false;
+    }
+    
+    std::lock_guard<std::mutex> lock(_read_mutex);
+    
+    try {
+        int num_channels = _shape[2];  // Frequency axis in CARTA shape [X, Y, F, S]
+        
+        spdlog::debug("ReadSpectralProfile: x={}, y={}, stokes={}, channels={}", 
+                     x, y, stokes, num_channels);
+        
+        // XRADIO schema: always 5D [T, F, S, L, M]
+        // Read ALL channels at once (entire F axis)
+        std::vector<tensorstore::Index> zarr_start = {
+            0,                                         // T (always 0)
+            0,                                         // F start (all channels)
+            static_cast<tensorstore::Index>(stokes),   // S
+            static_cast<tensorstore::Index>(x),        // L = X
+            static_cast<tensorstore::Index>(y)         // M = Y
+        };
+        std::vector<tensorstore::Index> zarr_shape = {
+            1,                                         // T
+            static_cast<tensorstore::Index>(num_channels),  // F (all channels)
+            1,                                         // S
+            1,                                         // L
+            1                                          // M
+        };
+        
+        tensorstore::TensorStore<> sliced_store = _impl->store;
+        
+        for (size_t dim = 0; dim < zarr_start.size(); ++dim) {
+            auto transform_result = sliced_store | 
+                tensorstore::Dims(static_cast<tensorstore::DimensionIndex>(dim))
+                    .ClosedInterval(zarr_start[dim], zarr_start[dim] + zarr_shape[dim] - 1);
+            
+            if (!transform_result.ok()) {
+                spdlog::error("ReadSpectralProfile: Error creating slice transform: {}", 
+                             transform_result.status().ToString());
+                return false;
+            }
+            sliced_store = transform_result.value();
+        }
+        
+        auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<float>>(sliced_store);
+        if (!typed_store_result.ok()) {
+            spdlog::error("ReadSpectralProfile: Error casting to float store: {}", 
+                         typed_store_result.status().ToString());
+            return false;
+        }
+        
+        // Read the data
+        auto read_result = tensorstore::Read(typed_store_result.value()).result();
+        
+        if (!read_result.ok()) {
+            spdlog::error("ReadSpectralProfile: TensorStore read failed: {}", 
+                         read_result.status().ToString());
+            return false;
+        }
+        
+        auto result_array = read_result.value();
+        
+        spdlog::debug("ReadSpectralProfile: result has {} elements, rank={}", 
+                     result_array.num_elements(), result_array.rank());
+        
+        if (static_cast<size_t>(result_array.num_elements()) != static_cast<size_t>(num_channels)) {
+            spdlog::error("ReadSpectralProfile: Size mismatch. Expected {}, got {}", 
+                         num_channels, result_array.num_elements());
+            return false;
+        }
+        
+        // Make a contiguous C-order copy to ensure linear memory access
+        auto contiguous_result = tensorstore::MakeCopy(result_array, tensorstore::c_order);
+        
+        const float* src_ptr = contiguous_result.data();
+        if (!src_ptr) {
+            spdlog::error("ReadSpectralProfile: Null data pointer after MakeCopy");
+            return false;
+        }
+        
+        // Copy to output vector
+        data.resize(num_channels);
+        std::copy(src_ptr, src_ptr + num_channels, data.begin());
+        
+        spdlog::debug("ReadSpectralProfile: Successfully read {} channels", num_channels);
+        
+        return true;
+        
+    } catch (const std::exception& ex) {
+        spdlog::error("Exception in ReadSpectralProfile: {}", ex.what());
+        return false;
+    }
+}
 
 //-----------------------------------------------------------------------------
 // Metadata Helpers
