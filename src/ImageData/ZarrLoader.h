@@ -7,6 +7,7 @@
 #ifndef CARTA_SRC_IMAGEDATA_ZARRLOADER_H_
 #define CARTA_SRC_IMAGEDATA_ZARRLOADER_H_
 
+#include <map>
 #include <string>
 
 #include "CartaZarrImage.h"
@@ -40,6 +41,10 @@ public:
     bool GetCursorSpectralData(std::vector<float>& data, int stokes, int cursor_x, 
                                int count_x, int cursor_y, int count_y, 
                                std::mutex& image_mutex) override;
+    bool UseRegionSpectralData(const casacore::IPosition& region_shape, std::mutex& image_mutex) override;
+    bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
+        const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
+        std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) override;
 
     // Spatial profile methods required by Frame.cc for ZARR optimization
     bool GetSpatialProfileX(std::vector<float>& profile, int start_x, int end_x, 
@@ -54,6 +59,8 @@ private:
     
     // Helper to get typed image
     CartaZarrImage* GetZarrImage();
+
+    std::map<FileInfo::RegionStatsId, FileInfo::RegionSpectralStats> _region_stats;
 };
 
 } // namespace carta
