@@ -230,6 +230,8 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
         spdlog::debug("ReadSlice: start={}, length={}", start.toString(), length.toString());
         
         auto zarr_start = Impl::MapToZarrCoords(start);
+        spdlog::debug("ReadSlice: zarr_start=[{},{},{},{},{}]", 
+                      zarr_start[0], zarr_start[1], zarr_start[2], zarr_start[3], zarr_start[4]);
         
         // Build shape for transform - XRADIO always 5D [T, F, S, L, M]
         // CARTA length is [X, Y, F, S], L -> X, M -> Y
@@ -239,6 +241,21 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
         if (length.size() > 3) { zarr_shape[2] = length[3]; }    // pol
         if (length.size() > 0) { zarr_shape[3] = length[0]; }    // L (CARTA X)
         if (length.size() > 1) { zarr_shape[4] = length[1]; }    // M (CARTA Y)
+        
+        spdlog::debug("ReadSlice: zarr_shape=[{},{},{},{},{}]", 
+                      zarr_shape[0], zarr_shape[1], zarr_shape[2], zarr_shape[3], zarr_shape[4]);
+        spdlog::debug("ReadSlice: original_shape={}", _original_shape.toString());
+        
+        // Bounds validation - check that requested slice is within the original array bounds
+        for (size_t dim = 0; dim < kDimSize5D; ++dim) {
+            tensorstore::Index end_idx = zarr_start[dim] + zarr_shape[dim] - 1;
+            if (zarr_start[dim] < 0 || end_idx >= _original_shape[dim]) {
+                spdlog::error("ReadSlice: Bounds error! dim={}, start={}, end={}, array_size={}",
+                              dim, zarr_start[dim], end_idx, _original_shape[dim]);
+                return false;
+            }
+        }
+        spdlog::debug("ReadSlice: Bounds check passed");
         
         tensorstore::TensorStore<> sliced_store = _impl->store;
         
@@ -253,6 +270,7 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
             }
             sliced_store = transform_result.value();
         }
+        spdlog::debug("ReadSlice: Slice transform created");
         
         // Cast to typed float store
         auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<float>>(sliced_store);
@@ -260,6 +278,7 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
             spdlog::error("ZarrDataReader: Error casting to float store: {}", typed_store_result.status().ToString());
             return false;
         }
+        spdlog::debug("ReadSlice: Float store cast succeeded");
 
         // OPTIMIZATION: Reduce copies from 3 to 2
         // Read WITHOUT transpose to get contiguous C-order data, then transpose directly to output
@@ -270,6 +289,8 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
         int num_freq = (length.size() > 2) ? length[2] : 1;
         int num_stokes = (length.size() > 3) ? length[3] : 1;
         size_t total_elements = static_cast<size_t>(width_x) * height_y * num_freq * num_stokes;
+        spdlog::debug("ReadSlice: Dimensions: {}x{}, freq={}, stokes={}, total={}", 
+                      width_x, height_y, num_freq, num_stokes, total_elements);
         
         // Pre-allocate output buffer
         buffer.resize(length);
@@ -278,9 +299,12 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
             spdlog::error("ReadSlice: buffer.data() returned null after resize");
             return false;
         }
+        spdlog::debug("ReadSlice: Buffer allocated");
         
         // Read directly - TensorStore returns contiguous C-order data for Zarr
+        spdlog::debug("ReadSlice: Starting TensorStore read...");
         auto read_result = tensorstore::Read(typed_store_result.value()).result();
+        spdlog::debug("ReadSlice: TensorStore read completed");
         
         if (!read_result.ok()) {
             spdlog::error("TensorStore read failed: {}", read_result.status().ToString());
@@ -288,18 +312,13 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
         }
         
         auto& result_array = read_result.value();
+        spdlog::debug("ReadSlice: Result array has {} elements, rank={}", 
+                      result_array.num_elements(), result_array.rank());
         
-        // Check if we can use data() directly (contiguous layout)
-        const float* src_ptr = result_array.data();
-        
-        // Keep the copy alive if needed
-        decltype(tensorstore::MakeCopy(result_array, tensorstore::c_order)) contiguous_copy;
-        
-        if (!src_ptr) {
-            // Fallback: make contiguous copy only if necessary
-            contiguous_copy = tensorstore::MakeCopy(result_array, tensorstore::c_order);
-            src_ptr = contiguous_copy.data();
-        }
+        // Ensure contiguous C-order layout
+        // usage of MakeCopy returns Array directly here
+        auto dense_array = tensorstore::MakeCopy(result_array, tensorstore::c_order);
+        const float* src_ptr = dense_array.data();
         
         if (!src_ptr) {
             spdlog::error("ReadSlice: data pointer is null");
@@ -311,6 +330,7 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
                           total_elements, result_array.num_elements());
             return false;
         }
+        spdlog::debug("ReadSlice: Data pointer validated, starting transpose...");
         
         // Source is C-order [T, F, S, L, M] with M fastest (after slicing: [1, num_freq, num_stokes, width_x, height_y])
         // Destination is Fortran-order [X, Y, F, S] with X fastest
@@ -400,6 +420,16 @@ bool ZarrDataReader::ReadChannel(int channel, int stokes, std::vector<float>& da
             static_cast<tensorstore::Index>(height)   // M = Y = height
         };
         
+        // Bounds validation
+        for (size_t dim = 0; dim < kDimSize5D; ++dim) {
+            tensorstore::Index end_idx = zarr_start[dim] + zarr_shape[dim] - 1;
+            if (zarr_start[dim] < 0 || end_idx >= _original_shape[dim]) {
+                spdlog::error("ReadChannel: Bounds error! dim={}, start={}, end={}, array_size={}",
+                              dim, zarr_start[dim], end_idx, _original_shape[dim]);
+                return false;
+            }
+        }
+        
         tensorstore::TensorStore<> sliced_store = _impl->store;
         
         for (size_t dim = 0; dim < zarr_start.size(); ++dim) {
@@ -433,13 +463,9 @@ bool ZarrDataReader::ReadChannel(int channel, int stokes, std::vector<float>& da
         auto& result_array = read_result.value();
         
         // Use data() directly if contiguous, otherwise fallback to MakeCopy
-        const float* src_ptr = result_array.data();
-        decltype(tensorstore::MakeCopy(result_array, tensorstore::c_order)) contiguous_copy;
-        
-        if (!src_ptr) {
-            contiguous_copy = tensorstore::MakeCopy(result_array, tensorstore::c_order);
-            src_ptr = contiguous_copy.data();
-        }
+        // Ensure contiguous C-order layout
+        auto dense_array = tensorstore::MakeCopy(result_array, tensorstore::c_order);
+        const float* src_ptr = dense_array.data();
         
         if (!src_ptr) {
             spdlog::error("ReadChannel: data pointer is null");
@@ -503,6 +529,16 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
             static_cast<tensorstore::Index>(data_height)   // M = Y
         };
         
+        // Bounds validation
+        for (size_t dim = 0; dim < kDimSize5D; ++dim) {
+            tensorstore::Index end_idx = zarr_start[dim] + zarr_shape[dim] - 1;
+            if (zarr_start[dim] < 0 || end_idx >= _original_shape[dim]) {
+                spdlog::error("GetChunk: Bounds error! dim={}, start={}, end={}, array_size={}",
+                              dim, zarr_start[dim], end_idx, _original_shape[dim]);
+                return false;
+            }
+        }
+        
         tensorstore::TensorStore<> sliced_store = _impl->store;
         
         for (size_t dim = 0; dim < zarr_start.size(); ++dim) {
@@ -536,13 +572,9 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
         auto& result_array = read_result.value();
         
         // Use data() directly if contiguous, otherwise fallback to MakeCopy
-        const float* src_ptr = result_array.data();
-        decltype(tensorstore::MakeCopy(result_array, tensorstore::c_order)) contiguous_copy;
-        
-        if (!src_ptr) {
-            contiguous_copy = tensorstore::MakeCopy(result_array, tensorstore::c_order);
-            src_ptr = contiguous_copy.data();
-        }
+        // Ensure contiguous C-order layout
+        auto dense_array = tensorstore::MakeCopy(result_array, tensorstore::c_order);
+        const float* src_ptr = dense_array.data();
         
         if (!src_ptr) {
             spdlog::error("GetChunk: data pointer is null");
@@ -597,6 +629,16 @@ bool ZarrDataReader::ReadSpectralProfile(int x, int y, int stokes,
             1,                                         // L
             1                                          // M
         };
+        
+        // Bounds validation
+        for (size_t dim = 0; dim < kDimSize5D; ++dim) {
+            tensorstore::Index end_idx = zarr_start[dim] + zarr_shape[dim] - 1;
+            if (zarr_start[dim] < 0 || end_idx >= _original_shape[dim]) {
+                spdlog::error("ReadSpectralProfile: Bounds error! dim={}, start={}, end={}, array_size={}",
+                              dim, zarr_start[dim], end_idx, _original_shape[dim]);
+                return false;
+            }
+        }
         
         tensorstore::TensorStore<> sliced_store = _impl->store;
         
