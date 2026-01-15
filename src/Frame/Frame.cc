@@ -448,30 +448,41 @@ bool Frame::GetRasterData(int z, std::vector<float>& image_data, CARTA::ImageBou
     size_t num_rows_region = std::ceil((float)req_height / mip);
     size_t row_length_region = std::ceil((float)req_width / mip);
     image_data.resize(num_rows_region * row_length_region);
-    int num_image_columns = _dims.width;
-    int num_image_rows = _dims.height;
-
     // read lock imageCache
     queuing_rw_mutex_scoped cache_lock(&_cache_mutex, false);
 
     Timer t;
     float* z_data;
+    std::vector<float> region_data;
+    int src_width = _dims.width;
+    int src_height = _dims.height;
+    int x_offset = x;
+    int y_offset = y;
     if (z == _z_index) {
         // Use image cache for current z
         z_data = _image_cache.get();
     } else {
-        // Load data for requested z
-        std::vector<float> z_matrix;
-        GetZMatrix(z_matrix, z, _stokes_index);
-        z_data = z_matrix.data();
+        // Load only the required region for requested z to avoid full-plane allocations
+        int end_x = bounds.x_max() - 1;
+        int end_y = bounds.y_max() - 1;
+        StokesSlicer stokes_slicer = GetImageSlicer(AxisRange(x, end_x), AxisRange(y, end_y), AxisRange(z), _stokes_index);
+        region_data.resize(stokes_slicer.slicer.length().product());
+        if (!GetSlicerData(stokes_slicer, region_data.data())) {
+            return false;
+        }
+        z_data = region_data.data();
+        src_width = req_width;
+        src_height = req_height;
+        x_offset = 0;
+        y_offset = 0;
     }
 
     if (mean_filter && mip > 1) {
         // Perform down-sampling by calculating the mean for each MIPxMIP block
-        BlockSmooth(z_data, image_data.data(), num_image_columns, num_image_rows, row_length_region, num_rows_region, x, y, mip);
+        BlockSmooth(z_data, image_data.data(), src_width, src_height, row_length_region, num_rows_region, x_offset, y_offset, mip);
     } else {
         // Nearest neighbour filtering
-        NearestNeighbor(z_data, image_data.data(), num_image_columns, row_length_region, num_rows_region, x, y, mip);
+        NearestNeighbor(z_data, image_data.data(), src_width, row_length_region, num_rows_region, x_offset, y_offset, mip);
     }
 
     auto dt = t.Elapsed();
