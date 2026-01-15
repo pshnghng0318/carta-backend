@@ -45,8 +45,6 @@ constexpr int K_TILE_SIZE = 256;
 constexpr size_t kDefaultCacheSizeMB = 128;
 constexpr size_t kDefaultCpuCount = 8;
 constexpr size_t kDimSize5D = 5;
-constexpr size_t kDimSize4D = 4;
-constexpr size_t kDimSize3D = 3;
 
 //-----------------------------------------------------------------------------
 // Pimpl Implementation Helper
@@ -54,7 +52,6 @@ constexpr size_t kDimSize3D = 3;
 struct ZarrDataReader::Impl {
     tensorstore::Context context;
     tensorstore::TensorStore<> store;
-    bool is_5d = false;
     
     // Create Context
     void CreateContext() {
@@ -85,28 +82,18 @@ struct ZarrDataReader::Impl {
         }
     }
     
-    // Map Coordinates Helper
-    std::vector<tensorstore::Index> MapToZarrCoords(
-        const casacore::IPosition& start, const casacore::IPosition& length) const {
-        
-        std::vector<tensorstore::Index> result;
-        
-        if (is_5d && start.size() >= kDimSize4D) {
-            // CARTA [x, y, freq, stokes] -> ZARR [time, freq, pol, l, m]
-            // time=0 (always first time slice)
-            result.push_back(0);                    // time
-            result.push_back(start[2]);             // freq
-            result.push_back(start[3]);             // pol
-            result.push_back(start[0]);             // l (x)
-            result.push_back(start[1]);             // m (y)
-        } else {
-            // Direct mapping for 2D/3D/4D
-            for (size_t i = 0; i < start.size(); ++i) {
-                result.push_back(start[i]);
-            }
-        }
-        
-        return result;
+    // Map Coordinates Helper - XRADIO schema: always 5D [T, F, S, L, M]
+    // Zarr is C-order (row-major): M (index 4) changes fastest
+    // CARTA is Fortran-order (column-major): X (index 0) changes fastest
+    // L is the horizontal axis (X), M is the vertical axis (Y)
+    static std::vector<tensorstore::Index> MapToZarrCoords(const casacore::IPosition& start) {
+        std::vector<tensorstore::Index> res(kDimSize5D, 0);
+        res[0] = 0; // T (always 0 for CARTA)
+        if (start.size() > 2) { res[1] = start[2]; } // F
+        if (start.size() > 3) { res[2] = start[3]; } // S
+        if (start.size() > 0) { res[3] = start[0]; } // L (CARTA X)
+        if (start.size() > 1) { res[4] = start[1]; } // M (CARTA Y)
+        return res;
     }
 };
 
@@ -197,18 +184,21 @@ bool ZarrDataReader::Initialize() {
         }
         _original_shape = casacore::IPosition(orig_shape_vec);
         
-        _impl->is_5d = (ts_shape.size() == kDimSize5D);
-        
-        if (_impl->is_5d) {
-            std::vector<int> carta_shape;
-            carta_shape.push_back(orig_shape_vec[3]); // l (x)
-            carta_shape.push_back(orig_shape_vec[4]); // m (y)
-            carta_shape.push_back(orig_shape_vec[1]); // freq
-            carta_shape.push_back(orig_shape_vec[2]); // pol
-            _shape = casacore::IPosition(carta_shape);
-        } else {
-            _shape = _original_shape;
+        // XRADIO schema: always 5D [T, F, S, L, M]
+        if (ts_shape.size() != kDimSize5D) {
+            spdlog::error("XRADIO schema requires 5D array, got {}D", ts_shape.size());
+            return false;
         }
+        
+        // Map to CARTA shape [X, Y, F, S]
+        // L (index 3) is the horizontal axis -> X
+        // M (index 4) is the vertical axis -> Y
+        std::vector<int> carta_shape;
+        carta_shape.push_back(orig_shape_vec[3]); // L -> X
+        carta_shape.push_back(orig_shape_vec[4]); // M -> Y
+        carta_shape.push_back(orig_shape_vec[1]); // F
+        carta_shape.push_back(orig_shape_vec[2]); // S
+        _shape = casacore::IPosition(carta_shape);
         
         _initialized = true;
         spdlog::info("ZarrDataReader initialized: ZARR shape={}, CARTA shape={}", 
@@ -233,22 +223,19 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
     try {
         const auto& start = section.start();
         const auto& length = section.length();
+
+        spdlog::debug("ReadSlice: start={}, length={}", start.toString(), length.toString());
         
-        auto zarr_start = _impl->MapToZarrCoords(start, length);
+        auto zarr_start = Impl::MapToZarrCoords(start);
         
-        // Build shape for transform
-        std::vector<tensorstore::Index> zarr_shape;
-        if (_impl->is_5d && length.size() >= kDimSize4D) {
-            zarr_shape.push_back(1);            // time
-            zarr_shape.push_back(length[2]);    // freq
-            zarr_shape.push_back(length[3]);    // pol
-            zarr_shape.push_back(length[0]);    // l (x)
-            zarr_shape.push_back(length[1]);    // m (y)
-        } else {
-            for (size_t i = 0; i < length.size(); ++i) {
-                zarr_shape.push_back(length[i]);
-            }
-        }
+        // Build shape for transform - XRADIO always 5D [T, F, S, L, M]
+        // CARTA length is [X, Y, F, S], L -> X, M -> Y
+        std::vector<tensorstore::Index> zarr_shape(kDimSize5D, 1);
+        zarr_shape[0] = 1;            // time
+        if (length.size() > 2) { zarr_shape[1] = length[2]; }    // freq
+        if (length.size() > 3) { zarr_shape[2] = length[3]; }    // pol
+        if (length.size() > 0) { zarr_shape[3] = length[0]; }    // L (CARTA X)
+        if (length.size() > 1) { zarr_shape[4] = length[1]; }    // M (CARTA Y)
         
         tensorstore::TensorStore<> sliced_store = _impl->store;
         
@@ -270,10 +257,13 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
             spdlog::error("ZarrDataReader: Error casting to float store: {}", typed_store_result.status().ToString());
             return false;
         }
-        
-        // Read into new array
-        auto read_future = tensorstore::Read(typed_store_result.value());
-        auto read_result = read_future.result();
+
+        // Read using dimension permutation
+        // Zarr XRADIO: [0:T, 1:F, 2:S, 3:L, 4:M] in C-order (M fastest)
+        // Use {4, 3, 1, 2, 0} to read with M first (matching C-order), then transpose XY
+        auto read_result = tensorstore::Read(
+            typed_store_result.value() | tensorstore::Dims(0, 1, 2, 3, 4).Transpose({4, 3, 1, 2, 0})
+        ).result();
         
         if (!read_result.ok()) {
             spdlog::error("TensorStore read failed: {}", read_result.status().ToString());
@@ -281,21 +271,32 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
         }
         
         auto result_array = read_result.value();
+        auto fortran_result = tensorstore::MakeCopy(result_array, tensorstore::fortran_order);
         
-        // Copy to casacore array
-        buffer.resize(length);
-        
-        // Use data() and num_elements()
-        if (static_cast<size_t>(result_array.num_elements()) != length.product()) {
-             spdlog::error("ZarrDataReader: Read size mismatch");
+        if (static_cast<size_t>(fortran_result.num_elements()) != length.product()) {
+             spdlog::error("ZarrDataReader: Read size mismatch. Expected {}, got {}", 
+                           length.product(), fortran_result.num_elements());
              return false;
         }
         
-        const float* src_ptr = result_array.data();
-        size_t src_size = result_array.num_elements();
+        // Copy to casacore array with XY transpose
+        // fortran_result has [M, L, F, S, T] order with M fastest
+        // We need [L, M, F, S] order with L fastest (i.e., transpose XY plane)
+        buffer.resize(length);
         
-        // Use buffer iterator to be safe against non-continguous casacore arrays
-        std::copy(src_ptr, src_ptr + src_size, buffer.begin());
+        int width_x = length[0];   // target X size (should be L)
+        int height_y = length[1];  // target Y size (should be M)
+        const float* src_ptr = fortran_result.data();
+        float* dst_ptr = buffer.data();
+        
+        // Transpose the 2D plane:
+        // src is [M, L] with M fastest: src[m, l] at index m + l * M
+        // dst is [L, M] with L fastest: dst[l, m] at index l + m * L
+        for (int iy = 0; iy < height_y; ++iy) {
+            for (int ix = 0; ix < width_x; ++ix) {
+                dst_ptr[ix + (iy * width_x)] = src_ptr[iy + (ix * height_y)];
+            }
+        }
 
         return true;
         
@@ -318,22 +319,22 @@ bool ZarrDataReader::ReadChannel(int channel, int stokes, std::vector<float>& da
         int height = _shape[1];
         size_t channel_size = static_cast<size_t>(width) * height;
         
-        std::vector<tensorstore::Index> zarr_start;
-        std::vector<tensorstore::Index> zarr_shape;
-        
-        if (_impl->is_5d) {
-            zarr_start = {0, channel, stokes, 0, 0};
-            zarr_shape = {1, 1, 1, width, height};
-        } else if (_original_shape.size() == kDimSize4D) {
-            zarr_start = {0, 0, channel, stokes};
-            zarr_shape = {width, height, 1, 1};
-        } else if (_original_shape.size() == kDimSize3D) {
-             zarr_start = {0, 0, channel};
-             zarr_shape = {width, height, 1};
-        } else {
-             zarr_start = {0, 0};
-             zarr_shape = {width, height};
-        }
+        // XRADIO always 5D [T, F, S, L, M]
+        // L -> X (width), M -> Y (height)
+        std::vector<tensorstore::Index> zarr_start = {
+            0,
+            static_cast<tensorstore::Index>(channel),
+            static_cast<tensorstore::Index>(stokes),
+            0,  // L start
+            0   // M start
+        };
+        std::vector<tensorstore::Index> zarr_shape = {
+            1,
+            1,
+            1,
+            static_cast<tensorstore::Index>(width),   // L = X = width
+            static_cast<tensorstore::Index>(height)   // M = Y = height
+        };
         
         tensorstore::TensorStore<> sliced_store = _impl->store;
         
@@ -348,15 +349,16 @@ bool ZarrDataReader::ReadChannel(int channel, int stokes, std::vector<float>& da
             sliced_store = transform_result.value();
         }
         
-        // Explicitly cast to typed store
         auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<float>>(sliced_store);
         if (!typed_store_result.ok()) {
              spdlog::error("ZarrDataReader: Error casting to float store: {}", typed_store_result.status().ToString());
             return false;
         }
-        
-        auto read_future = tensorstore::Read(typed_store_result.value());
-        auto read_result = read_future.result();
+
+        // XRADIO always 5D - use {4, 3, 1, 2, 0} to match C-order storage (M fastest)
+        auto read_result = tensorstore::Read(
+            typed_store_result.value() | tensorstore::Dims(0, 1, 2, 3, 4).Transpose({4, 3, 1, 2, 0})
+        ).result();
         
         if (!read_result.ok()) {
             spdlog::error("TensorStore ReadChannel failed: {}", read_result.status().ToString());
@@ -364,12 +366,17 @@ bool ZarrDataReader::ReadChannel(int channel, int stokes, std::vector<float>& da
         }
 
         auto result_array = read_result.value();
+        auto fortran_result = tensorstore::MakeCopy(result_array, tensorstore::fortran_order);
         
+        // XY transpose: src [M, L] -> dst [L, M]
         data.resize(channel_size);
-        const float* src_ptr = result_array.data();
-        size_t src_size = result_array.num_elements();
-        
-        std::copy(src_ptr, src_ptr + src_size, data.begin());
+        float* dst_ptr = data.data();
+        const float* src_ptr = fortran_result.data();
+        for (int iy = 0; iy < height; ++iy) {
+            for (int ix = 0; ix < width; ++ix) {
+                dst_ptr[ix + (iy * width)] = src_ptr[iy + (ix * height)];
+            }
+        }
         
         return true;
         
@@ -402,22 +409,22 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
         
         size_t chunk_size = static_cast<size_t>(data_width) * data_height;
         
-        std::vector<tensorstore::Index> zarr_start;
-        std::vector<tensorstore::Index> zarr_shape;
-        
-        if (_impl->is_5d) {
-             zarr_start = {0, channel, stokes, min_x, min_y};
-             zarr_shape = {1, 1, 1, data_width, data_height};
-        } else if (_original_shape.size() == kDimSize4D) {
-             zarr_start = {min_x, min_y, channel, stokes};
-             zarr_shape = {data_width, data_height, 1, 1};
-        } else if (_original_shape.size() == kDimSize3D) {
-             zarr_start = {min_x, min_y, channel};
-             zarr_shape = {data_width, data_height, 1};
-        } else {
-             zarr_start = {min_x, min_y};
-             zarr_shape = {data_width, data_height};
-        }
+        // XRADIO always 5D [T, F, S, L, M]
+        // L -> X (min_x, data_width), M -> Y (min_y, data_height)
+        std::vector<tensorstore::Index> zarr_start = {
+            0,
+            static_cast<tensorstore::Index>(channel),
+            static_cast<tensorstore::Index>(stokes),
+            static_cast<tensorstore::Index>(min_x),     // L = X
+            static_cast<tensorstore::Index>(min_y)      // M = Y
+        };
+        std::vector<tensorstore::Index> zarr_shape = {
+            1,
+            1,
+            1,
+            static_cast<tensorstore::Index>(data_width),   // L = X
+            static_cast<tensorstore::Index>(data_height)   // M = Y
+        };
         
         tensorstore::TensorStore<> sliced_store = _impl->store;
         
@@ -438,8 +445,10 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
             return false;
         }
 
-        auto read_future = tensorstore::Read(typed_store_result.value());
-        auto read_result = read_future.result();
+        // XRADIO always 5D - use {4, 3, 1, 2, 0} to match C-order storage (M fastest)
+        auto read_result = tensorstore::Read(
+            typed_store_result.value() | tensorstore::Dims(0, 1, 2, 3, 4).Transpose({4, 3, 1, 2, 0})
+        ).result();
         
         if (!read_result.ok()) {
             spdlog::error("TensorStore GetChunk failed: {}", read_result.status().ToString());
@@ -447,12 +456,17 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
         }
         
         auto result_array = read_result.value();
+        auto fortran_result = tensorstore::MakeCopy(result_array, tensorstore::fortran_order);
         
+        // XY transpose: src [M, L] -> dst [L, M]
         data.resize(chunk_size);
-        const float* src_ptr = result_array.data();
-        size_t src_size = result_array.num_elements();
-        
-        std::copy(src_ptr, src_ptr + src_size, data.begin());
+        float* dst_ptr = data.data();
+        const float* src_ptr = fortran_result.data();
+        for (int iy = 0; iy < data_height; ++iy) {
+            for (int ix = 0; ix < data_width; ++ix) {
+                dst_ptr[ix + (iy * data_width)] = src_ptr[iy + (ix * data_height)];
+            }
+        }
         
         return true;
         

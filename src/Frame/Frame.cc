@@ -1115,6 +1115,8 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
 
     float cursor_value_with_current_stokes(0.0);
 
+    spdlog::debug("FillSpatialProfileData: x={}, y={}", x, y);
+
     // Get the cursor value with current stokes
     if (_image_cache_valid) {
         bool write_lock(false);
@@ -1234,23 +1236,24 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
 
                 if (is_current_stokes) {
                     // ZARR optimization: Use ZarrLoader direct read to bypass corrupted cache
-                    auto zarr_loader = std::dynamic_pointer_cast<ZarrLoader>(_loader);
-                    if (zarr_loader) {
+                    // auto zarr_loader = std::dynamic_pointer_cast<ZarrLoader>(_loader);
+                    // if (zarr_loader) {
                         // Use direct TensorStore read for ZARR files
-                        profile.resize(end - start);
+                        // profile.resize(end - start);
                         
-                        if (config.coordinate().back() == 'x') {
-                            have_profile = zarr_loader->GetSpatialProfileX(profile, start, end - 1, y, CurrentZ(), stokes, _image_mutex);
-                            if (have_profile) {
-                                spdlog::debug("Frame: ZarrLoader GetSpatialProfileX succeeded for x=[{},{}] at y={}", start, end-1, y);
-                            }
-                        } else if (config.coordinate().back() == 'y') {
-                            have_profile = zarr_loader->GetSpatialProfileY(profile, x, start, end - 1, CurrentZ(), stokes, _image_mutex);
-                            if (have_profile) {
-                                spdlog::debug("Frame: ZarrLoader GetSpatialProfileY succeeded for y=[{},{}] at x={}", start, end-1, x);
-                            }
-                        }
-                    } else if (_use_tile_cache) { // Use tile cache to return full resolution data or prepare data for decimation
+                        // if (config.coordinate().back() == 'x') {
+                        //     have_profile = zarr_loader->GetSpatialProfileX(profile, start, end - 1, y, CurrentZ(), stokes, _image_mutex);
+                        //     if (have_profile) {
+                        //         spdlog::debug("Frame: ZarrLoader GetSpatialProfileX succeeded for x=[{},{}] at y={}", start, end-1, y);
+                        //     }
+                        // } else if (config.coordinate().back() == 'y') {
+                        //     have_profile = zarr_loader->GetSpatialProfileY(profile, x, start, end - 1, CurrentZ(), stokes, _image_mutex);
+                        //     if (have_profile) {
+                        //         spdlog::debug("Frame: ZarrLoader GetSpatialProfileY succeeded for y=[{},{}] at x={}", start, end-1, x);
+                        //     }
+                        // }
+                    if (_use_tile_cache) { // Use tile cache to return full resolution data or prepare data for decimation
+                        spdlog::debug("Frame: Using tile cache for spatial profile");
                         profile.resize(end - start);
 
                         if (config.coordinate().back() == 'x') {
@@ -1304,6 +1307,7 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
                             have_profile = true;
                         }
                     } else { // Use image cache to return full resolution data or prepare data for decimation
+                        spdlog::debug("Frame: Using image cache for spatial profile");
                         profile.reserve(end - start);
 
                         if (config.coordinate().back() == 'x') {
@@ -1758,6 +1762,10 @@ bool Frame::GetSlicerData(const StokesSlicer& stokes_slicer, float* data) {
         auto slicer_start = stokes_slicer.slicer.start();
         auto slicer_end = stokes_slicer.slicer.end();
 
+        spdlog::debug("GetSlicerData: cache_shape: {}", cache_shape.toString());
+        spdlog::debug("GetSlicerData: slicer_start: {}", slicer_start.toString());
+        spdlog::debug("GetSlicerData: slicer_end: {}", slicer_end.toString());
+
         // Adjust cache shape and slicer for single channel and stokes
         if (_axes.z >= 0) {
             cache_shape(_axes.z) = 1;
@@ -1779,6 +1787,10 @@ bool Frame::GetSlicerData(const StokesSlicer& stokes_slicer, float* data) {
         // Use loader to slice image
         spdlog::info("Frame::GetZMatrix - Requesting data slice from loader");
         std::unique_lock<std::mutex> ulock(_image_mutex);
+        auto slicer_start = stokes_slicer.slicer.start();
+        auto slicer_end = stokes_slicer.slicer.end();
+        spdlog::debug("GetSlicerData: slicer_start: {}", slicer_start.toString());
+        spdlog::debug("GetSlicerData: slicer_end: {}", slicer_end.toString());
         data_ok = _loader->GetSlice(tmp, stokes_slicer);
         _loader->CloseImageIfUpdated();
         ulock.unlock();
