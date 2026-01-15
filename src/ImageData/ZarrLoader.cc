@@ -51,7 +51,6 @@ bool ZarrLoader::HasMip(int mip_level) const {
 }
 
 bool ZarrLoader::UseTileCache() const {
-    // Enable tile cache for efficient tile-based rendering
     return false;
 }
 

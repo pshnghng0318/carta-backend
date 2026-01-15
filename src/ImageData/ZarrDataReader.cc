@@ -42,7 +42,10 @@ namespace carta {
 constexpr int K_TILE_SIZE = 256;
 #endif
 
-constexpr size_t kDefaultCacheSizeMB = 128;
+// Reduced from 128MB to 16MB to lower memory footprint.
+// TensorStore still handles chunk caching internally, and 16MB is sufficient
+// for typical tile operations (256x256 float tiles = 256KB each).
+constexpr size_t kDefaultCacheSizeMB = 16;
 constexpr size_t kDefaultCpuCount = 8;
 constexpr size_t kDimSize5D = 5;
 
@@ -681,7 +684,7 @@ std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
             }}
         };
         
-        auto context_result = tensorstore::Context::Default(); // Use default context for metadata
+        // Reuse main context to share cache and reduce memory allocations
         auto spec_result = tensorstore::Spec::FromJson(spec_json);
         if (!spec_result.ok()) {
              // Try searching in subdirs if main path fails
@@ -690,7 +693,7 @@ std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
 
         auto open_future = tensorstore::Open(
             spec_result.value(),
-            context_result,
+            _impl->context,  // Reuse main context instead of creating new default
             tensorstore::OpenMode::open,
             tensorstore::ReadWriteMode::read
         );
