@@ -67,7 +67,7 @@ struct ZarrDataReader::Impl {
         
         nlohmann::json context_spec = {
             {"cache_pool", {
-                {"total_bytes_limit", 0}
+                {"total_bytes_limit", kDefaultCacheSizeMB * 1024 * 1024}
             }},
             {"data_copy_concurrency", {
                 {"limit", num_cpus}
