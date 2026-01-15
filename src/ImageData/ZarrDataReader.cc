@@ -65,7 +65,7 @@ struct ZarrDataReader::Impl {
         
         nlohmann::json context_spec = {
             {"cache_pool", {
-                {"total_bytes_limit", static_cast<size_t>(kDefaultCacheSizeMB) << 20}
+                {"total_bytes_limit", 0}
             }},
             {"data_copy_concurrency", {
                 {"limit", num_cpus}
@@ -735,7 +735,7 @@ std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
 
         auto open_future = tensorstore::Open(
             spec_result.value(),
-            _impl->context,  // Reuse main context instead of creating new default
+            tensorstore::Context::Default(),
             tensorstore::OpenMode::open,
             tensorstore::ReadWriteMode::read
         );
