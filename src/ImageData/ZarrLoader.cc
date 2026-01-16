@@ -116,14 +116,10 @@ bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, 
     }
 
     auto reader = zarr_image->GetReader();
-    if (!reader || !reader->IsInitialized()) {
-        return false;
-    }
-
-    return true;
+    return reader && reader->IsInitialized();
 }
 
-bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_range, int stokes,
+bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
     const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
     std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) {
     std::shared_ptr<ZarrDataReader> reader;
@@ -142,10 +138,10 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         return false;
     }
 
-    bool all_z = spectral_range.from == 0 && (spectral_range.to == ALL_Z || spectral_range.to == _dims.depth - 1);
-    AxisRange z_range(spectral_range.from, spectral_range.to);
+    bool all_z = z_range.from == 0 && (z_range.to == ALL_Z || z_range.to == _dims.depth - 1);
+    AxisRange spec_range(z_range.from, z_range.to);
     if (all_z) {
-        z_range.to = _dims.depth - 1;
+        spec_range.to = _dims.depth - 1;
     }
 
     auto region_stats_id = FileInfo::RegionStatsId(region_id, stokes);
@@ -159,7 +155,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
 
     int width = mask_shape(0);
     int height = mask_shape(1);
-    int depth = z_range.to - z_range.from + 1;
+    int depth = spec_range.to - spec_range.from + 1;
     if ((width <= 0) || (height <= 0) || (depth <= 0)) {
         return false;
     }
@@ -234,7 +230,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
     chunks_per_batch = std::max<size_t>(chunks_per_batch, 1);
 
     size_t batch_depth = chunks_per_batch * chunk_depth;
-    size_t absolute_z = static_cast<size_t>(z_range.from) + z_start;
+    size_t absolute_z = static_cast<size_t>(spec_range.from) + z_start;
     size_t offset = chunk_depth > 0 ? absolute_z % chunk_depth : 0;
     if (offset != 0 && chunk_depth > 0) {
         size_t remainder = chunk_depth - offset;
@@ -251,7 +247,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
     casacore::IPosition length(_num_dims, 1);
     start(0) = origin(0);
     start(1) = origin(1);
-    start(2) = z_range.from + z_start;
+    start(2) = spec_range.from + z_start;
     length(0) = width;
     length(1) = height;
     length(2) = batch_depth;
