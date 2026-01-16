@@ -99,8 +99,8 @@ public:
     virtual FileInfo::ImageStats& GetImageStats(int current_stokes, int channel);
 
     // Spectral profiles for cursor and region
-    virtual bool GetCursorSpectralData(
-        std::vector<float>& data, int stokes, int cursor_x, int count_x, int cursor_y, int count_y, std::mutex& image_mutex);
+    virtual bool GetCursorSpectralData(std::vector<float>& data, const AxisRange& z_range, int stokes, int cursor_x,
+        int count_x, int cursor_y, int count_y, std::mutex& image_mutex, float& progress);
     // Check if one can apply swizzled data under such image format and region condition
     virtual bool UseRegionSpectralData(const casacore::IPosition& region_shape, std::mutex& image_mutex);
     virtual bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,

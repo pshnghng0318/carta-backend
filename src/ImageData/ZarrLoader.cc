@@ -7,6 +7,7 @@
 #include "ZarrLoader.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <limits>
 
@@ -84,18 +85,207 @@ bool ZarrLoader::GetChunk(std::vector<float>& data, int& data_width, int& data_h
     return reader->GetChunk(data, data_width, data_height, min_x, min_y, channel, stokes);
 }
 
-bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, 
-                                        int cursor_x, int count_x,
-                                        int cursor_y, int count_y, 
-                                        std::mutex& image_mutex) {
-    // Return false to use Frame.cc's incremental reading path with progress updates.
-    // Frame.cc will call GetSlicerData which uses ReadSlice with multi-channel chunks.
-    // This provides progress feedback for large spectral cubes.
-    //
-    // Note: ReadSpectralProfile is available for other use cases where batch reading 
-    // is preferred (e.g., point region spectral profiles).
-    spdlog::debug("ZarrLoader::GetCursorSpectralData: Using Frame.cc fallback path for progress updates");
-    return false;
+bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange& z_range, int stokes, int cursor_x, int count_x,
+                                       int cursor_y, int count_y, std::mutex& image_mutex, float& progress) {
+    if (count_x <= 0 || count_y <= 0) {
+        return false;
+    }
+
+    std::shared_ptr<ZarrDataReader> reader;
+    {
+        std::lock_guard<std::mutex> lock(image_mutex);
+        auto* zarr_image = GetZarrImage();
+        if (!zarr_image) {
+            spdlog::error("ZarrLoader::GetCursorSpectralData: No valid ZARR image");
+            return false;
+        }
+        reader = zarr_image->GetReader();
+    }
+
+    if (!reader || !reader->IsInitialized()) {
+        spdlog::error("ZarrLoader::GetCursorSpectralData: Reader not initialized");
+        return false;
+    }
+
+    int total_depth = _dims.depth;
+    if (total_depth <= 0) {
+        return false;
+    }
+
+    AxisRange spec_range(z_range.from, z_range.to);
+    if (spec_range.to == ALL_Z || spec_range.to >= total_depth) {
+        spec_range.to = total_depth - 1;
+    }
+
+    int requested_depth = spec_range.to - spec_range.from + 1;
+    if (requested_depth <= 0) {
+        return false;
+    }
+
+    size_t expected_size = static_cast<size_t>(requested_depth * count_x * count_y);
+    {
+        std::lock_guard<std::mutex> guard(_cursor_profile_mutex);
+        bool cache_match = _cursor_profile_cache.valid && (_cursor_profile_cache.stokes == stokes) &&
+            (_cursor_profile_cache.cursor_x == cursor_x) && (_cursor_profile_cache.cursor_y == cursor_y) &&
+            (_cursor_profile_cache.count_x == count_x) && (_cursor_profile_cache.count_y == count_y) &&
+            (_cursor_profile_cache.z_from == static_cast<int>(spec_range.from)) &&
+            (_cursor_profile_cache.z_to == static_cast<int>(spec_range.to)) &&
+            (_cursor_profile_cache.data.size() == expected_size);
+
+        if (progress > 0.0f && cache_match) {
+            data = _cursor_profile_cache.data;
+        } else {
+            data.assign(expected_size, NAN);
+            _cursor_profile_cache.valid = true;
+            _cursor_profile_cache.stokes = stokes;
+            _cursor_profile_cache.cursor_x = cursor_x;
+            _cursor_profile_cache.cursor_y = cursor_y;
+            _cursor_profile_cache.count_x = count_x;
+            _cursor_profile_cache.count_y = count_y;
+            _cursor_profile_cache.z_from = static_cast<int>(spec_range.from);
+            _cursor_profile_cache.z_to = static_cast<int>(spec_range.to);
+            _cursor_profile_cache.data = data;
+        }
+    }
+
+    size_t z_start_in_data = static_cast<size_t>(progress * requested_depth);
+    if (z_start_in_data >= static_cast<size_t>(requested_depth)) {
+        progress = 1.0;
+        return true;
+    }
+
+    // Determine batch size (similar to GetRegionSpectralData)
+    size_t freq_chunk = requested_depth;
+    auto chunk_shape = reader->GetChunkShape();
+    if (chunk_shape.size() > 1) {
+        freq_chunk = chunk_shape[1];
+        if (freq_chunk <= 0) {
+            freq_chunk = requested_depth;
+        }
+    }
+
+    auto align_batch = [&](size_t batch_depth) {
+        if (batch_depth == 0) {
+            batch_depth = 1;
+        }
+        if (freq_chunk > 0) {
+            batch_depth = (batch_depth / freq_chunk) * freq_chunk;
+            if (batch_depth == 0) {
+                batch_depth = freq_chunk;
+            }
+        }
+        return batch_depth;
+    };
+
+    size_t plane_size = static_cast<size_t>(count_x) * static_cast<size_t>(count_y);
+    size_t z_batch = 0;
+    {
+        std::lock_guard<std::mutex> guard(_cursor_batch_mutex);
+        if (_cursor_batch_state.plane_size != plane_size) {
+            _cursor_batch_state = CursorBatchState();
+            _cursor_batch_state.plane_size = plane_size;
+        }
+
+        if (_cursor_batch_state.sample_count >= 2 && _cursor_batch_state.avg_ms_per_channel > 0.0) {
+            double target_ms = TARGET_PARTIAL_REGION_TIME;
+            size_t desired_batch = static_cast<size_t>(std::round(target_ms / _cursor_batch_state.avg_ms_per_channel));
+            desired_batch = std::max<size_t>(1, desired_batch);
+            z_batch = align_batch(desired_batch);
+        } else if (_cursor_batch_state.batch_depth == 0) {
+            // For single pixel profiles, 64MB is huge (16M channels). Use smaller batches to allow progress updates.
+            constexpr size_t target_profile_batch_bytes = 1 * 1024 * 1024; // 1MB for profiles
+            constexpr size_t target_batch_bytes = 64 * 1024 * 1024;
+            size_t target_bytes = (plane_size == 1) ? target_profile_batch_bytes : target_batch_bytes;
+            z_batch = target_bytes / (plane_size * sizeof(float));
+            z_batch = align_batch(z_batch);
+            if (plane_size == 1 && requested_depth > freq_chunk && z_batch >= static_cast<size_t>(requested_depth)) {
+                size_t max_initial_batch = std::max<size_t>(freq_chunk, static_cast<size_t>(requested_depth / 4));
+                z_batch = std::max<size_t>(1, align_batch(max_initial_batch));
+            }
+        } else {
+            z_batch = _cursor_batch_state.batch_depth;
+        }
+    }
+
+    z_batch = std::min<size_t>(z_batch, requested_depth - z_start_in_data);
+    spdlog::debug("ZarrLoader::GetCursorSpectralData: z_batch={}, freq_chunk={}, requested_depth={}, z_start_in_data={}",
+        z_batch, freq_chunk, requested_depth, z_start_in_data);
+
+    casacore::IPosition start(_num_dims, 0);
+    casacore::IPosition length(_num_dims, 1);
+    start(0) = cursor_x;
+    start(1) = cursor_y;
+    start(2) = static_cast<int>(spec_range.from + z_start_in_data);
+    length(0) = count_x;
+    length(1) = count_y;
+    length(2) = z_batch;
+    if (_num_dims > 3) {
+        start(3) = stokes;
+        length(3) = 1;
+    }
+
+    casacore::Array<float> batch_data;
+    auto t_batch_start = std::chrono::high_resolution_clock::now();
+    {
+        std::lock_guard<std::mutex> lock(image_mutex);
+        if (!reader->ReadSlice(casacore::Slicer(start, length), batch_data)) {
+            spdlog::error("ZarrLoader::GetCursorSpectralData: ReadSlice failed");
+            return false;
+        }
+    }
+
+    bool delete_data_ptr(false);
+    const float* data_ptr = batch_data.getStorage(delete_data_ptr);
+    if (!data_ptr) {
+        spdlog::error("ZarrLoader::GetCursorSpectralData: batch_data storage is null");
+        return false;
+    }
+
+    // Copy batch data to the main data vector at the correct position
+    std::copy(data_ptr, data_ptr + batch_data.nelements(), data.begin() + z_start_in_data * count_x * count_y);
+    batch_data.freeStorage(data_ptr, delete_data_ptr);
+
+    auto t_batch_end = std::chrono::high_resolution_clock::now();
+    double dt_ms = std::chrono::duration<double, std::milli>(t_batch_end - t_batch_start).count();
+
+    size_t next_batch = z_batch;
+    if (dt_ms > 0.0) {
+        double scale = TARGET_PARTIAL_REGION_TIME / dt_ms;
+        scale = std::clamp(scale, 0.5, 2.0);
+        next_batch = static_cast<size_t>(std::max<double>(1.0, std::round(z_batch * scale)));
+        next_batch = align_batch(next_batch);
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(_cursor_batch_mutex);
+        _cursor_batch_state.plane_size = plane_size;
+        if (z_batch > 0 && dt_ms > 0.0) {
+            double ms_per_channel = dt_ms / static_cast<double>(z_batch);
+            if (_cursor_batch_state.sample_count < 4) {
+                _cursor_batch_state.avg_ms_per_channel =
+                    (_cursor_batch_state.avg_ms_per_channel * _cursor_batch_state.sample_count + ms_per_channel) /
+                    static_cast<double>(_cursor_batch_state.sample_count + 1);
+                _cursor_batch_state.sample_count++;
+            } else {
+                _cursor_batch_state.avg_ms_per_channel = (0.8 * _cursor_batch_state.avg_ms_per_channel) + (0.2 * ms_per_channel);
+            }
+        }
+        _cursor_batch_state.batch_depth = next_batch;
+        _cursor_batch_state.last_elapsed_ms = dt_ms;
+    }
+
+    {
+        std::lock_guard<std::mutex> guard(_cursor_profile_mutex);
+        if (_cursor_profile_cache.valid && _cursor_profile_cache.data.size() == data.size()) {
+            _cursor_profile_cache.data = data;
+        }
+    }
+
+    z_start_in_data += z_batch;
+    progress = static_cast<float>(z_start_in_data) / requested_depth;
+    progress = std::min<double>(progress, 1.0);
+
+    return true;
 }
 
 bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, std::mutex& image_mutex) {
@@ -105,9 +295,7 @@ bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, 
     if ((region_shape(0) <= 0) || (region_shape(1) <= 0)) {
         return false;
     }
-    if ((region_shape(0) == 1) && (region_shape(1) == 1)) {
-        return false;
-    }
+    // Allow point regions to use loader path for progress-aware reads.
 
     std::lock_guard<std::mutex> lock(image_mutex);
     auto* zarr_image = GetZarrImage();

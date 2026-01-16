@@ -1520,8 +1520,9 @@ bool Frame::FillSpectralProfileData(std::function<void(CARTA::SpectralProfileDat
 
             std::vector<float> spectral_data;
             int xy_count(1);
-            if (!Stokes::IsComputed(stokes) && _loader->GetCursorSpectralData(spectral_data, stokes, (start_cursor.x + 0.5), xy_count,
-                                                   (start_cursor.y + 0.5), xy_count, _image_mutex)) {
+            float tmp_progress(0.0);
+            if (!Stokes::IsComputed(stokes) && _loader->GetCursorSpectralData(spectral_data, _all_z, stokes, (start_cursor.x + 0.5), xy_count,
+                                                   (start_cursor.y + 0.5), xy_count, _image_mutex, tmp_progress)) {
                 // Use loader data
                 spectral_profile->set_raw_values_fp32(spectral_data.data(), spectral_data.size() * sizeof(float));
                 cb(profile_message);
@@ -1847,8 +1848,8 @@ bool Frame::UseLoaderSpectralData(const casacore::IPosition& region_shape) {
     return _loader->UseRegionSpectralData(region_shape, _image_mutex);
 }
 
-bool Frame::GetLoaderPointSpectralData(std::vector<float>& profile, int stokes, CARTA::Point& point) {
-    return _loader->GetCursorSpectralData(profile, stokes, point.x(), 1, point.y(), 1, _image_mutex);
+bool Frame::GetLoaderPointSpectralData(std::vector<float>& profile, const AxisRange& z_range, int stokes, CARTA::Point& point, float& progress) {
+    return _loader->GetCursorSpectralData(profile, z_range, stokes, point.x(), 1, point.y(), 1, _image_mutex, progress);
 }
 
 bool Frame::GetLoaderSpectralData(int region_id, const AxisRange& z_range, int stokes, const casacore::ArrayLattice<casacore::Bool>& mask,

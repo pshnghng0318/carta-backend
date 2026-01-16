@@ -182,7 +182,7 @@ public:
         std::map<CARTA::StatsType, std::vector<double>>& stats_values);
     // Spectral profiles from loader
     bool UseLoaderSpectralData(const casacore::IPosition& region_shape);
-    bool GetLoaderPointSpectralData(std::vector<float>& profile, int stokes, CARTA::Point& point);
+    bool GetLoaderPointSpectralData(std::vector<float>& profile, const AxisRange& z_range, int stokes, CARTA::Point& point, float& progress);
     bool GetLoaderSpectralData(int region_id, const AxisRange& z_range, int stokes, const casacore::ArrayLattice<casacore::Bool>& mask,
         const casacore::IPosition& origin, std::map<CARTA::StatsType, std::vector<double>>& results, float& progress);
     void ClearRegionSpectralCache(int region_id);

@@ -8,7 +8,9 @@
 #define CARTA_SRC_IMAGEDATA_ZARRLOADER_H_
 
 #include <map>
+#include <mutex>
 #include <string>
+#include <vector>
 
 #include "CartaZarrImage.h"
 #include "FileLoader.h"
@@ -38,9 +40,8 @@ public:
                   std::mutex& image_mutex) override;
     
     // Spectral data access
-    bool GetCursorSpectralData(std::vector<float>& data, int stokes, int cursor_x, 
-                               int count_x, int cursor_y, int count_y, 
-                               std::mutex& image_mutex) override;
+    bool GetCursorSpectralData(std::vector<float>& data, const AxisRange& z_range, int stokes, int cursor_x, int count_x,
+        int cursor_y, int count_y, std::mutex& image_mutex, float& progress) override;
     bool UseRegionSpectralData(const casacore::IPosition& region_shape, std::mutex& image_mutex) override;
     bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
         const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
@@ -61,7 +62,31 @@ private:
     // Helper to get typed image
     CartaZarrImage* GetZarrImage();
 
+    struct CursorBatchState {
+        size_t plane_size = 0;
+        size_t batch_depth = 0;
+        double last_elapsed_ms = 0.0;
+        size_t sample_count = 0;
+        double avg_ms_per_channel = 0.0;
+    };
+
+    struct CursorProfileCache {
+        bool valid = false;
+        int stokes = 0;
+        int cursor_x = 0;
+        int cursor_y = 0;
+        int count_x = 0;
+        int count_y = 0;
+        int z_from = 0;
+        int z_to = 0;
+        std::vector<float> data;
+    };
+
     std::map<FileInfo::RegionStatsId, FileInfo::RegionSpectralStats> _region_stats;
+    std::mutex _cursor_batch_mutex;
+    CursorBatchState _cursor_batch_state;
+    std::mutex _cursor_profile_mutex;
+    CursorProfileCache _cursor_profile_cache;
 };
 
 } // namespace carta
