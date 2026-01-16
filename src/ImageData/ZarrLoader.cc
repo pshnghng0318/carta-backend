@@ -194,7 +194,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         return true;
     }
 
-    // Initialize all stats to NaN only on first batch (z_start == 0)
+    // Initialize all stats to NaN only on first batch
     if (z_start == 0) {
         for (size_t z = 0; z < static_cast<size_t>(depth); ++z) {
             num_pixels[z] = 0;
@@ -213,13 +213,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         }
     }
 
-    constexpr size_t kTargetBatchBytes = 64 * 1024 * 1024;
-    constexpr size_t kMaxZBatch = 4096;
-    size_t bytes_per_z = static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(float);
-    size_t delta_z = bytes_per_z > 0 ? kTargetBatchBytes / bytes_per_z : 1;
-    if (delta_z < 1) {
-        delta_z = 1;
-    }
+    constexpr size_t target_batch_bytes = 64 * 1024 * 1024;
+    size_t chunk_depth = 1;
     int freq_chunk = 0;
     auto chunk_shape = reader->GetChunkShape();
     if (chunk_shape.size() > 1) {
@@ -229,29 +224,27 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         }
     }
     if (freq_chunk > 0) {
-        size_t chunk = static_cast<size_t>(freq_chunk);
-        if (chunk <= kMaxZBatch) {
-            size_t absolute_z = static_cast<size_t>(z_range.from) + z_start;
-            size_t offset = absolute_z % chunk;
-            if (offset != 0) {
-                delta_z = chunk - offset;
-            } else {
-                if (delta_z < chunk) {
-                    delta_z = chunk;
-                } else {
-                    delta_z = (delta_z / chunk) * chunk;
-                    if (delta_z == 0) {
-                        delta_z = chunk;
-                    }
-                }
-            }
-        }
+        chunk_depth = static_cast<size_t>(freq_chunk);
     }
-    if (delta_z > kMaxZBatch) {
-        delta_z = kMaxZBatch;
+
+    size_t bytes_per_chunk_depth =
+        static_cast<size_t>(width) * static_cast<size_t>(height) * chunk_depth * sizeof(float);
+    size_t chunks_per_batch = bytes_per_chunk_depth > 0 ? target_batch_bytes / bytes_per_chunk_depth : 1;
+    chunks_per_batch = std::max<size_t>(chunks_per_batch, 1);
+
+    size_t batch_depth = chunks_per_batch * chunk_depth;
+    size_t absolute_z = static_cast<size_t>(z_range.from) + z_start;
+    size_t offset = chunk_depth > 0 ? absolute_z % chunk_depth : 0;
+    if (offset != 0 && chunk_depth > 0) {
+        size_t remainder = chunk_depth - offset;
+        batch_depth = remainder + (chunks_per_batch - 1) * chunk_depth;
     }
-    size_t max_z = std::min(static_cast<size_t>(depth), z_start + delta_z);
-    size_t batch_depth = max_z - z_start;
+    if (batch_depth == 0 && chunk_depth > 0) {
+        batch_depth = chunk_depth;
+    }
+
+    size_t max_z = std::min(static_cast<size_t>(depth), z_start + batch_depth);
+    batch_depth = max_z - z_start;
 
     casacore::IPosition start(_num_dims, 0);
     casacore::IPosition length(_num_dims, 1);
@@ -292,7 +285,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         pos(1) = y;
         for (size_t x = 0; x < w; ++x) {
             pos(0) = x;
-            mask_cache[y * w + x] = mask.getAt(pos) ? 1 : 0;
+            mask_cache[(y * w) + x] = mask.getAt(pos) ? 1 : 0;
         }
     }
 
@@ -312,7 +305,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         uint64_t local_nan = 0;
 
         for (size_t y = 0; y < h; ++y) {
-            size_t row_offset = z_offset + y * w;
+            size_t row_offset = z_offset + (y * w);
             size_t mask_row = y * w;
             for (size_t x = 0; x < w; ++x) {
                 if (!mask_cache[mask_row + x]) {
@@ -323,8 +316,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                     local_count++;
                     local_sum += v;
                     local_sum_sq += v * v;
-                    if (v < local_min) local_min = v;
-                    if (v > local_max) local_max = v;
+                    local_min = std::min(v, local_min);
+                    local_max = std::max(v, local_max);
                 } else {
                     local_nan++;
                 }
