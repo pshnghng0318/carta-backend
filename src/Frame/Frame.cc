@@ -1857,6 +1857,11 @@ bool Frame::GetLoaderSpectralData(int region_id, const AxisRange& z_range, int s
     return _loader->GetRegionSpectralData(region_id, z_range, stokes, mask, origin, _image_mutex, results, progress);
 }
 
+void Frame::ClearRegionSpectralCache(int region_id) {
+    std::lock_guard<std::mutex> lock(_image_mutex);
+    _loader->ClearRegionSpectralCache(region_id);
+}
+
 bool Frame::IsZarrLoader() const {
     return dynamic_cast<ZarrLoader*>(_loader.get()) != nullptr;
 }

@@ -185,6 +185,7 @@ public:
     bool GetLoaderPointSpectralData(std::vector<float>& profile, int stokes, CARTA::Point& point);
     bool GetLoaderSpectralData(int region_id, const AxisRange& z_range, int stokes, const casacore::ArrayLattice<casacore::Bool>& mask,
         const casacore::IPosition& origin, std::map<CARTA::StatsType, std::vector<double>>& results, float& progress);
+    void ClearRegionSpectralCache(int region_id);
     // Loader type detection for format-specific processing
     bool IsZarrLoader() const;
 

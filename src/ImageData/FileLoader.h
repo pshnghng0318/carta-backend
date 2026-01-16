@@ -106,6 +106,7 @@ public:
     virtual bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
         const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
         std::map<CARTA::StatsType, std::vector<double>>& results, float& progress);
+    virtual void ClearRegionSpectralCache(int region_id);
     virtual bool GetDownsampledRasterData(
         std::vector<float>& data, int z, int stokes, CARTA::ImageBounds& bounds, int mip, std::mutex& image_mutex);
     virtual bool GetChunk(

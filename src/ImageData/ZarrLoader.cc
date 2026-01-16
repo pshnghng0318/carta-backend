@@ -174,7 +174,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         _region_stats[region_stats_id] = FileInfo::RegionSpectralStats(origin, mask_shape, depth, has_flux);
     }
 
-    auto& stats = _region_stats[region_stats_id].stats;
+    auto& region_stats = _region_stats[region_stats_id];
+    auto& stats = region_stats.stats;
     auto& num_pixels = stats[CARTA::StatsType::NumPixels];
     auto& nan_count = stats[CARTA::StatsType::NanCount];
     auto& sum = stats[CARTA::StatsType::Sum];
@@ -187,7 +188,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
     auto& extrema = stats[CARTA::StatsType::Extrema];
     double* flux = has_flux ? stats[CARTA::StatsType::FluxDensity].data() : nullptr;
 
-    size_t z_start = _region_stats[region_stats_id].latest_z;
+    size_t z_start = region_stats.latest_z;
     if (z_start >= static_cast<size_t>(depth)) {
         results = stats;
         progress = 1.0;
@@ -279,13 +280,18 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
     // Use char instead of bool for faster access (no bit packing overhead)
     size_t w = static_cast<size_t>(width);
     size_t h = static_cast<size_t>(height);
-    std::vector<char> mask_cache(w * h);
-    casacore::IPosition pos(2);
-    for (size_t y = 0; y < h; ++y) {
-        pos(1) = y;
-        for (size_t x = 0; x < w; ++x) {
-            pos(0) = x;
-            mask_cache[(y * w) + x] = mask.getAt(pos) ? 1 : 0;
+    auto& mask_cache = region_stats.mask_cache;
+    if (region_stats.mask_width != w || region_stats.mask_height != h || mask_cache.empty()) {
+        region_stats.mask_width = w;
+        region_stats.mask_height = h;
+        mask_cache.assign(w * h, 0);
+        casacore::IPosition pos(2);
+        for (size_t y = 0; y < h; ++y) {
+            pos(1) = y;
+            for (size_t x = 0; x < w; ++x) {
+                pos(0) = x;
+                mask_cache[(y * w) + x] = mask.getAt(pos) ? 1 : 0;
+            }
         }
     }
 
@@ -361,17 +367,32 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         progress = static_cast<float>(max_z) / static_cast<float>(depth);
     }
 
-    _region_stats[region_stats_id].latest_z = max_z;
+    region_stats.latest_z = max_z;
 
     if (progress >= 1.0) {
         if (region_id <= TEMP_REGION_ID) {
             _region_stats.erase(region_stats_id);
         } else {
-            _region_stats[region_stats_id].completed = true;
+            region_stats.completed = true;
         }
     }
 
     return true;
+}
+
+void ZarrLoader::ClearRegionSpectralCache(int region_id) {
+    if (region_id == ALL_REGIONS) {
+        _region_stats.clear();
+        return;
+    }
+
+    for (auto it = _region_stats.begin(); it != _region_stats.end();) {
+        if (it->first.region_id == region_id) {
+            it = _region_stats.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 bool ZarrLoader::GetSpatialProfileX(std::vector<float>& profile, int start_x, int end_x, 

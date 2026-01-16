@@ -841,6 +841,11 @@ void RegionHandler::ClearRegionCache(int region_id) {
             stcache.second.ClearStats();
         }
     }
+    for (auto& frame : _frames) {
+        if (frame.second) {
+            frame.second->ClearRegionSpectralCache(region_id);
+        }
+    }
 }
 
 // ********************************************************************

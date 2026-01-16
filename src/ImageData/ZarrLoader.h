@@ -45,6 +45,7 @@ public:
     bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
         const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
         std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) override;
+    void ClearRegionSpectralCache(int region_id) override;
 
     // Spatial profile methods required by Frame.cc for ZARR optimization
     bool GetSpatialProfileX(std::vector<float>& profile, int start_x, int end_x, 

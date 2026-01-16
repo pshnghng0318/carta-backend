@@ -896,6 +896,10 @@ bool FileLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     return false;
 }
 
+void FileLoader::ClearRegionSpectralCache(int region_id) {
+    (void)region_id;
+}
+
 bool FileLoader::GetDownsampledRasterData(
     std::vector<float>& data, int z, int stokes, CARTA::ImageBounds& bounds, int mip, std::mutex& image_mutex) {
     // Must be implemented in subclasses
