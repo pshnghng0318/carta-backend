@@ -2015,13 +2015,6 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
     // Calculate and cache profiles
     size_t start_z(z_range.from), count(0), end_z(0), profile_start(0);
     int delta_z = INIT_DELTA_Z;        // the increment of z for each step
-    
-    // For ZARR files, use smaller initial delta_z to prevent cache overflow
-    // if (_frames.at(file_id)->IsZarrLoader()) {
-    //     delta_z = 5;  // Smaller channel batch size for ZARR to avoid cache overflow
-    //     spdlog::info("ZARR: Using reduced initial delta_z = {} for ZARR cache management", delta_z);
-    // }
-    
     int dt_target = TARGET_DELTA_TIME; // the target time elapse for each step, in the unit of milliseconds
     auto t_partial_profile_start = std::chrono::high_resolution_clock::now();
 
@@ -2090,15 +2083,6 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
         }
         if (delta_z > profile_size) {
             delta_z = profile_size;
-        }
-        
-        // For ZARR files, enforce maximum delta_z to prevent cache overflow
-        if (_frames.at(file_id)->IsZarrLoader()) {
-            const int ZARR_MAX_DELTA_Z = 20;  // Maximum channels per batch for ZARR
-            if (delta_z > ZARR_MAX_DELTA_Z) {
-                delta_z = ZARR_MAX_DELTA_Z;
-                spdlog::info("ZARR: Limited delta_z to {} channels to prevent cache overflow", delta_z);
-            }
         }
 
         // Cancel if region or frame is closing
