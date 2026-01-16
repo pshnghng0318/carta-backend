@@ -105,6 +105,7 @@ public:
     bool IsInitialized() const;
     const casacore::IPosition& GetShape() const;
     const casacore::IPosition& GetOriginalZarrShape() const;
+    const casacore::IPosition& GetChunkShape() const;
     const std::string& GetFilename() const;
     int NumDimensions() const;
 
@@ -115,6 +116,7 @@ private:
     // Cached metadata for quick access without dereferencing impl
     casacore::IPosition _shape;          
     casacore::IPosition _original_shape; 
+    casacore::IPosition _chunk_shape;
     std::string _filename;
     bool _initialized = false;
     

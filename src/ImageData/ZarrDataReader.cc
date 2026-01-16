@@ -22,6 +22,7 @@
 
 // TensorStore includes - isolated to implementation file
 #include "tensorstore/array.h"
+#include "tensorstore/chunk_layout.h"
 #include "tensorstore/index.h"
 #include "tensorstore/index_space/dim_expression.h"
 #include "tensorstore/open.h"
@@ -115,6 +116,7 @@ ZarrDataReader::~ZarrDataReader() = default;
 bool ZarrDataReader::IsInitialized() const { return _initialized; }
 const casacore::IPosition& ZarrDataReader::GetShape() const { return _shape; }
 const casacore::IPosition& ZarrDataReader::GetOriginalZarrShape() const { return _original_shape; }
+const casacore::IPosition& ZarrDataReader::GetChunkShape() const { return _chunk_shape; }
 const std::string& ZarrDataReader::GetFilename() const { return _filename; }
 int ZarrDataReader::NumDimensions() const { return _shape.size(); }
 
@@ -205,6 +207,22 @@ bool ZarrDataReader::Initialize() {
         carta_shape.push_back(orig_shape_vec[2]); // S
         _shape = casacore::IPosition(carta_shape);
         
+        auto chunk_layout_result = _impl->store.chunk_layout();
+        if (chunk_layout_result.ok()) {
+            auto read_chunk_shape = chunk_layout_result.value().read_chunk_shape();
+            if (!read_chunk_shape.empty()) {
+                std::vector<int> chunk_shape_vec;
+                chunk_shape_vec.reserve(read_chunk_shape.size());
+                for (auto size : read_chunk_shape) {
+                    chunk_shape_vec.push_back(static_cast<int>(size));
+                }
+                _chunk_shape = casacore::IPosition(chunk_shape_vec);
+                spdlog::debug("ZarrDataReader chunk shape (read): {}", _chunk_shape.toString());
+            }
+        } else {
+            spdlog::debug("ZarrDataReader: chunk_layout unavailable: {}", chunk_layout_result.status().ToString());
+        }
+
         _initialized = true;
         spdlog::info("ZarrDataReader initialized: ZARR shape={}, CARTA shape={}", 
                     _original_shape.toString(), _shape.toString());

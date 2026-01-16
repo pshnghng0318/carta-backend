@@ -49,6 +49,7 @@ struct RegionSpectralStats {
     std::map<CARTA::StatsType, std::vector<double>> stats;
     volatile bool completed = false;
     size_t latest_x = 0;
+    size_t latest_z = 0;
 
     RegionSpectralStats() {}
 

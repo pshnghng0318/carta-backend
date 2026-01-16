@@ -187,7 +187,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
     auto& extrema = stats[CARTA::StatsType::Extrema];
     double* flux = has_flux ? stats[CARTA::StatsType::FluxDensity].data() : nullptr;
 
-    size_t z_start = _region_stats[region_stats_id].latest_x;
+    size_t z_start = _region_stats[region_stats_id].latest_z;
     if (z_start >= static_cast<size_t>(depth)) {
         results = stats;
         progress = 1.0;
@@ -234,18 +234,45 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         }
     };
 
-    constexpr size_t kTargetChunkBytes = 8 * 1024 * 1024;
+    constexpr size_t kTargetBatchBytes = 64 * 1024 * 1024;
     constexpr size_t kMaxZBatch = 4096;
     size_t bytes_per_z = static_cast<size_t>(width) * static_cast<size_t>(height) * sizeof(float);
-    size_t delta_z = bytes_per_z > 0 ? kTargetChunkBytes / bytes_per_z : 1;
+    size_t delta_z = bytes_per_z > 0 ? kTargetBatchBytes / bytes_per_z : 1;
     if (delta_z < 1) {
         delta_z = 1;
+    }
+    int freq_chunk = 0;
+    auto chunk_shape = reader->GetChunkShape();
+    if (chunk_shape.size() > 1) {
+        freq_chunk = chunk_shape[1];
+        if (freq_chunk < 0) {
+            freq_chunk = depth;
+        }
+    }
+    if (freq_chunk > 0) {
+        size_t chunk = static_cast<size_t>(freq_chunk);
+        if (chunk <= kMaxZBatch) {
+            size_t absolute_z = static_cast<size_t>(z_range.from) + z_start;
+            size_t offset = absolute_z % chunk;
+            if (offset != 0) {
+                delta_z = chunk - offset;
+            } else {
+                if (delta_z < chunk) {
+                    delta_z = chunk;
+                } else {
+                    delta_z = (delta_z / chunk) * chunk;
+                    if (delta_z == 0) {
+                        delta_z = chunk;
+                    }
+                }
+            }
+        }
     }
     if (delta_z > kMaxZBatch) {
         delta_z = kMaxZBatch;
     }
     size_t max_z = std::min(static_cast<size_t>(depth), z_start + delta_z);
-    size_t chunk_depth = max_z - z_start;
+    size_t batch_depth = max_z - z_start;
 
     casacore::IPosition start(_num_dims, 0);
     casacore::IPosition length(_num_dims, 1);
@@ -254,29 +281,29 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
     start(2) = z_range.from + z_start;
     length(0) = width;
     length(1) = height;
-    length(2) = chunk_depth;
+    length(2) = batch_depth;
     if (_num_dims > 3) {
         start(3) = stokes;
         length(3) = 1;
     }
 
-    casacore::Array<float> chunk_data;
+    casacore::Array<float> batch_data;
     {
         std::lock_guard<std::mutex> lock(image_mutex);
-        if (!reader->ReadSlice(casacore::Slicer(start, length), chunk_data)) {
+        if (!reader->ReadSlice(casacore::Slicer(start, length), batch_data)) {
             spdlog::error("ZarrLoader::GetRegionSpectralData: ReadSlice failed");
             return false;
         }
     }
 
     bool delete_data_ptr(false);
-    const float* data_ptr = chunk_data.getStorage(delete_data_ptr);
+    const float* data_ptr = batch_data.getStorage(delete_data_ptr);
     if (!data_ptr) {
-        spdlog::error("ZarrLoader::GetRegionSpectralData: chunk_data storage is null");
+        spdlog::error("ZarrLoader::GetRegionSpectralData: batch_data storage is null");
         return false;
     }
     size_t plane_stride = static_cast<size_t>(width) * static_cast<size_t>(height);
-    for (size_t z = 0; z < chunk_depth; ++z) {
+    for (size_t z = 0; z < batch_depth; ++z) {
         size_t z_index = z_start + z;
         size_t z_offset = z * plane_stride;
         for (size_t y = 0; y < static_cast<size_t>(height); ++y) {
@@ -298,7 +325,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
             }
         }
     }
-    chunk_data.freeStorage(data_ptr, delete_data_ptr);
+    batch_data.freeStorage(data_ptr, delete_data_ptr);
 
     calculate_stats();
 
@@ -309,7 +336,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         progress = static_cast<float>(max_z) / static_cast<float>(depth);
     }
 
-    _region_stats[region_stats_id].latest_x = max_z;
+    _region_stats[region_stats_id].latest_z = max_z;
 
     if (progress >= 1.0) {
         if (region_id <= TEMP_REGION_ID) {
