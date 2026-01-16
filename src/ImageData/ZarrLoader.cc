@@ -196,43 +196,21 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
 
     for (size_t z = 0; z < static_cast<size_t>(depth); ++z) {
         if ((z_start == 0) || (num_pixels[z] == 0)) {
-            min[z] = std::numeric_limits<float>::max();
-            max[z] = std::numeric_limits<float>::lowest();
             num_pixels[z] = 0;
             nan_count[z] = 0;
-            sum[z] = 0;
-            sum_sq[z] = 0;
-        }
-    }
-
-    auto calculate_stats = [&]() {
-        for (size_t z = 0; z < static_cast<size_t>(depth); ++z) {
-            if (num_pixels[z]) {
-                double sum_z = sum[z];
-                double sum_sq_z = sum_sq[z];
-                uint64_t num_pixels_z = num_pixels[z];
-
-                mean[z] = sum_z / num_pixels_z;
-                rms[z] = sqrt(sum_sq_z / num_pixels_z);
-                sigma[z] = num_pixels_z > 1 ? sqrt((sum_sq_z - (sum_z * sum_z / num_pixels_z)) / (num_pixels_z - 1)) : 0;
-                extrema[z] = (abs(min[z]) > abs(max[z]) ? min[z] : max[z]);
-                if (has_flux) {
-                    flux[z] = sum_z / beam_area;
-                }
-            } else {
-                for (auto& kv : stats) {
-                    switch (kv.first) {
-                        case CARTA::StatsType::NanCount:
-                        case CARTA::StatsType::NumPixels:
-                            break;
-                        default:
-                            kv.second[z] = NAN;
-                            break;
-                    }
-                }
+            min[z] = NAN;
+            max[z] = NAN;
+            sum[z] = NAN;
+            sum_sq[z] = NAN;
+            mean[z] = NAN;
+            rms[z] = NAN;
+            sigma[z] = NAN;
+            extrema[z] = NAN;
+            if (has_flux) {
+                flux[z] = NAN;
             }
         }
-    };
+    }
 
     constexpr size_t kTargetBatchBytes = 64 * 1024 * 1024;
     constexpr size_t kMaxZBatch = 4096;
@@ -302,32 +280,84 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         spdlog::error("ZarrLoader::GetRegionSpectralData: batch_data storage is null");
         return false;
     }
-    size_t plane_stride = static_cast<size_t>(width) * static_cast<size_t>(height);
+
+    // Pre-cache mask to avoid repeated casacore::IPosition creation per pixel in hot loop
+    size_t w = static_cast<size_t>(width);
+    size_t h = static_cast<size_t>(height);
+    std::vector<bool> mask_cache(w * h);
+    casacore::IPosition pos(2);
+    for (size_t y = 0; y < h; ++y) {
+        pos(1) = y;
+        for (size_t x = 0; x < w; ++x) {
+            pos(0) = x;
+            mask_cache[y * w + x] = mask.getAt(pos);
+        }
+    }
+
+    size_t plane_stride = w * h;
+
+    // Parallelize over z-axis: each channel's stats are independent
+#pragma omp parallel for schedule(dynamic)
     for (size_t z = 0; z < batch_depth; ++z) {
         size_t z_index = z_start + z;
         size_t z_offset = z * plane_stride;
-        for (size_t y = 0; y < static_cast<size_t>(height); ++y) {
-            size_t base = z_offset + y * static_cast<size_t>(width);
-            for (size_t x = 0; x < static_cast<size_t>(width); ++x) {
-                if (!mask.getAt(casacore::IPosition(2, x, y))) {
+
+        double local_sum = 0.0;
+        double local_sum_sq = 0.0;
+        double local_min = std::numeric_limits<double>::max();
+        double local_max = std::numeric_limits<double>::lowest();
+        uint64_t local_count = 0;
+        uint64_t local_nan = 0;
+
+        for (size_t y = 0; y < h; ++y) {
+            size_t row_offset = z_offset + y * w;
+            size_t mask_row = y * w;
+            for (size_t x = 0; x < w; ++x) {
+                if (!mask_cache[mask_row + x]) {
                     continue;
                 }
-                double v = data_ptr[base + x];
+                double v = static_cast<double>(data_ptr[row_offset + x]);
                 if (std::isfinite(v)) {
-                    num_pixels[z_index] += 1;
-                    sum[z_index] += v;
-                    sum_sq[z_index] += v * v;
-                    min[z_index] = std::min(min[z_index], v);
-                    max[z_index] = std::max(max[z_index], v);
+                    local_count++;
+                    local_sum += v;
+                    local_sum_sq += v * v;
+                    if (v < local_min) local_min = v;
+                    if (v > local_max) local_max = v;
                 } else {
-                    nan_count[z_index] += 1;
+                    local_nan++;
                 }
+            }
+        }
+
+        // Write results and compute derived stats (each z_index is unique, no race condition)
+        num_pixels[z_index] = local_count;
+        nan_count[z_index] = local_nan;
+        sum[z_index] = local_sum;
+        sum_sq[z_index] = local_sum_sq;
+
+        if (local_count > 0) {
+            min[z_index] = local_min;
+            max[z_index] = local_max;
+            mean[z_index] = local_sum / local_count;
+            rms[z_index] = sqrt(local_sum_sq / local_count);
+            sigma[z_index] = local_count > 1 ? sqrt((local_sum_sq - (local_sum * local_sum / local_count)) / (local_count - 1)) : 0;
+            extrema[z_index] = (std::abs(local_min) > std::abs(local_max) ? local_min : local_max);
+            if (has_flux) {
+                flux[z_index] = local_sum / beam_area;
+            }
+        } else {
+            min[z_index] = NAN;
+            max[z_index] = NAN;
+            mean[z_index] = NAN;
+            rms[z_index] = NAN;
+            sigma[z_index] = NAN;
+            extrema[z_index] = NAN;
+            if (has_flux) {
+                flux[z_index] = NAN;
             }
         }
     }
     batch_data.freeStorage(data_ptr, delete_data_ptr);
-
-    calculate_stats();
 
     results = stats;
     if (max_z == static_cast<size_t>(depth)) {
