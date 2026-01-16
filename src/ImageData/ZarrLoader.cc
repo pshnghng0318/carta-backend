@@ -194,8 +194,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
         return true;
     }
 
-    for (size_t z = 0; z < static_cast<size_t>(depth); ++z) {
-        if ((z_start == 0) || (num_pixels[z] == 0)) {
+    // Initialize all stats to NaN only on first batch (z_start == 0)
+    if (z_start == 0) {
+        for (size_t z = 0; z < static_cast<size_t>(depth); ++z) {
             num_pixels[z] = 0;
             nan_count[z] = 0;
             min[z] = NAN;
@@ -282,15 +283,16 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
     }
 
     // Pre-cache mask to avoid repeated casacore::IPosition creation per pixel in hot loop
+    // Use char instead of bool for faster access (no bit packing overhead)
     size_t w = static_cast<size_t>(width);
     size_t h = static_cast<size_t>(height);
-    std::vector<bool> mask_cache(w * h);
+    std::vector<char> mask_cache(w * h);
     casacore::IPosition pos(2);
     for (size_t y = 0; y < h; ++y) {
         pos(1) = y;
         for (size_t x = 0; x < w; ++x) {
             pos(0) = x;
-            mask_cache[y * w + x] = mask.getAt(pos);
+            mask_cache[y * w + x] = mask.getAt(pos) ? 1 : 0;
         }
     }
 
