@@ -6,9 +6,6 @@
 
 #include "CartaZarrImage.h"
 
-#include <filesystem>
-#include <fstream>
-
 #include <casacore/casa/OS/Path.h>
 #include <casacore/coordinates/Coordinates/DirectionCoordinate.h>
 #include <casacore/coordinates/Coordinates/LinearCoordinate.h>
@@ -24,8 +21,7 @@ using namespace casacore;
 namespace carta {
 
 CartaZarrImage::CartaZarrImage(const std::string& filename)
-    : ImageInterface<float>(),
-      _reader(std::make_shared<ZarrDataReader>(filename)),
+    : _reader(std::make_shared<ZarrDataReader>(filename)),
       _name(filename),
       _is_copy(false) {
     

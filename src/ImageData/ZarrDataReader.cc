@@ -9,7 +9,6 @@
 // Standard library includes MUST come before TensorStore to ensure types are defined
 #include <algorithm>
 #include <array>
-#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -34,9 +33,7 @@
 #include "tensorstore/util/result.h"
 #include "tensorstore/context.h"
 // Include driver headers if necessary for Read
-#include "tensorstore/driver/read.h" 
 
-#include "Util/Image.h"
 
 namespace carta {
 
@@ -665,7 +662,8 @@ bool ZarrDataReader::ReadSpectralProfile(int x, int y, int stokes,
 //-----------------------------------------------------------------------------
 
 std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
-    if (!_initialized) return {};
+    if (!_initialized) { return {};
+}
     std::lock_guard<std::mutex> lock(_read_mutex);
 
     try {
@@ -738,7 +736,8 @@ std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
 }
 
 std::string ZarrDataReader::GetAttributeString(const std::string& array_name, const std::string& attr_name) {
-    if (!_initialized) return "";
+    if (!_initialized) { return "";
+}
     
     // Read .zattrs for the array
     std::filesystem::path base_path(_filename);
@@ -756,7 +755,8 @@ std::string ZarrDataReader::GetAttributeString(const std::string& array_name, co
         if (jsonObj.contains(attr_name)) {
             if (jsonObj[attr_name].is_string()) {
                 return jsonObj[attr_name].get<std::string>();
-            } else if (jsonObj[attr_name].is_array() && !jsonObj[attr_name].empty() && jsonObj[attr_name][0].is_string()) {
+            } 
+            if (jsonObj[attr_name].is_array() && !jsonObj[attr_name].empty() && jsonObj[attr_name][0].is_string()) {
                 return jsonObj[attr_name][0].get<std::string>(); // e.g. units: ["rad"]
             }
         }
@@ -766,7 +766,8 @@ std::string ZarrDataReader::GetAttributeString(const std::string& array_name, co
 }
 
 std::string ZarrDataReader::GetZattrsString(const std::string& array_name) {
-    if (!_initialized) return "{}";
+    if (!_initialized) { return "{}";
+}
     
     std::filesystem::path base_path(_filename);
     std::filesystem::path attrs_path = base_path;
@@ -797,7 +798,7 @@ std::map<std::string, std::string> ZarrDataReader::GetZattrMap(const std::string
         std::string json_str = GetZattrsString(array_name);
         nlohmann::json jsonObj = nlohmann::json::parse(json_str);
         
-        for (auto& [key, val] : jsonObj.items()) {
+        for (const auto& [key, val] : jsonObj.items()) {
             if (val.is_string()) {
                 result[key] = val.get<std::string>();
             } else {

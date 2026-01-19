@@ -128,11 +128,11 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
         bool cache_match = _cursor_profile_cache.valid && (_cursor_profile_cache.stokes == stokes) &&
             (_cursor_profile_cache.cursor_x == cursor_x) && (_cursor_profile_cache.cursor_y == cursor_y) &&
             (_cursor_profile_cache.count_x == count_x) && (_cursor_profile_cache.count_y == count_y) &&
-            (_cursor_profile_cache.z_from == static_cast<int>(spec_range.from)) &&
-            (_cursor_profile_cache.z_to == static_cast<int>(spec_range.to)) &&
+            (_cursor_profile_cache.z_from == spec_range.from) &&
+            (_cursor_profile_cache.z_to == spec_range.to) &&
             (_cursor_profile_cache.data.size() == expected_size);
 
-        if (progress > 0.0f && cache_match) {
+        if (progress > 0.0F && cache_match) {
             data = _cursor_profile_cache.data;
         } else {
             data.assign(expected_size, NAN);
@@ -142,8 +142,8 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
             _cursor_profile_cache.cursor_y = cursor_y;
             _cursor_profile_cache.count_x = count_x;
             _cursor_profile_cache.count_y = count_y;
-            _cursor_profile_cache.z_from = static_cast<int>(spec_range.from);
-            _cursor_profile_cache.z_to = static_cast<int>(spec_range.to);
+            _cursor_profile_cache.z_from = spec_range.from;
+            _cursor_profile_cache.z_to = spec_range.to;
             _cursor_profile_cache.data = data;
         }
     }
