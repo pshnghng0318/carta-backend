@@ -1559,6 +1559,13 @@ bool Frame::FillSpectralProfileData(std::function<void(CARTA::SpectralProfileDat
                         partial_profile->set_stats_type(config.all_stats[0]);
                         partial_profile->set_coordinate(config.coordinate);
                         partial_profile->set_raw_values_fp32(spectral_data.data(), spectral_data.size() * sizeof(float));
+                        // Check for cancel
+                        if (!(_cursor == start_cursor) || !IsConnected()) {
+                            return false;
+                        }
+                        if (!HasSpectralConfig(config)) {
+                            break;
+                        }
                         cb(partial_data);
                     }
                 }
