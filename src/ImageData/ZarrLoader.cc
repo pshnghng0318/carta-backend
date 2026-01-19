@@ -164,6 +164,9 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
         }
     }
 
+    // Cap batch to enable more frequent progress updates (aim for ~4-8 updates)
+    size_t max_batch_for_updates = std::max<size_t>(freq_chunk, requested_depth / 8);
+    
     auto align_batch = [&](size_t batch_depth) {
         if (batch_depth == 0) {
             batch_depth = 1;
@@ -174,6 +177,8 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
                 batch_depth = freq_chunk;
             }
         }
+        // Cap to max_batch_for_updates to ensure frequent progress updates
+        batch_depth = std::min(batch_depth, max_batch_for_updates);
         return batch_depth;
     };
 
@@ -427,6 +432,10 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     if (batch_depth == 0 && chunk_depth > 0) {
         batch_depth = chunk_depth;
     }
+    
+    // Cap batch to enable more frequent progress updates (aim for ~4-8 updates)
+    size_t max_batch_for_updates = std::max<size_t>(chunk_depth, static_cast<size_t>(depth) / 8);
+    batch_depth = std::min(batch_depth, max_batch_for_updates);
 
     size_t max_z = std::min(static_cast<size_t>(depth), z_start + batch_depth);
     batch_depth = max_z - z_start;

@@ -48,6 +48,8 @@ constexpr int K_TILE_SIZE = 256;
 constexpr size_t kDefaultCacheSizeMB = 16;
 constexpr size_t kDefaultCpuCount = 8;
 constexpr size_t kDimSize5D = 5;
+constexpr int kDefaultStripeHeight = 256;
+constexpr int kStripeChunkMultiplier = 8;  // Read multiple chunks per stripe to reduce overhead
 
 //-----------------------------------------------------------------------------
 // Pimpl Implementation Helper
@@ -246,109 +248,153 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
 
         spdlog::debug("ReadSlice: start={}, length={}", start.toString(), length.toString());
         
-        auto zarr_start = Impl::MapToZarrCoords(start);
-        spdlog::debug("ReadSlice: zarr_start=[{},{},{},{},{}]", 
-                      zarr_start[0], zarr_start[1], zarr_start[2], zarr_start[3], zarr_start[4]);
-        
-        // Build shape for transform - XRADIO always 5D [T, F, S, L, M]
-        // CARTA length is [X, Y, F, S], L -> X, M -> Y
-        std::vector<tensorstore::Index> zarr_shape(kDimSize5D, 1);
-        zarr_shape[0] = 1;            // time
-        if (length.size() > 2) { zarr_shape[1] = length[2]; }    // freq
-        if (length.size() > 3) { zarr_shape[2] = length[3]; }    // pol
-        if (length.size() > 0) { zarr_shape[3] = length[0]; }    // L (CARTA X)
-        if (length.size() > 1) { zarr_shape[4] = length[1]; }    // M (CARTA Y)
-        
-        spdlog::debug("ReadSlice: zarr_shape=[{},{},{},{},{}]", 
-                      zarr_shape[0], zarr_shape[1], zarr_shape[2], zarr_shape[3], zarr_shape[4]);
-        spdlog::debug("ReadSlice: original_shape={}", _original_shape.toString());
-        
-        // Bounds validation - check that requested slice is within the original array bounds
-        for (size_t dim = 0; dim < kDimSize5D; ++dim) {
-            tensorstore::Index end_idx = zarr_start[dim] + zarr_shape[dim] - 1;
-            if (zarr_start[dim] < 0 || end_idx >= _original_shape[dim]) {
-                spdlog::error("ReadSlice: Bounds error! dim={}, start={}, end={}, array_size={}",
-                              dim, zarr_start[dim], end_idx, _original_shape[dim]);
-                return false;
-            }
-        }
-        spdlog::debug("ReadSlice: Bounds check passed");
-        
-        tensorstore::TensorStore<> sliced_store = _impl->store;
-        
-        for (size_t dim = 0; dim < zarr_start.size(); ++dim) {
-            auto transform_result = sliced_store | 
-                tensorstore::Dims(static_cast<tensorstore::DimensionIndex>(dim))
-                    .ClosedInterval(zarr_start[dim], zarr_start[dim] + zarr_shape[dim] - 1);
-            
-            if (!transform_result.ok()) {
-                spdlog::error("ZarrDataReader: Error creating slice transform: {}", transform_result.status().ToString());
-                return false;
-            }
-            sliced_store = transform_result.value();
-        }
-        spdlog::debug("ReadSlice: Slice transform created");
-        
-        // Cast to typed float store
-        auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<float>>(sliced_store);
-        if (!typed_store_result.ok()) {
-            spdlog::error("ZarrDataReader: Error casting to float store: {}", typed_store_result.status().ToString());
-            return false;
-        }
-        spdlog::debug("ReadSlice: Float store cast succeeded");
-
         int width_x = length[0];   // target X size (CARTA L)
         int height_y = length[1];  // target Y size (CARTA M)
         int num_freq = (length.size() > 2) ? length[2] : 1;
         int num_stokes = (length.size() > 3) ? length[3] : 1;
-        spdlog::debug(
-            "ReadSlice: Dimensions: {}x{}, freq={}, stokes={}, total={}",
-            width_x, height_y, num_freq, num_stokes,
-            static_cast<size_t>(width_x) * height_y * num_freq * num_stokes);
+        
+        // Get chunk size for M dimension (Y) to align stripe reads
+        // _chunk_shape is in XRADIO 5D order [T, F, S, L, M]
+        int chunk_height_m = kDefaultStripeHeight;
+        if (_chunk_shape.size() == kDimSize5D && _chunk_shape[4] > 0) {
+            chunk_height_m = _chunk_shape[4];
+        }
+        
+        // Read multiple chunks per stripe to reduce per-stripe overhead
+        // while still limiting memory usage
+        int stripe_chunk_height = chunk_height_m * kStripeChunkMultiplier;
+        
+        // Align stripe start with chunk boundaries in M dimension
+        int start_y = start[1];
+        int aligned_stripe_height = stripe_chunk_height;
+        
+        // Adjust first stripe to align with chunk boundary
+        int first_stripe_offset = start_y % chunk_height_m;
+        
+        spdlog::debug("ReadSlice: Dimensions: {}x{}, freq={}, stokes={}, chunk_height={}", 
+                      width_x, height_y, num_freq, num_stokes, chunk_height_m);
         
         // Pre-allocate output buffer
         buffer.resize(length);
         float* dst_ptr = buffer.data();
         if (!dst_ptr) {
-            spdlog::error("ReadSlice: buffer.data() returned null after resize");
-            return false;
-        }
-        spdlog::debug("ReadSlice: Buffer allocated");
-        
-        auto time_slice_result = typed_store_result.value() | tensorstore::Dims(0).IndexSlice(0);
-        if (!time_slice_result.ok()) {
-            spdlog::error("ZarrDataReader: Error slicing time dimension: {}",
-                          time_slice_result.status().ToString());
+            spdlog::error("ReadSlice: buffer.data() returned null");
             return false;
         }
         
-        auto reorder_result = time_slice_result.value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
-        if (!reorder_result.ok()) {
-            spdlog::error("ZarrDataReader: Error reordering dimensions: {}",
-                          reorder_result.status().ToString());
-            return false;
+        // Read in stripes aligned with chunk boundaries to minimize memory usage
+        // and avoid reading the same chunk multiple times
+        int y_offset = 0;
+        while (y_offset < height_y) {
+            // Calculate stripe height aligned with chunk boundaries
+            int stripe_height;
+            if (y_offset == 0 && first_stripe_offset > 0) {
+                // First stripe: align to next chunk boundary
+                stripe_height = std::min(chunk_height_m - first_stripe_offset, height_y);
+            } else {
+                // Subsequent stripes: full chunk height or remainder
+                stripe_height = std::min(aligned_stripe_height, height_y - y_offset);
+            }
+            
+            // Build zarr coordinates for this stripe
+            std::vector<tensorstore::Index> zarr_start(kDimSize5D, 0);
+            zarr_start[0] = 0;                                          // T
+            zarr_start[1] = (start.size() > 2) ? start[2] : 0;          // F
+            zarr_start[2] = (start.size() > 3) ? start[3] : 0;          // S
+            zarr_start[3] = start[0];                                   // L (X)
+            zarr_start[4] = start[1] + y_offset;                        // M (Y)
+            
+            std::vector<tensorstore::Index> zarr_shape(kDimSize5D, 1);
+            zarr_shape[0] = 1;                                          // T
+            zarr_shape[1] = num_freq;                                   // F
+            zarr_shape[2] = num_stokes;                                 // S
+            zarr_shape[3] = width_x;                                    // L (X)
+            zarr_shape[4] = stripe_height;                              // M (Y stripe)
+            
+            // Bounds validation for this stripe
+            bool bounds_ok = true;
+            for (size_t dim = 0; dim < kDimSize5D; ++dim) {
+                tensorstore::Index end_idx = zarr_start[dim] + zarr_shape[dim] - 1;
+                if (zarr_start[dim] < 0 || end_idx >= _original_shape[dim]) {
+                    spdlog::error("ReadSlice: Bounds error! dim={}, start={}, end={}, array_size={}",
+                                  dim, zarr_start[dim], end_idx, _original_shape[dim]);
+                    bounds_ok = false;
+                    break;
+                }
+            }
+            if (!bounds_ok) {
+                return false;
+            }
+            
+            // Create sliced store for this stripe
+            tensorstore::TensorStore<> sliced_store = _impl->store;
+            for (size_t dim = 0; dim < kDimSize5D; ++dim) {
+                auto transform_result = sliced_store | 
+                    tensorstore::Dims(static_cast<tensorstore::DimensionIndex>(dim))
+                        .ClosedInterval(zarr_start[dim], zarr_start[dim] + zarr_shape[dim] - 1);
+                
+                if (!transform_result.ok()) {
+                    spdlog::error("ZarrDataReader: Error creating slice transform: {}", 
+                                  transform_result.status().ToString());
+                    return false;
+                }
+                sliced_store = transform_result.value();
+            }
+            
+            // Cast to typed float store
+            auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<float>>(sliced_store);
+            if (!typed_store_result.ok()) {
+                spdlog::error("ZarrDataReader: Error casting to float store: {}", 
+                              typed_store_result.status().ToString());
+                return false;
+            }
+            
+            // Slice time dimension and transpose
+            auto time_slice_result = typed_store_result.value() | tensorstore::Dims(0).IndexSlice(0);
+            if (!time_slice_result.ok()) {
+                spdlog::error("ZarrDataReader: Error slicing time dimension: {}",
+                              time_slice_result.status().ToString());
+                return false;
+            }
+            
+            // Transpose from [F, S, L, M] to [L, M, F, S] = [X, Y, F, S]
+            auto reorder_result = time_slice_result.value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+            if (!reorder_result.ok()) {
+                spdlog::error("ZarrDataReader: Error reordering dimensions: {}",
+                              reorder_result.status().ToString());
+                return false;
+            }
+            
+            // Calculate destination pointer for this stripe
+            // Buffer is in Fortran order [X, Y, F, S], so Y varies in the second dimension
+            // Stride in Y is width_x (one column)
+            float* stripe_dst = dst_ptr + (static_cast<size_t>(y_offset) * width_x);
+            
+            std::array<tensorstore::Index, 4> stripe_output_shape = {
+                static_cast<tensorstore::Index>(width_x),
+                static_cast<tensorstore::Index>(stripe_height),
+                static_cast<tensorstore::Index>(num_freq),
+                static_cast<tensorstore::Index>(num_stokes)
+            };
+            
+            // Create output array pointing to the stripe location in the buffer
+            auto output_array = tensorstore::SharedArray<float>(
+                tensorstore::internal::UnownedToShared(stripe_dst), stripe_output_shape,
+                tensorstore::fortran_order);
+            
+            // Read this stripe
+            auto read_status = tensorstore::Read(reorder_result.value(), output_array).result();
+            if (!read_status.ok()) {
+                spdlog::error("ZarrDataReader: ReadSlice stripe failed: {}", 
+                              read_status.status().ToString());
+                return false;
+            }
+            
+            y_offset += stripe_height;
         }
         
-        std::array<tensorstore::Index, 4> output_shape = {
-            static_cast<tensorstore::Index>(width_x),
-            static_cast<tensorstore::Index>(height_y),
-            static_cast<tensorstore::Index>(num_freq),
-            static_cast<tensorstore::Index>(num_stokes)
-        };
-        
-        auto output_array = tensorstore::SharedArray<float>(
-            tensorstore::internal::UnownedToShared(dst_ptr), output_shape,
-            tensorstore::fortran_order);
-        
-        spdlog::debug("ReadSlice: Starting TensorStore read into output buffer...");
-        auto read_status = tensorstore::Read(reorder_result.value(), output_array).result();
-        spdlog::debug("ReadSlice: TensorStore read completed");
-        
-        if (!read_status.ok()) {
-            spdlog::error("ZarrDataReader: ReadSlice failed: {}", read_status.status().ToString());
-            return false;
-        }
-
+        spdlog::debug("ReadSlice: Completed reading {} stripes", 
+                      (height_y + chunk_height_m - 1) / chunk_height_m);
         return true;
         
     } catch (const std::exception& ex) {
