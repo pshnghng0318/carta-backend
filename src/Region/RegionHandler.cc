@@ -2023,11 +2023,6 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
             casacore::IPosition origin = lc_region->boundingBox().start();
             auto point = Message::Point(origin(0), origin(1));
 
-            spdlog::debug("Fill spectral profile for point region (Zarr)");
-
-            // Progress must persist across loop iterations for batched reads
-            float point_progress(0.0);
-
             while (progress < 1.0) {
                 // Cancel if region or frame is closing
                 if (!RegionFileIdsValid(region_id, file_id)) {
@@ -2047,14 +2042,12 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
 
                 auto get_stokes_profiles_data = [&](ProfilesMap& tmp_results, int tmp_stokes) {
                     std::vector<float> tmp_profile;
-                    // z_range and progress do not work for Hdf5Loader
-                    if (!_frames.at(file_id)->GetLoaderPointSpectralData(tmp_profile, z_range, tmp_stokes, point, point_progress)) {
+                    if (!_frames.at(file_id)->GetLoaderPointSpectralData(tmp_profile, z_range, tmp_stokes, point, progress)) {
                         return false;
                     }
                     // Set results; there is only one required stat for point
                     std::vector<double> tmp_data(tmp_profile.begin(), tmp_profile.end());
                     tmp_results[required_stats[0]] = tmp_data;
-                    progress = point_progress;
                     return true;
                 };
 
@@ -2164,7 +2157,7 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
 
         spdlog::performance("Fill spectral profile in {:.3f} ms", t.Elapsed().ms());
         return true;
-    }
+    } // end zarr data
 
     // Initialize cache results for *all* spectral stats
     std::map<CARTA::StatsType, std::vector<double>> cache_results;

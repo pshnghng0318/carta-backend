@@ -1521,6 +1521,52 @@ bool Frame::FillSpectralProfileData(std::function<void(CARTA::SpectralProfileDat
             std::vector<float> spectral_data;
             int xy_count(1);
             float tmp_progress(0.0);
+
+            if (IsZarrLoader() && !Stokes::IsComputed(stokes)) {
+                size_t profile_size = Depth();
+                spectral_data.resize(profile_size, NAN);
+                float progress(0.0);
+
+                size_t dt_partial_update = TARGET_PARTIAL_CURSOR_TIME;
+                auto t_start_profile = std::chrono::high_resolution_clock::now();
+
+                while (progress < 1.0) {
+                    // Check for cancel
+                    if (!(_cursor == start_cursor) || !IsConnected()) {
+                        return false;
+                    }
+                    if (!HasSpectralConfig(config)) {
+                        break;
+                    }
+
+                    if (!_loader->GetCursorSpectralData(spectral_data, _all_z, stokes, (start_cursor.x + 0.5), xy_count,
+                                                        (start_cursor.y + 0.5), xy_count, _image_mutex, progress)) {
+                        // Error or read failed
+                        break;
+                    }
+
+                    auto t_now = std::chrono::high_resolution_clock::now();
+                    auto dt_profile = std::chrono::duration<double, std::milli>(t_now - t_start_profile).count();
+
+                    if (progress >= 1.0) {
+                        spectral_profile->set_raw_values_fp32(spectral_data.data(), spectral_data.size() * sizeof(float));
+                        cb(profile_message);
+                    } else if (dt_profile > dt_partial_update) {
+                        t_start_profile = t_now;
+                        // Partial update
+                        auto partial_data = Message::SpectralProfileData(CurrentStokes(), progress);
+                        auto *partial_profile = partial_data.add_profiles();
+                        partial_profile->set_stats_type(config.all_stats[0]);
+                        partial_profile->set_coordinate(config.coordinate);
+                        partial_profile->set_raw_values_fp32(spectral_data.data(), spectral_data.size() * sizeof(float));
+                        cb(partial_data);
+                    }
+                }
+
+                spdlog::performance("Fill cursor spectral profile in {:.3f} ms", t.Elapsed().ms());
+                continue;
+            }
+
             if (!Stokes::IsComputed(stokes) && _loader->GetCursorSpectralData(spectral_data, _all_z, stokes, (start_cursor.x + 0.5), xy_count,
                                                    (start_cursor.y + 0.5), xy_count, _image_mutex, tmp_progress)) {
                 // Use loader data
