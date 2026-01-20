@@ -1967,11 +1967,33 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
                 }
 
                 // Get partial profile
+                // Cancellation check lambda
+                auto cancellation_check = [&]() -> bool {
+                    if (!RegionFileIdsValid(region_id, file_id)) {
+                        spdlog::info("Cancellation: RegionFileIdsValid returned false");
+                        return true;
+                    }
+                    if (region->GetRegionState() != initial_region_state) {
+                        spdlog::info("Cancellation: Region state changed");
+                        return true;
+                    }
+                    if (use_current_stokes && (stokes_index != _frames.at(file_id)->CurrentStokes())) {
+                        spdlog::info("Cancellation: Stokes changed");
+                        return true;
+                    }
+                    if (!HasSpectralRequirements(region_id, file_id, coordinate, required_stats)) {
+                        spdlog::info("Cancellation: Spectral requirements changed");
+                        return true;
+                    }
+                    return false;
+                };
+
+                // Get partial profile
                 auto get_profiles_data = [&](ProfilesMap& tmp_results, std::string tmp_coordinate) {
                     int tmp_stokes;
                     return (
                         _frames.at(file_id)->GetStokesTypeIndex(tmp_coordinate, tmp_stokes) &&
-                        _frames.at(file_id)->GetLoaderSpectralData(region_id, z_range, tmp_stokes, mask, xy_origin, tmp_results, progress));
+                        _frames.at(file_id)->GetLoaderSpectralData(region_id, z_range, tmp_stokes, mask, xy_origin, tmp_results, progress, cancellation_check));
                 };
 
                 ProfilesMap partial_profiles;
@@ -1981,7 +2003,7 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
                     }
                 } else { // For regular stokes I, Q, U, or V
                     if (!_frames.at(file_id)->GetLoaderSpectralData(
-                            region_id, z_range, stokes_index, mask, xy_origin, partial_profiles, progress)) {
+                            region_id, z_range, stokes_index, mask, xy_origin, partial_profiles, progress, cancellation_check)) {
                         return false;
                     }
                 }

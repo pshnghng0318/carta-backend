@@ -8,6 +8,7 @@
 #define CARTA_SRC_IMAGEDATA_ZARRLOADER_H_
 
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -46,6 +47,10 @@ public:
     bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
         const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
         std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) override;
+    bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
+        const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
+        std::map<CARTA::StatsType, std::vector<double>>& results, float& progress,
+        std::function<bool()> cancellation_check = nullptr) override;
     void ClearRegionSpectralCache(int region_id) override;
 
     // Spatial profile methods required by Frame.cc for ZARR optimization
@@ -82,7 +87,7 @@ private:
         std::vector<float> data;
     };
 
-    std::map<FileInfo::RegionStatsId, FileInfo::RegionSpectralStats> _region_stats;
+    std::map<FileInfo::RegionStatsId, std::shared_ptr<FileInfo::RegionSpectralStats>> _region_stats;
     std::mutex _cursor_batch_mutex;
     CursorBatchState _cursor_batch_state;
     std::mutex _cursor_profile_mutex;

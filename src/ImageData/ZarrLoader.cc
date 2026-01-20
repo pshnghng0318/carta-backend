@@ -315,6 +315,13 @@ bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, 
 bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
     const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
     std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) {
+    return GetRegionSpectralData(region_id, z_range, stokes, mask, origin, image_mutex, results, progress, nullptr);
+}
+
+bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
+    const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
+    std::map<CARTA::StatsType, std::vector<double>>& results, float& progress,
+    std::function<bool()> cancellation_check) {
     std::shared_ptr<ZarrDataReader> reader;
     {
         std::lock_guard<std::mutex> lock(image_mutex);
@@ -331,6 +338,10 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         return false;
     }
 
+    if (cancellation_check && cancellation_check()) {
+        return false;
+    }
+
     bool all_z = z_range.from == 0 && (z_range.to == ALL_Z || z_range.to == _dims.depth - 1);
     AxisRange spec_range(z_range.from, z_range.to);
     if (all_z) {
@@ -339,9 +350,17 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
 
     auto region_stats_id = FileInfo::RegionStatsId(region_id, stokes);
     casacore::IPosition mask_shape(mask.shape());
-    if (_region_stats.count(region_stats_id) && _region_stats[region_stats_id].IsValid(origin, mask_shape) && all_z &&
-        _region_stats[region_stats_id].IsCompleted()) {
-        results = _region_stats[region_stats_id].stats;
+    std::shared_ptr<FileInfo::RegionSpectralStats> existing_stats_ptr;
+    {
+        std::lock_guard<std::mutex> lock(image_mutex);
+        if (_region_stats.count(region_stats_id)) {
+            existing_stats_ptr = _region_stats[region_stats_id];
+        }
+    }
+
+    if (existing_stats_ptr && existing_stats_ptr->IsValid(origin, mask_shape) && all_z &&
+        existing_stats_ptr->IsCompleted()) {
+        results = existing_stats_ptr->stats;
         progress = 1.0;
         return true;
     }
@@ -356,14 +375,22 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     double beam_area = CalculateBeamArea();
     bool has_flux = !std::isnan(beam_area);
 
-    if (_region_stats.find(region_stats_id) == _region_stats.end()) {
-        _region_stats.emplace(
-            std::piecewise_construct, std::forward_as_tuple(region_id, stokes), std::forward_as_tuple(origin, mask_shape, depth, has_flux));
-    } else if (!_region_stats[region_stats_id].IsValid(origin, mask_shape)) {
-        _region_stats[region_stats_id] = FileInfo::RegionSpectralStats(origin, mask_shape, depth, has_flux);
+    std::shared_ptr<FileInfo::RegionSpectralStats> stats_ptr;
+    {
+        std::lock_guard<std::mutex> lock(image_mutex);
+        if (_region_stats.find(region_stats_id) == _region_stats.end()) {
+            stats_ptr = std::make_shared<FileInfo::RegionSpectralStats>(origin, mask_shape, depth, has_flux);
+            _region_stats.emplace(region_stats_id, stats_ptr);
+        } else {
+            stats_ptr = _region_stats[region_stats_id];
+            if (!stats_ptr->IsValid(origin, mask_shape)) {
+                stats_ptr = std::make_shared<FileInfo::RegionSpectralStats>(origin, mask_shape, depth, has_flux);
+                _region_stats[region_stats_id] = stats_ptr;
+            }
+        }
     }
 
-    auto& region_stats = _region_stats[region_stats_id];
+    auto& region_stats = *stats_ptr;
     auto& stats = region_stats.stats;
     auto& num_pixels = stats[CARTA::StatsType::NumPixels];
     auto& nan_count = stats[CARTA::StatsType::NanCount];
@@ -460,6 +487,11 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
             spdlog::error("ZarrLoader::GetRegionSpectralData: ReadSlice failed");
             return false;
         }
+    }
+
+    if (cancellation_check && cancellation_check()) {
+        spdlog::info("ZarrLoader::GetRegionSpectralData: Cancelled by callback");
+        return false;
     }
 
     bool delete_data_ptr(false);

@@ -184,7 +184,8 @@ public:
     bool UseLoaderSpectralData(const casacore::IPosition& region_shape);
     bool GetLoaderPointSpectralData(std::vector<float>& profile, const AxisRange& z_range, int stokes, CARTA::Point& point, float& progress);
     bool GetLoaderSpectralData(int region_id, const AxisRange& z_range, int stokes, const casacore::ArrayLattice<casacore::Bool>& mask,
-        const casacore::IPosition& origin, std::map<CARTA::StatsType, std::vector<double>>& results, float& progress);
+        const casacore::IPosition& origin, std::map<CARTA::StatsType, std::vector<double>>& results, float& progress,
+        std::function<bool()> cancellation_check = nullptr);
     void ClearRegionSpectralCache(int region_id);
     // Loader type detection for format-specific processing
     bool IsZarrLoader() const;
