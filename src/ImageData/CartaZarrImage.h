@@ -84,6 +84,7 @@ private:
     void SetupCoordinateSystem();
     void CreateDefaultCoordinateSystem();
     bool ParseWCSFromMetadata();
+    void ParseBeamFromMetadata();
 };
 
 } // namespace carta

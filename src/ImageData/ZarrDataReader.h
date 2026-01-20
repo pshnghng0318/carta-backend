@@ -91,6 +91,10 @@ public:
     // Returns empty vector on failure
     std::vector<double> ReadVector(const std::string& array_name);
 
+    // Read an array of any rank by relative path and return as flat vector
+    // Returns empty vector on failure
+    std::vector<double> ReadFlattenedVector(const std::string& array_name);
+
     // Read attribute string (e.g. unit) from an array
     std::string GetAttributeString(const std::string& array_name, const std::string& attr_name);
 

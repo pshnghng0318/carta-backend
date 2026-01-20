@@ -781,6 +781,84 @@ std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
     }
 }
 
+std::vector<double> ZarrDataReader::ReadFlattenedVector(const std::string& array_name) {
+    if (!_initialized) { return {}; }
+    std::lock_guard<std::mutex> lock(_read_mutex);
+
+    try {
+        std::filesystem::path base_path(_filename);
+        std::filesystem::path target_path = base_path / array_name;
+        
+        // Open the array using TensorStore
+        nlohmann::json spec_json = {
+            {"driver", "zarr"},
+            {"kvstore", {
+                {"driver", "file"},
+                {"path", target_path.string()}
+            }}
+        };
+        
+        // Reuse main context to share cache and reduce memory allocations
+        auto spec_result = tensorstore::Spec::FromJson(spec_json);
+        if (!spec_result.ok()) {
+             return {};
+        }
+
+        auto open_future = tensorstore::Open(
+            spec_result.value(),
+            tensorstore::Context::Default(),
+            tensorstore::OpenMode::open,
+            tensorstore::ReadWriteMode::read
+        );
+        
+        auto open_result = open_future.result();
+        if (!open_result.ok()) {
+            return {};
+        }
+        
+        auto store = open_result.value();
+        
+        // No rank check - we want to flatten whatever it is
+        
+        // Read data
+        // We cast to double for uniformity
+        auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<double>>(store);
+        if (!typed_store_result.ok()) {
+             return {};
+        }
+        
+        // Read into memory
+        auto read_result = tensorstore::Read(typed_store_result.value()).result();
+        if (!read_result.ok()) {
+            return {};
+        }
+        
+        auto array = read_result.value();
+        size_t size = array.num_elements();
+        std::vector<double> result(size);
+        
+        // Copy data assuming C-order flattening is desired or at least some consistent order.
+        // If contiguity is not guaranteed we'd need to iterate.
+        // But typically Read() returns a contiguous array.
+        
+        // If not contiguous, we can try to iterate, but iteration helpers might be complex.
+        // Let's rely on data() for now. If it's null (non-contiguous), we fail.
+        const double* ptr = array.data();
+        if (ptr) {
+            std::copy(ptr, ptr + size, result.begin());
+        } else {
+             spdlog::warn("ReadFlattenedVector: Array {} resulted in non-contiguous memory, simpler copy failed.", array_name);
+             return {};
+        }
+
+        return result;
+        
+    } catch (const std::exception& ex) {
+        spdlog::warn("Error reading flattened vector {}: {}", array_name, ex.what());
+        return {};
+    }
+}
+
 std::string ZarrDataReader::GetAttributeString(const std::string& array_name, const std::string& attr_name) {
     if (!_initialized) { return "";
 }

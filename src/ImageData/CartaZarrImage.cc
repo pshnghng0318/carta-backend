@@ -12,6 +12,7 @@
 #include <casacore/coordinates/Coordinates/SpectralCoordinate.h>
 #include <casacore/coordinates/Coordinates/StokesCoordinate.h>
 #include <casacore/casa/Quanta/Unit.h>
+#include <casacore/images/Images/ImageInfo.h>
 #include <casacore/tables/DataMan/TiledFileAccess.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -183,11 +184,13 @@ void CartaZarrImage::SetupCoordinateSystem() {
     try {
         // Try to parse WCS from ZARR metadata first
         if (ParseWCSFromMetadata()) {
+            ParseBeamFromMetadata();
             return;
         }
         
         // Fall back to default coordinate system
         CreateDefaultCoordinateSystem();
+        ParseBeamFromMetadata(); // Try parsing beam even if WCS is default
         
     } catch (const std::exception& e) {
         spdlog::warn("Error setting up coordinate system: {}, using default", e.what());
@@ -288,7 +291,7 @@ bool CartaZarrImage::ParseWCSFromMetadata() {
             }
         }
         
-        Projection projection(Projection::SIN);
+        Projection projection(Projection::type(projection_str));
         
         DirectionCoordinate dir_coord(direction_type_enum, projection, 
                                       crval1_rad, crval2_rad,
@@ -448,6 +451,45 @@ void CartaZarrImage::CreateDefaultCoordinateSystem() {
         DirectionCoordinate dir_coord;
         fallback.addCoordinate(dir_coord);
         setCoordinateInfo(fallback);
+    }
+}
+
+void CartaZarrImage::ParseBeamFromMetadata() {
+    try {
+        // Read BEAM array (flattened)
+        // fits2xradio writes "BEAM" as [time, freq, pol, param] or similar ND array
+        // We just need the first beam (single beam support for now)
+        std::vector<double> beam_data = _reader->ReadFlattenedVector("BEAM");
+        if (beam_data.size() < 3) {
+            return;
+        }
+
+        // Check units
+        std::string units = _reader->GetAttributeString("BEAM", "units");
+        if (units.empty()) {
+            units = "rad"; // Default to rad as per fits2xradio
+        }
+
+        // Taking first beam (index 0, 1, 2 for major, minor, pa)
+        double bmaj = beam_data[0];
+        double bmin = beam_data[1];
+        double bpa = beam_data[2];
+
+        // Construct GaussianBeam
+        GaussianBeam beam(
+            Quantity(bmaj, units),
+            Quantity(bmin, units),
+            Quantity(bpa, units)
+        );
+
+        ImageInfo info = imageInfo();
+        info.setRestoringBeam(beam);
+        setImageInfo(info);
+        
+        spdlog::info("Parsed restoring beam from Zarr BEAM array: {}, {}, {} {}", bmaj, bmin, bpa, units);
+
+    } catch (const std::exception& e) {
+        spdlog::warn("Error parsing beam from metadata: {}", e.what());
     }
 }
 
