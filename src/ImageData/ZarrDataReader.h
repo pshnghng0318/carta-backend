@@ -91,6 +91,9 @@ public:
     // Returns empty vector on failure
     std::vector<double> ReadVector(const std::string& array_name);
 
+    // Read a 1D string array (e.g. polarization)
+    std::vector<std::string> ReadStringVector(const std::string& array_name);
+
     // Read an array of any rank by relative path and return as flat vector
     // Returns empty vector on failure
     std::vector<double> ReadFlattenedVector(const std::string& array_name);

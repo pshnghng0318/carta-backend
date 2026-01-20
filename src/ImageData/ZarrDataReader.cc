@@ -190,6 +190,30 @@ bool ZarrDataReader::Initialize() {
         }
         _original_shape = casacore::IPosition(orig_shape_vec);
         
+        // Validate _ARRAY_DIMENSIONS if present
+        try {
+            // Read .zattrs manually to check _ARRAY_DIMENSIONS
+            // (tensorstore might expose it via Schema but simple JSON read is reliable)
+            std::string zattrs_str = GetZattrsString(""); 
+            if (!zattrs_str.empty() && zattrs_str != "{}") {
+                nlohmann::json zattrs = nlohmann::json::parse(zattrs_str);
+                if (zattrs.contains("_ARRAY_DIMENSIONS")) {
+                    std::vector<std::string> dims = zattrs["_ARRAY_DIMENSIONS"].get<std::vector<std::string>>();
+                    if (dims.size() == 5) {
+                         // Check for deviations from standard XRADIO order [time, freq, pol, l, m]
+                         // Note: names might vary slightly, but we expect l, m at end
+                         bool standard_order = (dims[3] == "l" || dims[3] == "u" || dims[3] == "X") &&
+                                               (dims[4] == "m" || dims[4] == "v" || dims[4] == "Y");
+                         if (!standard_order) {
+                             spdlog::warn("Effectively assuming [t, f, p, l, m] but _ARRAY_DIMENSIONS are: {}", fmt::join(dims, ", "));
+                         }
+                    }
+                }
+            }
+        } catch (...) {
+            // Ignore metadata read errors during init, handled elsewhere or non-critical
+        }
+
         // XRADIO schema: always 5D [T, F, S, L, M]
         if (ts_shape.size() != kDimSize5D) {
             spdlog::error("XRADIO schema requires 5D array, got {}D", ts_shape.size());
@@ -777,6 +801,81 @@ std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
         
     } catch (const std::exception& ex) {
         spdlog::warn("Error reading vector {}: {}", array_name, ex.what());
+        return {};
+    }
+}
+
+std::vector<std::string> ZarrDataReader::ReadStringVector(const std::string& array_name) {
+    if (!_initialized) { return {}; }
+    std::lock_guard<std::mutex> lock(_read_mutex);
+
+    try {
+        std::filesystem::path base_path(_filename);
+        std::filesystem::path target_path = base_path / array_name;
+        
+        nlohmann::json spec_json = {
+            {"driver", "zarr"},
+            {"kvstore", {
+                {"driver", "file"},
+                {"path", target_path.string()}
+            }}
+        };
+        
+        auto spec_result = tensorstore::Spec::FromJson(spec_json);
+        if (!spec_result.ok()) {
+             return {};
+        }
+
+        auto open_future = tensorstore::Open(
+            spec_result.value(),
+            tensorstore::Context::Default(),
+            tensorstore::OpenMode::open,
+            tensorstore::ReadWriteMode::read
+        );
+        
+        auto open_result = open_future.result();
+        if (!open_result.ok()) {
+            return {};
+        }
+        
+        auto store = open_result.value();
+        auto domain = store.domain();
+        
+        if (domain.rank() != 1) {
+            spdlog::warn("ReadStringVector: Array {} is not 1D (rank={})", array_name, domain.rank());
+            return {};
+        }
+        
+        // Try reading as string (TensorStore supports casting some types to string, 
+        // but for Zarr fixed-length strings it usually maps to std::string or view)
+        // Explicitly casting to string store
+        auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<std::string>>(store);
+        
+        if (typed_store_result.ok()) {
+            // It's already a string-compatible type
+            auto read_result = tensorstore::Read(typed_store_result.value()).result();
+            if (!read_result.ok()) {
+                return {};
+            }
+             auto array = read_result.value();
+            size_t size = array.num_elements();
+            std::vector<std::string> result(size);
+            
+            // Copy data
+            // Since we ensured rank 1, we can iterate by index
+            for (tensorstore::Index i = 0; i < array.domain().shape()[0]; ++i) {
+                result[i] = array(i);
+            }
+            return result;
+        } else {
+             // Fallback: maybe it's bytes or incompatible? 
+             // If fits2xradio wrote it as JSON strings or unicode, StaticCast should verify compatibility.
+             spdlog::warn("ReadStringVector: could not cast array {} to string", array_name);
+             return {};
+        }
+
+    } catch (const std::exception& ex) {
+        spdlog::warn("Error reading string vector {}: {}", array_name, ex.what());
         return {};
     }
 }

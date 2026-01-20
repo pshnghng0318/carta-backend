@@ -26,6 +26,10 @@ CartaZarrImage::CartaZarrImage(const std::string& filename)
       _name(filename),
       _is_copy(false) {
     
+    // Constants
+    static constexpr double kDefaultSpectralFreq = 1.4e9;
+    static constexpr double kDefaultSpectralWidth = 1e6;
+    
     // Initialize the reader
     if (!_reader->Initialize()) {
         throw AipsError("Failed to initialize ZarrDataReader for: " + filename);
@@ -369,6 +373,7 @@ bool CartaZarrImage::ParseWCSFromMetadata() {
                                           rest_freq);
             coord_sys.addCoordinate(spec_coord);
         } else if (_shape.size() > 2) {
+             // Use constants defined in constructor or here
              constexpr double kDefaultFreq = 1.4e9;
              constexpr double kDefaultWidth = 1e6;
              SpectralCoordinate spec_coord(MFrequency::TOPO, kDefaultFreq, kDefaultWidth, 0.0);
@@ -379,7 +384,39 @@ bool CartaZarrImage::ParseWCSFromMetadata() {
         if (_shape.size() > 3) {
              int stokes_size = _shape[3];
              Vector<int> stokes(stokes_size);
-             stokes = Stokes::I; // Default
+             
+             // Try to read 'polarization' or 'stokes' array
+             std::vector<std::string> pol_strs = _reader->ReadStringVector("polarization");
+             if (pol_strs.empty()) {
+                 pol_strs = _reader->ReadStringVector("stokes");
+             }
+             
+             if (!pol_strs.empty() && pol_strs.size() >= static_cast<size_t>(stokes_size)) {
+                 for (int i = 0; i < stokes_size; ++i) {
+                     stokes(i) = Stokes::type(pol_strs[i]);
+                     // Fallback if type() returns 0 (Undefined) but string was valid?
+                     // casacore::Stokes::type(string) returns Stokes::Standard usually.
+                     // If unknown, it might return Stokes::I or throw? 
+                     // type() wraps generic string match.
+                 }
+                 spdlog::info("Parsed polarization axes from metadata");
+             } else {
+                 // Fallback to default
+                 stokes = Stokes::I; 
+                 // If size > 1 and we default to all I, that's invalid for CoordinateSystem usually
+                 // So we should try to differentiate if possible, but without metadata we can't guess Q/U/V.
+                 // Just linear increment?
+                 if (stokes_size > 1) {
+                     for (int i=0; i<stokes_size; ++i) {
+                         // Fallback: Just assume standard order if I, Q, U, V... 
+                         // But unsafe. Let's just warn.
+                         stokes(i) = Stokes::type(i + 1); // 1=I, 2=Q, 3=U, 4=V ...
+                     }
+                      spdlog::warn("No polarization metadata found, assuming standard Stokes indices 1..N");
+                 } else {
+                      stokes = Stokes::I;
+                 }
+             }
              
              StokesCoordinate stokes_coord(stokes);
              coord_sys.addCoordinate(stokes_coord);
