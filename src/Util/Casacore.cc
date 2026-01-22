@@ -14,6 +14,7 @@
 
 #include "ImageData/CartaMiriadImage.h"
 #include "Logger/Logger.h"
+#include "String.h"
 
 const std::regex GILDAS_REGEX(" *[a-zA-Z]+[ .]+\\(T[a-zA-Z_]+[*.]*\\) *");
 
@@ -280,20 +281,23 @@ bool IsGildasUnit(const casacore::String& unit) {
 
 namespace fs = std::filesystem;
 
-inline bool ends_with(const std::string& str, const std::string& suffix) {
-    return str.size() >= suffix.size() &&
-           str.compare(str.size() - suffix.size(), suffix.size(), suffix) == 0;
+namespace {
+bool HasZarrMetadataFile(const fs::path& dir_path) {
+    std::error_code err_code;
+    return fs::exists(dir_path / ".zattr", err_code) || fs::exists(dir_path / ".zgroup", err_code) ||
+           fs::exists(dir_path / ".zmetadata", err_code);
 }
+} // namespace
 
 bool IsZarrFile(const std::string& path) {
-    if (fs::is_directory(path) && ends_with(path, ".zarr")) {
-        return true;
+    std::error_code err_code;
+    fs::path fs_path(path);
+    if (fs_path.empty()) {
+        return false;
     }
 
-    if (fs::exists(path)) {
-        if (ends_with(path, ".zarray") || ends_with(path, ".zmetadata")) {
-            return true;
-        }
+    if (fs::is_directory(fs_path, err_code)) {
+        return HasSuffix(fs_path.filename().string(), ".zarr") && HasZarrMetadataFile(fs_path);
     }
 
     return false;
