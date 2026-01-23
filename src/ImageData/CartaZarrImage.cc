@@ -100,6 +100,11 @@ DataType CartaZarrImage::dataType() const {
 
 
 Vector<String> CartaZarrImage::FitsHeaderStrings() {
+    // Return cached headers if available
+    if (!_fits_header_strings.empty()) {
+        return _fits_header_strings;
+    }
+    
     std::vector<String> headers;
 
     static constexpr size_t kFitsKeywordMaxLen = 8;
@@ -476,11 +481,12 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
     // END keyword required for FITS header
     headers.emplace_back(fmt::format("{:<80}", "END"));
 
-    Vector<String> header_vector(headers.size());
+    // Cache the headers
+    _fits_header_strings.resize(headers.size());
     for (size_t i = 0; i < headers.size(); ++i) {
-        header_vector[i] = headers[i];
+        _fits_header_strings[i] = headers[i];
     }
-    return header_vector;
+    return _fits_header_strings;
 }
 
 Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
@@ -582,7 +588,6 @@ void CartaZarrImage::SetupCoordinateSystem() {
         
         if (!header_strings.empty()) {
             // Use casacore's ImageFITSConverter to build coordinate system from FITS headers
-            // This is the same approach used by CartaHdf5Image
             int stokes_fits_value(1);
             Record unused_headers;
             LogSink sink;  // null sink to suppress confusing FITS log messages

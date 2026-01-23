@@ -86,6 +86,7 @@ private:
     
     bool _is_copy = false;
     mutable std::mutex _slice_mutex;
+    casacore::Vector<casacore::String> _fits_header_strings;  // Cached FITS headers
     
     // Coordinate system setup
     void SetupCoordinateSystem();
