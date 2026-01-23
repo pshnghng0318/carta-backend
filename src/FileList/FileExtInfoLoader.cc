@@ -25,6 +25,7 @@
 #include "../ImageData/CartaZarrImage.h"
 #include "FileList/FitsHduList.h"
 #include "Logger/Logger.h"
+#include "Timer/Timer.h"
 #include "Util/Casacore.h"
 #include "Util/File.h"
 #include "Util/FileSystem.h"
@@ -153,6 +154,8 @@ void FileExtInfoLoader::StripHduName(std::string& hdu) {
 }
 
 bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_info, const std::string& hdu, std::string& message) {
+    Timer t;
+    
     // add header_entries in FITS format (issue #13) using ImageInterface from FileLoader
     bool info_ok(false);
     if (_loader) {
@@ -178,17 +181,6 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                 auto equivalent_type = data_type; // for FITS only, for rescaled data
                 casacore::String image_type(image->imageType());
                 spdlog::debug("Image type: {}, Data type: {}, Equivalent type: {}", image_type, data_type, equivalent_type);
-                
-                // For ZARR images, ensure we get the correct data type from CartaZarrImage
-                if (image_type == "zarr") {
-                    auto zarr_data_type = image->dataType();
-                    spdlog::debug("ZARR image detected - loader data type: {}, CartaZarrImage data type: {}", data_type, zarr_data_type);
-                    if (data_type != zarr_data_type) {
-                        data_type = zarr_data_type;
-                        equivalent_type = zarr_data_type;
-                        spdlog::debug("Updated ZARR data type to: {} (equivalent: {})", data_type, equivalent_type);
-                    }
-                }
                 
                 bool use_image_for_entries(false);
                 if (image_type == "FITSImage") {
@@ -228,7 +220,11 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                 } else if (image_type == "CartaHdf5Image") {
                     CartaHdf5Image* hdf5_image = dynamic_cast<CartaHdf5Image*>(image.get());
                     casacore::Vector<casacore::String> headers = hdf5_image->FitsHeaderStrings();
-                    AddEntriesFromHeaderStrings(headers, hdu, extended_info);    
+                    AddEntriesFromHeaderStrings(headers, hdu, extended_info);
+                } else if (image_type == "CartaZarrImage") {
+                    CartaZarrImage* zarr_image = dynamic_cast<CartaZarrImage*>(image.get());
+                    casacore::Vector<casacore::String> headers = zarr_image->FitsHeaderStrings();
+                    AddEntriesFromHeaderStrings(headers, hdu, extended_info);
                 } else {
                     // Get image headers in FITS format using casacore ImageHeaderToFITS
                     spdlog::debug("Using GetFITSHeader fallback for image type: {}", image_type);
@@ -277,6 +273,8 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
     } else { // loader failed
         message = "Image type not supported.";
     }
+
+    spdlog::performance("Fill file info in {:.3f} ms", t.Elapsed().ms());
 
     return info_ok;
 }

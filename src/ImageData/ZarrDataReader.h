@@ -108,6 +108,9 @@ public:
     // Helper to get raw JSON content of .zattrs for full parsing
     std::string GetZattrsString(const std::string& array_name = "");
 
+    // Helper to get raw JSON content of .zarray for full parsing
+    std::string GetZarrayString(const std::string& array_name = "");
+
     // Accessors
     bool IsInitialized() const;
     const casacore::IPosition& GetShape() const;

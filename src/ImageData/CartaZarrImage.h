@@ -12,6 +12,8 @@
 #include <string>
 
 #include <casacore/coordinates/Coordinates/CoordinateSystem.h>
+#include <casacore/casa/Arrays/Vector.h>
+#include <casacore/images/Images/ImageBeamSet.h>
 #include <casacore/images/Images/ImageInterface.h>
 #include <casacore/lattices/Lattices/TiledShape.h>
 
@@ -52,6 +54,8 @@ public:
     casacore::uInt advisedMaxPixels() const override;
     casacore::IPosition doNiceCursorShape(casacore::uInt maxPixels) const override;
 
+    casacore::Vector<casacore::String> FitsHeaderStrings();
+
     // Mask-related (ZARR images typically don't have masks)
     casacore::Bool isMasked() const override;
     casacore::Bool hasPixelMask() const override;
@@ -76,6 +80,9 @@ private:
     casacore::IPosition _shape;
     casacore::String _name;
     casacore::TiledShape _tiled_shape;
+    bool _is_single_beam = true;
+    casacore::GaussianBeam _beam;
+    casacore::ImageBeamSet _beam_set;
     
     bool _is_copy = false;
     mutable std::mutex _slice_mutex;
@@ -85,6 +92,7 @@ private:
     void CreateDefaultCoordinateSystem();
     bool ParseWCSFromMetadata();
     void ParseBeamFromMetadata();
+    void SetBeams();
 };
 
 } // namespace carta

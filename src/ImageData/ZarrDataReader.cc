@@ -972,15 +972,15 @@ std::string ZarrDataReader::GetAttributeString(const std::string& array_name, co
     
     try {
         std::ifstream fstr(attrs_path);
-        nlohmann::json jsonObj;
-        fstr >> jsonObj;
+        nlohmann::json json_obj;
+        fstr >> json_obj;
         
-        if (jsonObj.contains(attr_name)) {
-            if (jsonObj[attr_name].is_string()) {
-                return jsonObj[attr_name].get<std::string>();
+        if (json_obj.contains(attr_name)) {
+            if (json_obj[attr_name].is_string()) {
+                return json_obj[attr_name].get<std::string>();
             } 
-            if (jsonObj[attr_name].is_array() && !jsonObj[attr_name].empty() && jsonObj[attr_name][0].is_string()) {
-                return jsonObj[attr_name][0].get<std::string>(); // e.g. units: ["rad"]
+            if (json_obj[attr_name].is_array() && !json_obj[attr_name].empty() && json_obj[attr_name][0].is_string()) {
+                return json_obj[attr_name][0].get<std::string>(); // e.g. units: ["rad"]
             }
         }
     } catch (...) {}
@@ -989,39 +989,46 @@ std::string ZarrDataReader::GetAttributeString(const std::string& array_name, co
 }
 
 std::string ZarrDataReader::GetZattrsString(const std::string& array_name) {
-    if (!_initialized) { return "{}";
-}
-    
     std::filesystem::path base_path(_filename);
-    std::filesystem::path attrs_path = base_path;
-    
     if (!array_name.empty()) {
-        attrs_path = attrs_path / array_name;
-    }
+        base_path /= array_name;
+    } 
     
-    attrs_path = attrs_path / ".zattrs";
-    
-    if (!std::filesystem::exists(attrs_path)) {
-        return "{}";
-    }
-    
-    try {
-        std::ifstream fstr(attrs_path);
+    // Check for .zattrs in the resolved path
+    std::filesystem::path zattrs_path = base_path / ".zattrs";
+    if (std::filesystem::exists(zattrs_path)) {
+        std::ifstream file(zattrs_path);
         std::stringstream buffer;
-        buffer << fstr.rdbuf();
+        buffer << file.rdbuf();
         return buffer.str();
-    } catch (...) {
+    }
+    return "{}";
+}
+
+std::string ZarrDataReader::GetZarrayString(const std::string& array_name) {
+    std::filesystem::path base_path(_filename);
+    if (!array_name.empty()) {
+        base_path /= array_name;
+    }
+    
+    std::filesystem::path zarray_path = base_path / ".zarray";
+    if (!std::filesystem::exists(zarray_path)) {
         return "{}";
     }
+    
+    std::ifstream file(zarray_path);
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
 }
 
 std::map<std::string, std::string> ZarrDataReader::GetZattrMap(const std::string& array_name) {
     std::map<std::string, std::string> result;
     try {
         std::string json_str = GetZattrsString(array_name);
-        nlohmann::json jsonObj = nlohmann::json::parse(json_str);
+        nlohmann::json json_obj = nlohmann::json::parse(json_str);
         
-        for (const auto& [key, val] : jsonObj.items()) {
+        for (const auto& [key, val] : json_obj.items()) {
             if (val.is_string()) {
                 result[key] = val.get<std::string>();
             } else {
