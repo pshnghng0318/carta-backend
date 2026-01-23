@@ -8,8 +8,8 @@
 
 #include <algorithm>
 #include <cmath>
-#include <iomanip>
-#include <sstream>
+
+#include <spdlog/fmt/fmt.h>
 
 #include <casacore/casa/OS/Path.h>
 #include <casacore/coordinates/Coordinates/DirectionCoordinate.h>
@@ -17,6 +17,7 @@
 #include <casacore/coordinates/Coordinates/SpectralCoordinate.h>
 #include <casacore/coordinates/Coordinates/StokesCoordinate.h>
 #include <casacore/casa/Quanta/Unit.h>
+#include <casacore/images/Images/ImageFITSConverter.h>
 #include <casacore/images/Images/ImageInfo.h>
 #include <casacore/tables/DataMan/TiledFileAccess.h>
 #include <nlohmann/json.hpp>
@@ -97,31 +98,32 @@ DataType CartaZarrImage::dataType() const {
     return TpFloat;
 }
 
+
 Vector<String> CartaZarrImage::FitsHeaderStrings() {
     std::vector<String> headers;
 
     static constexpr size_t kFitsKeywordMaxLen = 8;
+    static constexpr size_t kFitsHeaderLen = 80;
 
+    // Format headers in standard FITS format: 80 characters, 8-char keyword name
     auto add_string_header = [&headers](const std::string& key, const std::string& value) {
         if (value.empty()) {
             return;
         }
-        std::ostringstream line;
-        line << key << " = '" << value << "'";
-        headers.emplace_back(line.str());
+        std::string key_value = fmt::format("{:<8}= '{}'", key, value);
+        headers.emplace_back(fmt::format("{:<80}", key_value));
     };
 
     auto add_double_header = [&headers](const std::string& key, double value) {
-        std::ostringstream line;
-        line << std::setprecision(15) << key << " = " << value;
-        headers.emplace_back(line.str());
+        std::string key_value = fmt::format("{:<8}= {:#.13G}", key, value);
+        headers.emplace_back(fmt::format("{:<80}", key_value));
     };
 
     auto add_int_header = [&headers](const std::string& key, int value) {
-        std::ostringstream line;
-        line << key << " = " << value;
-        headers.emplace_back(line.str());
+        std::string key_value = fmt::format("{:<8}= {}", key, value);
+        headers.emplace_back(fmt::format("{:<80}", key_value));
     };
+
 
     auto to_upper_ascii = [](std::string& text) {
         std::transform(text.begin(), text.end(), text.begin(),
@@ -129,12 +131,19 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
     };
 
     auto make_ctype = [](const std::string& axis, const std::string& proj) {
+        // FITS CTYPE format: 4-char axis type + "-" + 3-char projection
+        // e.g., "RA---SIN", "DEC--SIN", "GLON-TAN"
         std::string axis_str(axis);
-        if (axis_str.size() < 4) {
-            axis_str.append(4 - axis_str.size(), ' ');
+        if (!proj.empty()) {
+            // Pad with dashes to reach 4 chars, then add "-" + projection
+            while (axis_str.size() < 4) {
+                axis_str += '-';
+            }
+            return axis_str + "-" + proj;
         }
-        return proj.empty() ? axis_str : axis_str + "-" + proj;
+        return axis_str;
     };
+
 
     // BITPIX
     // TODO: currently XRADIO only supports float32 and float64
@@ -464,6 +473,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         }
     }
 
+    // END keyword required for FITS header
+    headers.emplace_back(fmt::format("{:<80}", "END"));
+
     Vector<String> header_vector(headers.size());
     for (size_t i = 0; i < headers.size(); ++i) {
         header_vector[i] = headers[i];
@@ -565,228 +577,55 @@ void CartaZarrImage::reopen() {
 
 void CartaZarrImage::SetupCoordinateSystem() {
     try {
-        // Try to parse WCS from ZARR metadata first
-        if (ParseWCSFromMetadata()) {
-            // ParseBeamFromMetadata();
+        // Get FITS header strings generated from Zarr metadata
+        Vector<String> header_strings = FitsHeaderStrings();
+        
+        if (!header_strings.empty()) {
+            // Use casacore's ImageFITSConverter to build coordinate system from FITS headers
+            // This is the same approach used by CartaHdf5Image
+            int stokes_fits_value(1);
+            Record unused_headers;
+            LogSink sink;  // null sink to suppress confusing FITS log messages
+            LogIO log(sink);
+            unsigned int which_rep(0);
+            bool drop_stokes(true);
+            
+            CoordinateSystem coord_sys = ImageFITSConverter::getCoordinateSystem(
+                stokes_fits_value, unused_headers, header_strings, log, which_rep, _shape, drop_stokes);
+            
+            setCoordinateInfo(coord_sys);
+            
+            // Set image units from unused headers
+            setUnits(ImageFITSConverter::getBrightnessUnit(unused_headers, log));
+            
+            // Set image info (beam, image type, etc.)
+            ImageInfo image_info = ImageFITSConverter::getImageInfo(unused_headers);
+            if (stokes_fits_value != -1) {
+                ImageInfo::ImageTypes type = ImageInfo::imageTypeFromFITS(stokes_fits_value);
+                if (type != ImageInfo::Undefined) {
+                    image_info.setImageType(type);
+                }
+            }
+            setImageInfo(image_info);
+            
+            // Set misc info
+            Record misc_info;
+            ImageFITSConverter::extractMiscInfo(misc_info, unused_headers);
+            setMiscInfo(misc_info);
+            
+            spdlog::info("Successfully set up coordinate system from FITS headers");
             return;
         }
-        
-        // Fall back to default coordinate system
-        CreateDefaultCoordinateSystem();
-        // ParseBeamFromMetadata(); // Try parsing beam even if WCS is default
-        
+    } catch (const AipsError& e) {
+        spdlog::warn("Error setting up coordinate system from FITS headers: {}", e.getMesg());
     } catch (const std::exception& e) {
         spdlog::warn("Error setting up coordinate system: {}, using default", e.what());
-        CreateDefaultCoordinateSystem();
     }
+    
+    // Fall back to default coordinate system
+    CreateDefaultCoordinateSystem();
 }
 
-
-// Use explicit namespace or typedef to avoid ambiguity if strict
-using casacore::String;
-
-bool CartaZarrImage::ParseWCSFromMetadata() {
-    try {
-        nlohmann::json zattrs = nlohmann::json::parse(_reader->GetZattrsString(""));
-        nlohmann::json wcs_dict;
-        
-        // --- 1. Locate WCS Direction Info ---
-        if (zattrs.contains("direction")) {
-            wcs_dict = zattrs["direction"];
-        } else {
-            return false;
-        }
-        
-        if (wcs_dict.empty()) {
-            return false;
-        }
-
-        // Extract Reference Info
-        if (!wcs_dict.contains("reference") || !wcs_dict["reference"].contains("data")) {
-            return false;
-        }
-        
-        auto ref_data = wcs_dict["reference"]["data"];
-        double crval1_rad = ref_data[0];
-        double crval2_rad = ref_data[1];
-        
-        std::string projection_str;
-        if (wcs_dict.contains("projection")) {
-            projection_str = wcs_dict["projection"].get<std::string>();
-        } else {
-            projection_str = "SIN";
-            spdlog::info("No projection specified in metadata, using default: SIN");
-        }
-
-        Projection projection(Projection::type(projection_str));
-        
-        // Extract PC Matrix (default identity)
-        Matrix<double> pc_matrix(2, 2);
-        pc_matrix = 0.0;
-        pc_matrix(0,0) = 1.0; pc_matrix(1,1) = 1.0;
-        
-        if (wcs_dict.contains("pc") && wcs_dict["pc"].contains("_value")) {
-            auto pc_val = wcs_dict["pc"]["_value"];
-            if (pc_val.size() >= 2 && pc_val[0].size() >= 2) {
-                 pc_matrix(0,0) = pc_val[0][0];
-                 pc_matrix(0,1) = pc_val[0][1];
-                 pc_matrix(1,0) = pc_val[1][0];
-                 pc_matrix(1,1) = pc_val[1][1];
-            }
-        }
-        
-        // --- 2. Read Coordinate Arrays for Increments (CDELT) and Reference Pixels (CRPIX) ---
-        std::vector<double> l_arr = _reader->ReadVector("l");
-        std::vector<double> m_arr = _reader->ReadVector("m");
-        
-        if (l_arr.empty() || m_arr.empty()) {
-            spdlog::warn("Could not read 'l' or 'm' arrays for WCS");
-            return false;
-        }
-
-        // Calculate CDELT and CRPIX
-        // TODO: This calculation works for Zarr files converted from FITS, but may not work for native Zarr files.
-        double cdelt1_rad = l_arr.size() > 1 ? (l_arr[1] - l_arr[0]) : 1.0;
-        double cdelt2_rad = m_arr.size() > 1 ? (m_arr[1] - m_arr[0]) : 1.0;
-        double crpix1 = -l_arr[0] / cdelt1_rad;
-        double crpix2 = -m_arr[0] / cdelt2_rad;
-
-        // Build DirectionCoordinate
-        MDirection::Types direction_type_enum = MDirection::J2000;
-        
-        if (wcs_dict["reference"].contains("attrs")) {
-            auto ref_attrs = wcs_dict["reference"]["attrs"];
-            if (ref_attrs.contains("frame")) {
-                std::string frame = ref_attrs["frame"];
-                MDirection::getType(direction_type_enum, String(frame));
-            }
-        }
-
-        DirectionCoordinate dir_coord(direction_type_enum, projection, 
-                                      crval1_rad, crval2_rad,
-                                      cdelt1_rad, cdelt2_rad,
-                                      pc_matrix,
-                                      crpix1, crpix2);
-
-        CoordinateSystem coord_sys;
-        coord_sys.addCoordinate(dir_coord);
-
-        // --- 3. Spectral Coordinate ---
-        std::string freq_name = "frequency";
-        std::vector<double> freq_arr = _reader->ReadVector(freq_name);
-        int freq_size = _shape.size() > 2 ? _shape[2] : 1;
-        
-        if (!freq_arr.empty()) {
-            double crval_freq = freq_arr[0];
-            double cdelt_freq = freq_arr.size() > 1 ? (freq_arr[1] - freq_arr[0]) : 1.0;
-            double crpix_freq = 0.0; // 0-based index
-            
-            // Parse attributes for rest frequency and frame
-            double rest_freq = 0.0;
-            MFrequency::Types freq_frame = MFrequency::TOPO;
-            
-            try {
-                std::string attrs_str = _reader->GetZattrsString(freq_name);
-                if (attrs_str != "{}" && !attrs_str.empty()) {
-                    nlohmann::json attrs = nlohmann::json::parse(attrs_str);
-                    
-                    // Rest Frequency
-                    if (attrs.contains("rest_frequency")) {
-                        auto& rfreq = attrs["rest_frequency"];
-                        if (rfreq.is_object() && rfreq.contains("data")) {
-                            rest_freq = rfreq["data"];
-                        }
-                    }
-                    
-                    // Spectral Frame (SPECSYS -> observer/frame)
-                    nlohmann::json ref_obj;
-                    bool has_ref = false;
-                    // TODO: delete "reference_value" at some point because it has been changed to "reference_frequency".
-                    if (attrs.contains("reference_frequency")) {
-                        ref_obj = attrs["reference_frequency"];
-                        has_ref = true;
-                    } else if (attrs.contains("reference_value")) {
-                        ref_obj = attrs["reference_value"];
-                        has_ref = true;
-                    }
-                    
-                    if (has_ref && ref_obj.contains("attrs")) {
-                        auto& ref_attrs = ref_obj["attrs"];
-                        std::string frame_str;
-
-                        if (ref_attrs.contains("observer")) {
-                            frame_str = ref_attrs["observer"];
-                        }
-                        
-                        if (!frame_str.empty()) {
-                            MFrequency::getType(freq_frame, String(frame_str));
-                        }
-                    }
-                }
-            } catch (const std::exception& ex) {
-                spdlog::warn("Error parsing frequency attributes: {}", ex.what());
-            }
-            
-            SpectralCoordinate spec_coord(freq_frame, 
-                                          crval_freq, cdelt_freq, crpix_freq, 
-                                          rest_freq);
-            coord_sys.addCoordinate(spec_coord);
-        } else if (freq_size > 1) {
-            // Use constants defined in constructor or here
-            constexpr double kDefaultFreq = 1.4e9;
-            constexpr double kDefaultWidth = 1e6;
-            SpectralCoordinate spec_coord(MFrequency::TOPO, kDefaultFreq, kDefaultWidth, 0.0);
-            coord_sys.addCoordinate(spec_coord);
-        }
-        
-        // --- 4. Stokes Coordinate ---
-        int stokes_size = _shape.size() > 3 ? _shape[3] : 1;
-        if (stokes_size >= 1) {
-             Vector<int> stokes(stokes_size);
-             
-             // Try to read 'polarization' or 'stokes' array
-             std::vector<std::string> pol_strs = _reader->ReadStringVector("polarization");
-             
-             if (!pol_strs.empty() && pol_strs.size() >= static_cast<size_t>(stokes_size)) {
-                 for (int i = 0; i < stokes_size; ++i) {
-                     stokes(i) = Stokes::type(pol_strs[i]);
-                 }
-             } else {
-                 // Default to Stokes I if no polarization info available
-                 for (int i = 0; i < stokes_size; ++i) {
-                     stokes(i) = Stokes::I;
-                 }
-             }
-             StokesCoordinate stokes_coord(stokes);
-             coord_sys.addCoordinate(stokes_coord);
-        }
-        
-        setCoordinateInfo(coord_sys);
-        
-        // --- 5. BUNIT (Units) ---
-        // Try getting units from main array or "SKY"
-        std::string units_str = _reader->GetAttributeString("", "units");
-        if (units_str.empty()) {
-            units_str = _reader->GetAttributeString("SKY", "units");
-        }
-        
-        if (!units_str.empty()) {
-            try {
-                setUnits(Unit(String(units_str)));
-                spdlog::info("Set BUNIT to {}", units_str);
-            } catch (const std::exception& e) {
-                spdlog::warn("Invalid units string '{}': {}", units_str, e.what());
-            }
-        }
-        
-        spdlog::info("Successfully parsed WCS from Zarr metadata");
-        return true;
-        
-    } catch (const std::exception& e) {
-        spdlog::error("Exception parsing WCS from metadata: {}", e.what());
-        return false;
-    }
-}
 
 void CartaZarrImage::CreateDefaultCoordinateSystem() {
     CoordinateSystem coord_sys;

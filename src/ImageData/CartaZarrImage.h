@@ -90,10 +90,10 @@ private:
     // Coordinate system setup
     void SetupCoordinateSystem();
     void CreateDefaultCoordinateSystem();
-    bool ParseWCSFromMetadata();
     void ParseBeamFromMetadata();
     void SetBeams();
 };
+
 
 } // namespace carta
 
