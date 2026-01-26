@@ -107,7 +107,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
     std::vector<std::string> headers;
 
     static constexpr size_t kFitsKeywordMaxLen = 8;
+    static constexpr double kRadToDeg = 180.0 / M_PI;
 
+    // Helper to add headers safely
     // Format headers in standard FITS format: 80 characters, 8-char keyword name
     auto add_string_header = [&headers](const std::string& key, const std::string& value) {
         if (value.empty()) {
@@ -153,12 +155,23 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         }
     };
 
-    // BITPIX
-    // TODO: currently XRADIO only supports float32 and float64
+    // Helper for safe execution of blocks
+    auto safe_exec = [](auto func, const std::string& context) {
+        try {
+            func();
+        } catch (const std::exception& e) {
+            spdlog::warn("Error parsing {}: {}", context, e.what());
+        } catch (...) {
+            spdlog::warn("Unknown error parsing {}", context);
+        }
+    };
+
+    // 1. BITPIX
     static constexpr int kBitpixFloat32 = -32;
     static constexpr int kBitpixFloat64 = -64;
     int bitpix = kBitpixFloat32;
-    try {
+    safe_exec([&]() {
+        // TODO: currently XRADIO only supports float32 and float64
         nlohmann::json zarray = nlohmann::json::parse(_reader->GetZarrayString("SKY"));
         const auto* dtype = get_ptr(zarray, "/dtype");
         if (dtype && dtype->is_string()) {
@@ -169,13 +182,12 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 bitpix = kBitpixFloat64;
             }
         }
-    } catch (...) {
-    }
+    }, "BITPIX");
 
     add_string_header("SIMPLE", "T");
     add_int_header("BITPIX", bitpix);
 
-    // Add image shape information
+    // 2. NAXIS
     int ndim = _shape.size();
     if (ndim > 0) {
         add_int_header("NAXIS", ndim);
@@ -184,86 +196,105 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         }
     }
 
-    constexpr double kRadToDeg = 180.0 / M_PI;
+    // 3. Direction Information (.zattrs)
+    {
+        nlohmann::json zattrs;
+        bool zattrs_valid = false;
+        try {
+            zattrs = nlohmann::json::parse(_reader->GetZattrsString(""));
+            zattrs_valid = true;
+        } catch (const std::exception& e) {
+            spdlog::warn("Error parsing root .zattrs: {}", e.what());
+        }
 
-    // Parse direction information from .zattrs
-    try {
-        nlohmann::json zattrs = nlohmann::json::parse(_reader->GetZattrsString(""));
+        if (zattrs_valid) {
+            const auto* direction = get_ptr(zattrs, "/direction");
+            if (direction && direction->is_object()) {
+                // Shared state for CTYPE/RADESYS
+                std::string ctype1_prefix = "RA";
+                std::string ctype2_prefix = "DEC";
 
-        const auto* direction = get_ptr(zattrs, "/direction");
-        if (direction && direction->is_object()) {
-            // Set default CTYPE prefixes
-            std::string ctype1_prefix = "RA";
-            std::string ctype2_prefix = "DEC";
+                // CRVAL
+                safe_exec([&]() {
+                    const auto* ref_data = get_ptr(zattrs, "/direction/reference/data");
+                    if (ref_data && ref_data->is_array() && ref_data->size() >= 2) {
+                        add_double_header("CRVAL1", (*ref_data)[0].get<double>() * kRadToDeg);
+                        add_double_header("CRVAL2", (*ref_data)[1].get<double>() * kRadToDeg);
+                    }
+                }, "CRVAL");
 
-            // CRVAL1, CRVAL2, RADESYS and EQUINOX
-            const auto* ref_data = get_ptr(zattrs, "/direction/reference/data");
-            if (ref_data && ref_data->is_array() && ref_data->size() >= 2) {
-                add_double_header("CRVAL1", (*ref_data)[0].get<double>() * kRadToDeg);
-                add_double_header("CRVAL2", (*ref_data)[1].get<double>() * kRadToDeg);
-            }
+                // RADESYS & Prefix
+                safe_exec([&]() {
+                    const auto* frame = get_ptr(zattrs, "/direction/reference/attrs/frame");
+                    if (frame && frame->is_string()) {
+                        std::string frame_str = frame->get<std::string>();
+                        to_upper_ascii(frame_str);
+                        add_string_header("RADESYS", frame_str);
 
-            const auto* frame = get_ptr(zattrs, "/direction/reference/attrs/frame");
-            if (frame && frame->is_string()) {
-                std::string frame_str = frame->get<std::string>();
-                to_upper_ascii(frame_str);
-                add_string_header("RADESYS", frame_str);
+                        if (frame_str == "GALACTIC") {
+                            ctype1_prefix = "GLON";
+                            ctype2_prefix = "GLAT";
+                        } else if (frame_str == "ECLIPTIC") {
+                            ctype1_prefix = "ELON";
+                            ctype2_prefix = "ELAT";
+                        } else if (frame_str == "SUPERGALACTIC") {
+                            ctype1_prefix = "SLON";
+                            ctype2_prefix = "SLAT";
+                        }
+                    }
+                }, "RADESYS");
 
-                if (frame_str == "GALACTIC") {
-                    ctype1_prefix = "GLON";
-                    ctype2_prefix = "GLAT";
-                } else if (frame_str == "ECLIPTIC") {
-                    ctype1_prefix = "ELON";
-                    ctype2_prefix = "ELAT";
-                } else if (frame_str == "SUPERGALACTIC") {
-                    ctype1_prefix = "SLON";
-                    ctype2_prefix = "SLAT";
-                }
-            }
+                // EQUINOX
+                safe_exec([&]() {
+                    const auto* equinox = get_ptr(zattrs, "/direction/reference/attrs/equinox");
+                    if (equinox && equinox->is_string()) {
+                        std::string equinox_str = equinox->get<std::string>();
+                        to_upper_ascii(equinox_str);
+                        add_string_header("EQUINOX", equinox_str);
+                    }
+                }, "EQUINOX");
 
-            const auto* equinox = get_ptr(zattrs, "/direction/reference/attrs/equinox");
-            if (equinox && equinox->is_string()) {
-                std::string equinox_str = equinox->get<std::string>();
-                to_upper_ascii(equinox_str);
-                add_string_header("EQUINOX", equinox_str);
-            }
+                // CTYPE
+                safe_exec([&]() {
+                    std::string projection_str;
+                    const auto* projection = get_ptr(zattrs, "/direction/projection");
+                    if (projection && projection->is_string()) {
+                        projection_str = projection->get<std::string>();
+                    }
+                    add_string_header("CTYPE1", make_ctype(ctype1_prefix, projection_str));
+                    add_string_header("CTYPE2", make_ctype(ctype2_prefix, projection_str));
+                }, "CTYPE");
 
-            // CTYPE1 and CTYPE2
-            std::string projection_str;
-            const auto* projection = get_ptr(zattrs, "/direction/projection");
-            if (projection && projection->is_string()) {
-                projection_str = projection->get<std::string>();
-            }
-            add_string_header("CTYPE1", make_ctype(ctype1_prefix, projection_str));
-            add_string_header("CTYPE2", make_ctype(ctype2_prefix, projection_str));
+                // LATPOLE/LONPOLE
+                safe_exec([&]() {
+                    const auto* lat_data = get_ptr(zattrs, "/direction/latpole/data");
+                    if (lat_data && lat_data->is_number()) {
+                        add_double_header("LATPOLE", lat_data->get<double>() * kRadToDeg);
+                    }
+                    const auto* lon_data = get_ptr(zattrs, "/direction/lonpole/data");
+                    if (lon_data && lon_data->is_number()) {
+                        add_double_header("LONPOLE", lon_data->get<double>() * kRadToDeg);
+                    }
+                }, "LATPOLE/LONPOLE");
 
-            // LATPOLE and LONPOLE
-            const auto* lat_data = get_ptr(zattrs, "/direction/latpole/data");
-            if (lat_data && lat_data->is_number()) {
-                add_double_header("LATPOLE", lat_data->get<double>() * kRadToDeg);
-            }
-            const auto* lon_data = get_ptr(zattrs, "/direction/lonpole/data");
-            if (lon_data && lon_data->is_number()) {
-                add_double_header("LONPOLE", lon_data->get<double>() * kRadToDeg);
-            }
+                // TODO: XRADIO has not finalized projection_parameters yet.
 
-            // TODO: XRADIO has not finalized projection_parameters yet.
-
-            // PC1_1, PC1_2, PC2_1 and PC2_2
-            const auto* pc_val = get_ptr(zattrs, "/direction/pc/_value");
-            if (pc_val && pc_val->is_array() && pc_val->size() >= 2 && (*pc_val)[0].is_array() && (*pc_val)[0].size() >= 2) {
-                add_double_header("PC1_1", (*pc_val)[0][0].get<double>());
-                add_double_header("PC1_2", (*pc_val)[0][1].get<double>());
-                add_double_header("PC2_1", (*pc_val)[1][0].get<double>());
-                add_double_header("PC2_2", (*pc_val)[1][1].get<double>());
+                // PC Matrix
+                safe_exec([&]() {
+                    const auto* pc_val = get_ptr(zattrs, "/direction/pc/_value");
+                    if (pc_val && pc_val->is_array() && pc_val->size() >= 2 && (*pc_val)[0].is_array() && (*pc_val)[0].size() >= 2) {
+                        add_double_header("PC1_1", (*pc_val)[0][0].get<double>());
+                        add_double_header("PC1_2", (*pc_val)[0][1].get<double>());
+                        add_double_header("PC2_1", (*pc_val)[1][0].get<double>());
+                        add_double_header("PC2_2", (*pc_val)[1][1].get<double>());
+                    }
+                }, "PC Matrix");
             }
         }
-    } catch (const std::exception& e) {
-        spdlog::warn("Error parsing direction metadata for FITS headers: {}", e.what());
     }
 
-    // Direction increments and units from coordinate arrays (radians -> degrees)
-    try {
+    // 4. Direction Increments
+    safe_exec([&]() {
         std::vector<double> l_arr = _reader->ReadVector("l");
         std::vector<double> m_arr = _reader->ReadVector("m");
         if (l_arr.size() > 1) {
@@ -282,15 +313,13 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         }
         add_string_header("CUNIT1", "deg");
         add_string_header("CUNIT2", "deg");
-    } catch (const std::exception& e) {
-        spdlog::warn("Error parsing direction increments and units for FITS headers: {}", e.what());
-    }
+    }, "Direction Increments");
 
-    // Spectral axis
-    try {
+    // 5. Spectral Axis
+    safe_exec([&]() {
         std::vector<double> freq_arr = _reader->ReadVector("frequency");
         nlohmann::json zattrs = nlohmann::json::parse(_reader->GetZattrsString("frequency"));
-        // If no reference_frequency or reference_value, it has no frequency axis
+        
         if (!freq_arr.empty()) {
             add_string_header("CTYPE3", "FREQ");
             add_double_header("CRPIX3", 1.0); // FITS 1-indexed
@@ -298,11 +327,13 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
             if (freq_arr.size() > 1) {
                 add_double_header("CDELT3", freq_arr[1] - freq_arr[0]);
             }
+            
             // TODO: drop support for reference_value, only support reference_frequency
             const auto* ref_attrs = get_ptr(zattrs, "/reference_frequency/attrs");
             if (!ref_attrs) {
                 ref_attrs = get_ptr(zattrs, "/reference_value/attrs");
             }
+            
             if (ref_attrs && ref_attrs->is_object()) {
                 const auto* ref_units = get_ptr(*ref_attrs, "/units");
                 if (ref_units) {
@@ -331,20 +362,20 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                     add_string_header("SPECSYS", specsys);
                 }
             }
+            
             const auto* rest_freq = get_ptr(zattrs, "/rest_frequency/data");
             if (rest_freq && rest_freq->is_number()) {
                 add_double_header("RESTFRQ", rest_freq->get<double>());
             }
         }
-    } catch (const std::exception& e) {
-        spdlog::warn("Error parsing frequency metadata for FITS headers: {}", e.what());
-    }
+    }, "Spectral Axis");
 
-    // Stokes axis
-    try {
+    // 6. Stokes Axis
+    safe_exec([&]() {
         std::vector<std::string> pol_strs = _reader->ReadStringVector("polarization");
         add_string_header("CTYPE4", "STOKES");
         add_double_header("CRPIX4", 1.0); // FITS 1-indexed
+        
         if (!pol_strs.empty() && (pol_strs.size() != 1 || casacore::Stokes::type(pol_strs[0]) != casacore::Stokes::I)) {
             int stokes_first = casacore::Stokes::type(pol_strs[0]);
             add_double_header("CRVAL4", static_cast<double>(stokes_first));
@@ -371,135 +402,162 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
             add_double_header("CRVAL4", 1.0);
             add_string_header("CUNIT4", "");
         }
-    } catch (const std::exception& e) {
-        spdlog::warn("Error parsing polarization metadata for FITS headers: {}", e.what());
-    }
+    }, "Stokes Axis");
 
-    // Information from SKY
-    try {
-        nlohmann::json zattrs = nlohmann::json::parse(_reader->GetZattrsString("SKY"));
-        const auto* units = get_ptr(zattrs, "/units");
-        if (units && units->is_string()) {
-            add_string_header("BUNIT", units->get<std::string>());
-        }
-        const auto* image_type = get_ptr(zattrs, "/image_type");
-        if (image_type && image_type->is_string()) {
-            add_string_header("BTYPE", image_type->get<std::string>());
-        }
-        const auto* object_name = get_ptr(zattrs, "/object_name");
-        if (object_name && object_name->is_string()) {
-            add_string_header("OBJECT", object_name->get<std::string>());
-        }
-        const auto* observer = get_ptr(zattrs, "/observer");
-        if (observer && observer->is_string()) {
-            add_string_header("OBSERVER", observer->get<std::string>());
+    // 7. SKY Metadata (BUNIT, OBJECT, etc.)
+    {
+        nlohmann::json zattrs_sky;
+        bool zattrs_sky_valid = false;
+        try {
+            zattrs_sky = nlohmann::json::parse(_reader->GetZattrsString("SKY"));
+            zattrs_sky_valid = true;
+        } catch (...) {
+            spdlog::warn("Error parsing SKY zattrs");
         }
 
-        const auto* obs_scale = get_ptr(zattrs, "/obsdate/attrs/scale");
-        if (obs_scale && obs_scale->is_string()) {
-            std::string scale = obs_scale->get<std::string>();
-            to_upper_ascii(scale);
-            add_string_header("TIMESYS", scale);
-        }
-        const auto* obs_format = get_ptr(zattrs, "/obsdate/attrs/format");
-        const auto* obs_data = get_ptr(zattrs, "/obsdate/data");
-        if (obs_format && obs_data && obs_format->is_string() && obs_data->is_number()) {
-            if (obs_format->get<std::string>() == "MJD") {
-                add_double_header("MJD-OBS", obs_data->get<double>());
-            }
-        }
-
-        const auto* telescope_name = get_ptr(zattrs, "/telescope/name");
-        if (telescope_name && telescope_name->is_string()) {
-            add_string_header("TELESCOP", telescope_name->get<std::string>());
-        }
-        const auto* telescope_dir = get_ptr(zattrs, "/telescope/direction/data/_value");
-        const auto* telescope_dist = get_ptr(zattrs, "/telescope/distance/data/_value");
-        if (telescope_dir && telescope_dist && telescope_dir->is_array() && telescope_dir->size() >= 2 && telescope_dist->is_array() &&
-            !telescope_dist->empty()) {
-            double lon = (*telescope_dir)[0].get<double>();
-            double lat = (*telescope_dir)[1].get<double>();
-            double radius = (*telescope_dist)[0].get<double>();
-            double obsgeo_x = radius * cos(lat) * cos(lon);
-            double obsgeo_y = radius * cos(lat) * sin(lon);
-            double obsgeo_z = radius * sin(lat);
-            add_double_header("OBSGEO-X", obsgeo_x);
-            add_double_header("OBSGEO-Y", obsgeo_y);
-            add_double_header("OBSGEO-Z", obsgeo_z);
-        }
-
-        const auto* user = get_ptr(zattrs, "/user");
-        if (user && user->is_object()) {
-            for (const auto& [k, v] : user->items()) {
-                std::string key = k;
-                to_upper_ascii(key);
-                if (key.size() > kFitsKeywordMaxLen) {
-                    key = key.substr(0, kFitsKeywordMaxLen);
+        if (zattrs_sky_valid) {
+            // BUNIT
+            safe_exec([&]() {
+                const auto* units = get_ptr(zattrs_sky, "/units");
+                if (units && units->is_string()) {
+                    add_string_header("BUNIT", units->get<std::string>());
                 }
-                if (v.is_string()) {
-                    add_string_header(key, v.get<std::string>());
-                } else if (v.is_number_float() || v.is_number_integer() || v.is_number_unsigned()) {
-                    add_double_header(key, v.get<double>());
+            }, "BUNIT");
+
+            // BTYPE
+            safe_exec([&]() {
+                const auto* image_type = get_ptr(zattrs_sky, "/image_type");
+                if (image_type && image_type->is_string()) {
+                    add_string_header("BTYPE", image_type->get<std::string>());
+                }
+            }, "BTYPE");
+
+            // OBJECT
+            safe_exec([&]() {
+                const auto* object_name = get_ptr(zattrs_sky, "/object_name");
+                if (object_name && object_name->is_string()) {
+                    add_string_header("OBJECT", object_name->get<std::string>());
+                }
+            }, "OBJECT");
+
+            // OBSERVER
+            safe_exec([&]() {
+                const auto* observer = get_ptr(zattrs_sky, "/observer");
+                if (observer && observer->is_string()) {
+                    add_string_header("OBSERVER", observer->get<std::string>());
+                }
+            }, "OBSERVER");
+
+            // TIMESYS & MJD-OBS
+            safe_exec([&]() {
+                const auto* obs_scale = get_ptr(zattrs_sky, "/obsdate/attrs/scale");
+                if (obs_scale && obs_scale->is_string()) {
+                    std::string scale = obs_scale->get<std::string>();
+                    to_upper_ascii(scale);
+                    add_string_header("TIMESYS", scale);
+                }
+                const auto* obs_format = get_ptr(zattrs_sky, "/obsdate/attrs/format");
+                const auto* obs_data = get_ptr(zattrs_sky, "/obsdate/data");
+                if (obs_format && obs_data && obs_format->is_string() && obs_data->is_number()) {
+                    if (obs_format->get<std::string>() == "MJD") {
+                        add_double_header("MJD-OBS", obs_data->get<double>());
+                    }
+                }
+            }, "TIMESYS/MJD-OBS");
+
+            // TELESCOPE & OBSGEO
+            safe_exec([&]() {
+                const auto* telescope_name = get_ptr(zattrs_sky, "/telescope/name");
+                if (telescope_name && telescope_name->is_string()) {
+                    add_string_header("TELESCOP", telescope_name->get<std::string>());
+                }
+                const auto* telescope_dir = get_ptr(zattrs_sky, "/telescope/direction/data/_value");
+                const auto* telescope_dist = get_ptr(zattrs_sky, "/telescope/distance/data/_value");
+                if (telescope_dir && telescope_dist && telescope_dir->is_array() && telescope_dir->size() >= 2 && telescope_dist->is_array() &&
+                    !telescope_dist->empty()) {
+                    double lon = (*telescope_dir)[0].get<double>();
+                    double lat = (*telescope_dir)[1].get<double>();
+                    double radius = (*telescope_dist)[0].get<double>();
+                    double obsgeo_x = radius * cos(lat) * cos(lon);
+                    double obsgeo_y = radius * cos(lat) * sin(lon);
+                    double obsgeo_z = radius * sin(lat);
+                    add_double_header("OBSGEO-X", obsgeo_x);
+                    add_double_header("OBSGEO-Y", obsgeo_y);
+                    add_double_header("OBSGEO-Z", obsgeo_z);
+                }
+            }, "TELESCOPE/OBSGEO");
+
+            // User metadata
+            safe_exec([&]() {
+                const auto* user = get_ptr(zattrs_sky, "/user");
+                if (user && user->is_object()) {
+                    for (const auto& [k, v] : user->items()) {
+                        std::string key = k;
+                        to_upper_ascii(key);
+                        if (key.size() > kFitsKeywordMaxLen) {
+                            key = key.substr(0, kFitsKeywordMaxLen);
+                        }
+                        if (v.is_string()) {
+                            add_string_header(key, v.get<std::string>());
+                        } else if (v.is_number_float() || v.is_number_integer() || v.is_number_unsigned()) {
+                            add_double_header(key, v.get<double>());
+                        }
+                    }
+                }
+            }, "User Metadata");
+        }
+    }
+
+    // 8. Beam Parameters
+    safe_exec([&]() {
+        std::vector<double> beam_data = _reader->ReadFlattenedVector("BEAM");
+        if (beam_data.size() >= 3) {
+            static constexpr size_t kBeamParamCount = 3;
+            static constexpr double kBeamCompareEpsilon = 1e-12;
+
+            const size_t n_beams = beam_data.size() / kBeamParamCount;
+            bool single_beam = true;
+            const double ref_bmaj = beam_data[0];
+            const double ref_bmin = beam_data[1];
+            const double ref_bpa = beam_data[2];
+
+            // Heuristic: Multi-beam data usually varies immediately or across the band.
+            // Check first few, middle, and last to detect variation without full iteration.
+            // This optimizes for the common case where data is effectively single-beam but stored as an array.
+            std::vector<size_t> check_indices;
+            const size_t check_limit = std::min(n_beams, size_t(10));
+            for (size_t i = 1; i < check_limit; ++i) {
+                check_indices.push_back(i);
+            }
+            if (n_beams > check_limit) {
+                check_indices.push_back(n_beams / 2); // Middle
+                check_indices.push_back(n_beams - 1); // Last
+            }
+
+            for (size_t idx : check_indices) {
+                const size_t base = idx * kBeamParamCount;
+                if (std::abs(beam_data[base + 0] - ref_bmaj) > kBeamCompareEpsilon ||
+                    std::abs(beam_data[base + 1] - ref_bmin) > kBeamCompareEpsilon ||
+                    std::abs(beam_data[base + 2] - ref_bpa) > kBeamCompareEpsilon) {
+                    single_beam = false;
+                    break;
                 }
             }
-        }
-    } catch (const std::exception& e) {
-        spdlog::warn("Error parsing SKY metadata for FITS headers: {}", e.what());
-    }
 
-    // Beam parameters, if available (radians -> degrees)
-    std::vector<double> beam_data = _reader->ReadFlattenedVector("BEAM");
-    if (beam_data.size() >= 3) {
-        static constexpr size_t kBeamParamCount = 3;
-        static constexpr double kBeamCompareEpsilon = 1e-12;
+            if (single_beam) {
+                _is_single_beam = true;
+                _beam = casacore::GaussianBeam(
+                    casacore::Quantity(ref_bmaj, "rad"), casacore::Quantity(ref_bmin, "rad"), casacore::Quantity(ref_bpa, "rad"));
 
-        const size_t n_beams = beam_data.size() / kBeamParamCount;
-        bool single_beam = true;
-        const double ref_bmaj = beam_data[0];
-        const double ref_bmin = beam_data[1];
-        const double ref_bpa = beam_data[2];
-
-        // Heuristic: Multi-beam data usually varies immediately or across the band.
-        // Check first few, middle, and last to detect variation without full iteration.
-        // This optimizes for the common case where data is effectively single-beam but stored as an array.
-        std::vector<size_t> check_indices;
-        const size_t check_limit = std::min(n_beams, size_t(10));
-        for (size_t i = 1; i < check_limit; ++i) {
-            check_indices.push_back(i);
-        }
-        if (n_beams > check_limit) {
-            check_indices.push_back(n_beams / 2); // Middle
-            check_indices.push_back(n_beams - 1); // Last
-        }
-
-        for (size_t idx : check_indices) {
-            const size_t base = idx * kBeamParamCount;
-            if (std::abs(beam_data[base + 0] - ref_bmaj) > kBeamCompareEpsilon ||
-                std::abs(beam_data[base + 1] - ref_bmin) > kBeamCompareEpsilon ||
-                std::abs(beam_data[base + 2] - ref_bpa) > kBeamCompareEpsilon) {
-                single_beam = false;
-                break;
+                add_double_header("BMAJ", ref_bmaj * kRadToDeg);
+                add_double_header("BMIN", ref_bmin * kRadToDeg);
+                add_double_header("BPA", ref_bpa * kRadToDeg);
+            } else {
+                _is_single_beam = false;
+                add_string_header("CASAMBM", "T");
             }
         }
-
-        // We only add beam headers if single beam.
-        // CartaZarrImage logic was:
-        // if (single_beam) add BMAJ, BMIN, BPA
-        // else add CASAMBM "T"
-
-        if (single_beam) {
-            _is_single_beam = true;
-            _beam = casacore::GaussianBeam(
-                casacore::Quantity(ref_bmaj, "rad"), casacore::Quantity(ref_bmin, "rad"), casacore::Quantity(ref_bpa, "rad"));
-
-            add_double_header("BMAJ", ref_bmaj * kRadToDeg);
-            add_double_header("BMIN", ref_bmin * kRadToDeg);
-            add_double_header("BPA", ref_bpa * kRadToDeg);
-        } else {
-            _is_single_beam = false;
-            add_string_header("CASAMBM", "T");
-        }
-    }
+    }, "Beam Parameters");
 
     // END keyword required for FITS header
     headers.emplace_back(fmt::format("{:<80}", "END"));
