@@ -247,10 +247,24 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 // EQUINOX
                 safe_exec([&]() {
                     const auto* equinox = get_ptr(zattrs, "/direction/reference/attrs/equinox");
-                    if (equinox && equinox->is_string()) {
-                        std::string equinox_str = equinox->get<std::string>();
-                        to_upper_ascii(equinox_str);
-                        add_string_header("EQUINOX", equinox_str);
+                    if (equinox) {
+                        if (equinox->is_number()) {
+                            add_double_header("EQUINOX", equinox->get<double>());
+                        } else if (equinox->is_string()) {
+                            std::string val = equinox->get<std::string>();
+                            if (!val.empty()) {
+                                size_t start_pos = 0;
+                                // Handle J2000/B1950 styles
+                                if (std::toupper(val[0]) == 'J' || std::toupper(val[0]) == 'B') {
+                                    start_pos = 1;
+                                }
+                                try {
+                                    add_double_header("EQUINOX", std::stod(val.substr(start_pos)));
+                                } catch (...) {
+                                    // Ignore parsing failure
+                                }
+                            }
+                        }
                     }
                 }, "EQUINOX");
 

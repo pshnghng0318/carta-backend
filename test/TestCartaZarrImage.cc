@@ -103,6 +103,10 @@ protected:
         create_vec_array("l", {0.0, 0.001});
         create_vec_array("m", {0.0, 0.001});
         create_vec_array("frequency", {1.4e9, 1.41e9});
+        nlohmann::json freq_zattrs = {{"frame", "LSRK"}};
+        std::ofstream freq_zattrs_file(path / "frequency" / ".zattrs");
+        freq_zattrs_file << freq_zattrs.dump();
+        freq_zattrs_file.close();
     }
 
     fs::path test_dir;
@@ -164,14 +168,15 @@ TEST_F(CartaZarrImageTest, GetFitsHeaderStringsTest) {
     EXPECT_EQ(header_map["NAXIS4"], "4");   // S (from zarr shape in CreateMockZarr)
 
     // 2. Coordinate System (Direction)
+    constexpr double kRadToDeg = 180.0 / M_PI;
+    constexpr double kTol = 1e-6;
+
     EXPECT_EQ(header_map["CTYPE1"], "RA---SIN");
     EXPECT_EQ(header_map["CTYPE2"], "DEC--SIN");
     EXPECT_EQ(header_map["RADESYS"], "FK5");
-    EXPECT_EQ(header_map["EQUINOX"], "J2000");
+    EXPECT_NEAR(std::stod(header_map["EQUINOX"]), 2000.0, kTol);
 
     // 3. Direction Values (Radians -> Degrees)
-    constexpr double kRadToDeg = 180.0 / M_PI;
-    constexpr double kTol = 1e-6;
 
     // CRVAL1 = 0.1 rad, CRVAL2 = 0.2 rad
     EXPECT_NEAR(std::stod(header_map["CRVAL1"]), 0.1 * kRadToDeg, kTol);
@@ -207,6 +212,7 @@ TEST_F(CartaZarrImageTest, GetFitsHeaderStringsTest) {
     EXPECT_NEAR(std::stod(header_map["CRVAL3"]), 1.4e9, kTol);
     EXPECT_NEAR(std::stod(header_map["CDELT3"]), 1.0e7, kTol); // 1.41e9 - 1.4e9
     EXPECT_NEAR(std::stod(header_map["CRPIX3"]), 1.0, kTol);
+    EXPECT_EQ(header_map["SPECSYS"], "LSRK");
 
     // 5. Stokes Axis (Defaults because "polarization" array missing in mock)
     // Code defaults to CDELT4=1.0, CRVAL4=1.0
