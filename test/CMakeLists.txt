@@ -65,6 +65,7 @@ set(TEST_SOURCES
         TestRestApi.cc
         TestTileEncoding.cc
         TestVoTable.cc
+        TestCartaZarrImage.cc
         Util/TestUtilCasacore.cc
         Util/TestUtilFile.cc
         Util/TestUtilImage.cc
