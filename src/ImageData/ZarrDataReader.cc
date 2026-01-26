@@ -266,7 +266,7 @@ bool ZarrDataReader::Initialize() {
         }
 
         _initialized = true;
-        spdlog::info("ZarrDataReader initialized: ZARR shape={}, CARTA shape={}", 
+        spdlog::debug("ZarrDataReader initialized: ZARR shape={}, CARTA shape={}", 
                     _original_shape.toString(), _shape.toString());
         
         return true;

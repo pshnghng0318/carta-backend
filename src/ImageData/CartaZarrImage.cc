@@ -47,7 +47,7 @@ CartaZarrImage::CartaZarrImage(const std::string& filename)
     // Set beams (must be after SetupCoordinateSystem)
     SetBeams();
 
-    spdlog::info("CartaZarrImage created: {} with shape {}", filename, _shape.toString());
+    spdlog::debug("CartaZarrImage created: {} with shape {}", filename, _shape.toString());
 }
 
 CartaZarrImage::CartaZarrImage(const CartaZarrImage& other)
@@ -711,13 +711,13 @@ void CartaZarrImage::SetupCoordinateSystem() {
             ImageFITSConverter::extractMiscInfo(misc_info, unused_headers);
             setMiscInfo(misc_info);
 
-            spdlog::info("Successfully set up coordinate system from FITS headers");
+            spdlog::debug("Successfully set up coordinate system for Zarr image from FITS headers");
             return;
         }
     } catch (const AipsError& e) {
-        spdlog::warn("Error setting up coordinate system from FITS headers: {}", e.getMesg());
+        spdlog::warn("Error setting up coordinate system for Zarr image from FITS headers: {}", e.getMesg());
     } catch (const std::exception& e) {
-        spdlog::warn("Error setting up coordinate system: {}, using default", e.what());
+        spdlog::warn("Error setting up coordinate system for Zarr image: {}, using default", e.what());
     }
 
     // Fall back to default coordinate system
