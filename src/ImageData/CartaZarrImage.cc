@@ -7,61 +7,56 @@
 #include "CartaZarrImage.h"
 
 #include <algorithm>
-#include <cmath>
 #include <cctype>
+#include <cmath>
 
 #include <spdlog/fmt/fmt.h>
 
 #include <casacore/casa/OS/Path.h>
+#include <casacore/casa/Quanta/Unit.h>
 #include <casacore/coordinates/Coordinates/DirectionCoordinate.h>
 #include <casacore/coordinates/Coordinates/LinearCoordinate.h>
 #include <casacore/coordinates/Coordinates/SpectralCoordinate.h>
 #include <casacore/coordinates/Coordinates/StokesCoordinate.h>
-#include <casacore/casa/Quanta/Unit.h>
 #include <casacore/images/Images/ImageFITSConverter.h>
 #include <casacore/images/Images/ImageInfo.h>
 #include <casacore/tables/DataMan/TiledFileAccess.h>
-#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <nlohmann/json.hpp>
 
 using namespace casacore;
 
 namespace carta {
 
 CartaZarrImage::CartaZarrImage(const std::string& filename)
-    : _reader(std::make_shared<ZarrDataReader>(filename)),
-      _name(filename),
-      _is_copy(false) {
-    
-    // Constants
-    static constexpr double kDefaultSpectralFreq = 1.4e9;
-    static constexpr double kDefaultSpectralWidth = 1e6;
-    
+    : _reader(std::make_shared<ZarrDataReader>(filename)), _name(filename), _is_copy(false) {
     // Initialize the reader
     if (!_reader->Initialize()) {
         throw AipsError("Failed to initialize ZarrDataReader for: " + filename);
     }
-    
+
     // Get shape from reader
     _shape = _reader->GetShape();
-    
+
     // Set up tiled shape for cursor operations
     _tiled_shape = TiledShape(_shape, TiledFileAccess::makeTileShape(_shape));
-    
+
     // Set up coordinate system
     SetupCoordinateSystem();
-    
+
+    // Set beams (must be after SetupCoordinateSystem)
+    SetBeams();
+
     spdlog::info("CartaZarrImage created: {} with shape {}", filename, _shape.toString());
 }
 
 CartaZarrImage::CartaZarrImage(const CartaZarrImage& other)
     : ImageInterface<float>(other),
-      _reader(other._reader),  // Share reader!
+      _reader(other._reader), // Share reader!
       _shape(other._shape),
       _name(other._name),
       _tiled_shape(other._tiled_shape),
       _is_copy(true) {
-    
     spdlog::debug("CartaZarrImage copy constructor: sharing reader for {}", _name);
 }
 
@@ -99,7 +94,6 @@ DataType CartaZarrImage::dataType() const {
     return TpFloat;
 }
 
-
 Vector<String> CartaZarrImage::FitsHeaderStrings() {
     // Return cached headers if available
     if (!_fits_header_strings.empty()) {
@@ -134,8 +128,7 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
     };
 
     auto to_upper_ascii = [](std::string& text) {
-        std::transform(text.begin(), text.end(), text.begin(),
-            [](unsigned char character) { return std::toupper(character); });
+        std::transform(text.begin(), text.end(), text.begin(), [](unsigned char character) { return std::toupper(character); });
     };
 
     auto make_ctype = [](const std::string& axis, const std::string& proj) {
@@ -277,14 +270,14 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
             double cdelt1_rad = l_arr[1] - l_arr[0];
             add_double_header("CDELT1", cdelt1_rad * kRadToDeg);
             if (cdelt1_rad != 0.0) {
-                add_double_header("CRPIX1", (-l_arr[0] / cdelt1_rad) + 1.0);  // +1 for FITS 1-indexed
+                add_double_header("CRPIX1", (-l_arr[0] / cdelt1_rad) + 1.0); // +1 for FITS 1-indexed
             }
         }
         if (m_arr.size() > 1) {
             double cdelt2_rad = m_arr[1] - m_arr[0];
             add_double_header("CDELT2", cdelt2_rad * kRadToDeg);
             if (cdelt2_rad != 0.0) {
-                add_double_header("CRPIX2", (-m_arr[0] / cdelt2_rad) + 1.0);  // +1 for FITS 1-indexed
+                add_double_header("CRPIX2", (-m_arr[0] / cdelt2_rad) + 1.0); // +1 for FITS 1-indexed
             }
         }
         add_string_header("CUNIT1", "deg");
@@ -300,7 +293,7 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         // If no reference_frequency or reference_value, it has no frequency axis
         if (!freq_arr.empty()) {
             add_string_header("CTYPE3", "FREQ");
-            add_double_header("CRPIX3", 1.0);  // FITS 1-indexed
+            add_double_header("CRPIX3", 1.0); // FITS 1-indexed
             add_double_header("CRVAL3", freq_arr[0]);
             if (freq_arr.size() > 1) {
                 add_double_header("CDELT3", freq_arr[1] - freq_arr[0]);
@@ -351,7 +344,7 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
     try {
         std::vector<std::string> pol_strs = _reader->ReadStringVector("polarization");
         add_string_header("CTYPE4", "STOKES");
-        add_double_header("CRPIX4", 1.0);  // FITS 1-indexed
+        add_double_header("CRPIX4", 1.0); // FITS 1-indexed
         if (!pol_strs.empty() && (pol_strs.size() != 1 || casacore::Stokes::type(pol_strs[0]) != casacore::Stokes::I)) {
             int stokes_first = casacore::Stokes::type(pol_strs[0]);
             add_double_header("CRVAL4", static_cast<double>(stokes_first));
@@ -381,7 +374,7 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
     } catch (const std::exception& e) {
         spdlog::warn("Error parsing polarization metadata for FITS headers: {}", e.what());
     }
-    
+
     // Information from SKY
     try {
         nlohmann::json zattrs = nlohmann::json::parse(_reader->GetZattrsString("SKY"));
@@ -422,8 +415,8 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         }
         const auto* telescope_dir = get_ptr(zattrs, "/telescope/direction/data/_value");
         const auto* telescope_dist = get_ptr(zattrs, "/telescope/distance/data/_value");
-        if (telescope_dir && telescope_dist && telescope_dir->is_array() && telescope_dir->size() >= 2 &&
-            telescope_dist->is_array() && !telescope_dist->empty()) {
+        if (telescope_dir && telescope_dist && telescope_dir->is_array() && telescope_dir->size() >= 2 && telescope_dist->is_array() &&
+            !telescope_dist->empty()) {
             double lon = (*telescope_dir)[0].get<double>();
             double lat = (*telescope_dir)[1].get<double>();
             double radius = (*telescope_dist)[0].get<double>();
@@ -466,8 +459,21 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         const double ref_bmin = beam_data[1];
         const double ref_bpa = beam_data[2];
 
-        for (size_t i = 1; i < n_beams; ++i) {
-            const size_t base = i * kBeamParamCount;
+        // Heuristic: Multi-beam data usually varies immediately or across the band.
+        // Check first few, middle, and last to detect variation without full iteration.
+        // This optimizes for the common case where data is effectively single-beam but stored as an array.
+        std::vector<size_t> check_indices;
+        const size_t check_limit = std::min(n_beams, size_t(10));
+        for (size_t i = 1; i < check_limit; ++i) {
+            check_indices.push_back(i);
+        }
+        if (n_beams > check_limit) {
+            check_indices.push_back(n_beams / 2); // Middle
+            check_indices.push_back(n_beams - 1); // Last
+        }
+
+        for (size_t idx : check_indices) {
+            const size_t base = idx * kBeamParamCount;
             if (std::abs(beam_data[base + 0] - ref_bmaj) > kBeamCompareEpsilon ||
                 std::abs(beam_data[base + 1] - ref_bmin) > kBeamCompareEpsilon ||
                 std::abs(beam_data[base + 2] - ref_bpa) > kBeamCompareEpsilon) {
@@ -483,6 +489,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
 
         if (single_beam) {
             _is_single_beam = true;
+            _beam = casacore::GaussianBeam(
+                casacore::Quantity(ref_bmaj, "rad"), casacore::Quantity(ref_bmin, "rad"), casacore::Quantity(ref_bpa, "rad"));
+
             add_double_header("BMAJ", ref_bmaj * kRadToDeg);
             add_double_header("BMIN", ref_bmin * kRadToDeg);
             add_double_header("BPA", ref_bpa * kRadToDeg);
@@ -509,14 +518,12 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         spdlog::error("ZarrDataReader not initialized");
         return false;
     }
-    
+
     std::lock_guard<std::mutex> lock(_slice_mutex);
     return _reader->ReadSlice(section, buffer);
 }
 
-void CartaZarrImage::doPutSlice(const Array<float>& buffer, 
-                                 const IPosition& where, 
-                                 const IPosition& stride) {
+void CartaZarrImage::doPutSlice(const Array<float>& buffer, const IPosition& where, const IPosition& stride) {
     throw AipsError("CartaZarrImage::doPutSlice - image is not writable");
 }
 
@@ -599,24 +606,24 @@ void CartaZarrImage::SetupCoordinateSystem() {
     try {
         // Get FITS header strings generated from Zarr metadata
         Vector<String> header_strings = FitsHeaderStrings();
-        
+
         if (!header_strings.empty()) {
             // Use casacore's ImageFITSConverter to build coordinate system from FITS headers
             int stokes_fits_value(1);
             Record unused_headers;
-            LogSink sink;  // null sink to suppress confusing FITS log messages
+            LogSink sink; // null sink to suppress confusing FITS log messages
             LogIO log(sink);
             unsigned int which_rep(0);
             bool drop_stokes(true);
-            
+
             CoordinateSystem coord_sys = ImageFITSConverter::getCoordinateSystem(
                 stokes_fits_value, unused_headers, header_strings, log, which_rep, _shape, drop_stokes);
-            
+
             setCoordinateInfo(coord_sys);
-            
+
             // Set image units from unused headers
             setUnits(ImageFITSConverter::getBrightnessUnit(unused_headers, log));
-            
+
             // Set image info (beam, image type, etc.)
             ImageInfo image_info = ImageFITSConverter::getImageInfo(unused_headers);
             if (stokes_fits_value != -1) {
@@ -626,12 +633,12 @@ void CartaZarrImage::SetupCoordinateSystem() {
                 }
             }
             setImageInfo(image_info);
-            
+
             // Set misc info
             Record misc_info;
             ImageFITSConverter::extractMiscInfo(misc_info, unused_headers);
             setMiscInfo(misc_info);
-            
+
             spdlog::info("Successfully set up coordinate system from FITS headers");
             return;
         }
@@ -640,46 +647,45 @@ void CartaZarrImage::SetupCoordinateSystem() {
     } catch (const std::exception& e) {
         spdlog::warn("Error setting up coordinate system: {}, using default", e.what());
     }
-    
+
     // Fall back to default coordinate system
     CreateDefaultCoordinateSystem();
 }
 
-
 void CartaZarrImage::CreateDefaultCoordinateSystem() {
     CoordinateSystem coord_sys;
-    
+
     try {
         int ndim = _shape.size();
-        
+
         if (ndim >= 2) {
             // Create default DirectionCoordinate for first 2 axes
             DirectionCoordinate dir_coord;
             coord_sys.addCoordinate(dir_coord);
         }
-        
+
         if (ndim >= 3) {
             // Add SpectralCoordinate for 3rd axis
             SpectralCoordinate spec_coord;
             coord_sys.addCoordinate(spec_coord);
         }
-        
+
         if (ndim >= 4) {
             // Add StokesCoordinate for 4th axis
             int stokes_size = _shape[3];
             Vector<int> stokes_types(stokes_size);
             for (int i = 0; i < stokes_size; ++i) {
-                stokes_types(i) = Stokes::I;  // Default to Stokes I
+                stokes_types(i) = Stokes::I; // Default to Stokes I
             }
             StokesCoordinate stokes_coord(stokes_types);
             coord_sys.addCoordinate(stokes_coord);
         }
-        
+
         setCoordinateInfo(coord_sys);
-        
+
     } catch (const std::exception& e) {
         spdlog::error("Error creating default coordinate system: {}", e.what());
-        
+
         // Emergency fallback - just DirectionCoordinate
         CoordinateSystem fallback;
         DirectionCoordinate dir_coord;
@@ -688,13 +694,15 @@ void CartaZarrImage::CreateDefaultCoordinateSystem() {
     }
 }
 
-
 void CartaZarrImage::SetBeams() {
     if (_is_single_beam) {
+        spdlog::debug("CartaZarrImage::SetBeams - Setting single beam from _beam: {} x {} @ {}", _beam.getMajor().getValue("arcsec"),
+            _beam.getMinor().getValue("arcsec"), _beam.getPA().getValue("deg"));
         ImageInfo info = imageInfo();
         info.setRestoringBeam(_beam);
         setImageInfo(info);
     } else {
+        spdlog::debug("CartaZarrImage::SetBeams - Setting multiple beams from Zarr BEAM array");
         std::vector<double> beam_data = _reader->ReadFlattenedVector("BEAM");
         if (beam_data.size() < 3) {
             return;
@@ -709,6 +717,9 @@ void CartaZarrImage::SetBeams() {
         const size_t usable = std::min(beam_data.size(), expected);
         const size_t usable_groups = usable / 3;
 
+        spdlog::debug(
+            "CartaZarrImage::SetBeams - Processing {} beam entries for shape {}x{} (chan x stokes)", usable_groups, n_chan, n_stokes);
+
         for (size_t beam_group = 0; beam_group < usable_groups; ++beam_group) {
             const int chan = static_cast<int>(beam_group / static_cast<size_t>(n_stokes));
             const int stokes = static_cast<int>(beam_group % static_cast<size_t>(n_stokes));
@@ -720,56 +731,13 @@ void CartaZarrImage::SetBeams() {
             const double bmaj = beam_data[offset + 0];
             const double bmin = beam_data[offset + 1];
             const double bpa = beam_data[offset + 2];
-            casacore::GaussianBeam beam(
-                casacore::Quantity(bmaj, "rad"),
-                casacore::Quantity(bmin, "rad"),
-                casacore::Quantity(bpa, "rad")
-            );
+            casacore::GaussianBeam beam(casacore::Quantity(bmaj, "rad"), casacore::Quantity(bmin, "rad"), casacore::Quantity(bpa, "rad"));
             _beam_set.setBeam(chan, stokes, beam);
         }
 
         ImageInfo info = imageInfo();
         info.setBeams(_beam_set);
         setImageInfo(info);
-    }
-}
-
-void CartaZarrImage::ParseBeamFromMetadata() {
-    try {
-        // Read BEAM array (flattened)
-        // fits2xradio writes "BEAM" as [time, freq, pol, param] or similar ND array
-        // We just need the first beam (single beam support for now)
-        std::vector<double> beam_data = _reader->ReadFlattenedVector("BEAM");
-        if (beam_data.size() < 3) {
-            return;
-        }
-
-        // Check units
-        std::string units = _reader->GetAttributeString("BEAM", "units");
-        if (units.empty()) {
-            units = "rad"; // Default to rad as per fits2xradio
-        }
-
-        // Taking first beam (index 0, 1, 2 for major, minor, pa)
-        double bmaj = beam_data[0];
-        double bmin = beam_data[1];
-        double bpa = beam_data[2];
-
-        // Construct GaussianBeam
-        GaussianBeam beam(
-            Quantity(bmaj, units),
-            Quantity(bmin, units),
-            Quantity(bpa, units)
-        );
-
-        ImageInfo info = imageInfo();
-        info.setRestoringBeam(beam);
-        setImageInfo(info);
-        
-        spdlog::info("Parsed restoring beam from Zarr BEAM array: {}, {}, {} {}", bmaj, bmin, bpa, units);
-
-    } catch (const std::exception& e) {
-        spdlog::warn("Error parsing beam from metadata: {}", e.what());
     }
 }
 
