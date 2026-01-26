@@ -18,6 +18,7 @@
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <spdlog/fmt/fmt.h>
 
 // TensorStore includes - isolated to implementation file
 #include "tensorstore/array.h"
@@ -57,6 +58,10 @@ constexpr int kStripeChunkMultiplier = 8;  // Read multiple chunks per stripe to
 struct ZarrDataReader::Impl {
     tensorstore::Context context;
     tensorstore::TensorStore<> store;
+    
+    // Cached .zmetadata
+    nlohmann::json zmetadata;
+    bool has_zmetadata = false;
     
     // Create Context
     void CreateContext() {
@@ -122,7 +127,7 @@ int ZarrDataReader::NumDimensions() const { return _shape.size(); }
 std::string ZarrDataReader::FindArrayPath() const {
     std::filesystem::path base_path(_filename);
     
-    std::vector<std::string> common_array_names = {"SKY", "DATA", "ARRAY", "0"};
+    std::vector<std::string> common_array_names = {"SKY", "APERTURE"};
     for (const auto& array_name : common_array_names) {
         auto potential_path = base_path / array_name;
         if (std::filesystem::exists(potential_path / ".zarray")) {
@@ -148,6 +153,20 @@ bool ZarrDataReader::Initialize() {
         std::string array_path = FindArrayPath();
         if (array_path.empty()) {
             return false;
+        }
+        
+        // Try to read .zmetadata
+        std::filesystem::path zmetadata_path = std::filesystem::path(_filename) / ".zmetadata";
+        if (std::filesystem::exists(zmetadata_path)) {
+            try {
+                std::ifstream file(zmetadata_path);
+                file >> _impl->zmetadata;
+                _impl->has_zmetadata = true;
+                spdlog::info("Loaded .zmetadata from {}", _filename);
+            } catch (const std::exception& e) {
+                spdlog::warn("Failed to parse .zmetadata: {}", e.what());
+                _impl->has_zmetadata = false;
+            }
         }
         
         _impl->CreateContext();
@@ -727,6 +746,7 @@ bool ZarrDataReader::ReadSpectralProfile(int x, int y, int stokes,
     }
 }
 
+
 //-----------------------------------------------------------------------------
 // Metadata Helpers
 //-----------------------------------------------------------------------------
@@ -989,6 +1009,15 @@ std::string ZarrDataReader::GetAttributeString(const std::string& array_name, co
 }
 
 std::string ZarrDataReader::GetZattrsString(const std::string& array_name) {
+    if (_impl && _impl->has_zmetadata) {
+        std::string key = array_name.empty() ? ".zattrs" : array_name + "/.zattrs";
+        if (_impl->zmetadata.contains("metadata") && _impl->zmetadata["metadata"].contains(key)) {
+            const auto& val = _impl->zmetadata["metadata"][key];
+            if (val.is_string()) return val.get<std::string>();
+            return val.dump();
+        }
+    }
+
     std::filesystem::path base_path(_filename);
     if (!array_name.empty()) {
         base_path /= array_name;
@@ -1006,6 +1035,15 @@ std::string ZarrDataReader::GetZattrsString(const std::string& array_name) {
 }
 
 std::string ZarrDataReader::GetZarrayString(const std::string& array_name) {
+    if (_impl && _impl->has_zmetadata) {
+        std::string key = array_name.empty() ? ".zarray" : array_name + "/.zarray";
+        if (_impl->zmetadata.contains("metadata") && _impl->zmetadata["metadata"].contains(key)) {
+            const auto& val = _impl->zmetadata["metadata"][key];
+            if (val.is_string()) return val.get<std::string>();
+            return val.dump();
+        }
+    }
+
     std::filesystem::path base_path(_filename);
     if (!array_name.empty()) {
         base_path /= array_name;
