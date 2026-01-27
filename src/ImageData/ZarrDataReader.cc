@@ -21,6 +21,7 @@
 #include <spdlog/fmt/fmt.h>
 
 // TensorStore includes - isolated to implementation file
+#include "contiguous_layout.h"
 #include "tensorstore/array.h"
 #include "tensorstore/chunk_layout.h"
 #include "tensorstore/index.h"
@@ -34,6 +35,8 @@
 #include "tensorstore/util/result.h"
 #include "tensorstore/context.h"
 // Include driver headers if necessary for Read
+
+#include "Timer/Timer.h"
 
 
 namespace carta {
@@ -51,6 +54,10 @@ constexpr size_t kDefaultCpuCount = 8;
 constexpr size_t kDimSize5D = 5;
 constexpr int kDefaultStripeHeight = 256;
 constexpr int kStripeChunkMultiplier = 8;  // Read multiple chunks per stripe to reduce overhead
+
+// Maximum data size per column batch in MiB for ReadChannelSliceV2
+// Single chunk size is taken as minimum to avoid reading same chunk multiple times
+constexpr size_t kColumnBatchMaxDataMiB = 16;
 
 //-----------------------------------------------------------------------------
 // Pimpl Implementation Helper
@@ -277,13 +284,342 @@ bool ZarrDataReader::Initialize() {
     }
 }
 
-bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<float>& buffer) {
+bool ZarrDataReader::ReadChannelSlice(casacore::Array<float>& buffer, const casacore::Slicer& section) {
+    if (!_initialized) {
+        spdlog::error("ZarrDataReader not initialized");
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(_read_mutex);
+
+    const auto& start = section.start();
+    const auto& length = section.length();
+    const auto& stop = section.end();
+
+    buffer.resize(length);
+
+    // 1. Make a slice
+    auto slice_result =
+        _impl->store
+        // l / u
+        | tensorstore::Dims(3).ClosedInterval(start[0], stop[0])
+        // m / v
+        | tensorstore::Dims(4).ClosedInterval(start[1], stop[1])
+        // Collapse time(0), frequency(1), polarization(2) at once to avoid index shifting
+        | tensorstore::Dims(0, 1, 2).IndexSlice({0, (tensorstore::Index)start[2], (tensorstore::Index)start[3]});
+
+    if (!slice_result.ok()) {
+        spdlog::error("Failed to apply slicer: {}", slice_result.status().ToString());
+        return false;
+    }
+
+    auto slice_view = std::move(slice_result).value();
+
+    // 2. Make a destination array
+    auto dst = tensorstore::SharedArray<float>(
+        tensorstore::internal::UnownedToShared(buffer.data()),
+        slice_view.domain().shape(),
+        tensorstore::fortran_order);
+
+    // 3. Read the slice
+    auto read_status = tensorstore::Read(slice_view, dst).result();
+    if (!read_status.ok()) {
+        spdlog::error("Read failed: {}", read_status.status().ToString());
+        return false;
+    }
+
+    return true;
+}
+
+
+bool ZarrDataReader::ReadChannelSliceV2(casacore::Array<float>& buffer, const casacore::Slicer& section) {
+    if (!_initialized) {
+        spdlog::error("ZarrDataReader not initialized");
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(_read_mutex);
+
+    const auto& start = section.start();
+    const auto& stop = section.end();
+    const auto& length = section.length();
+
+    buffer.resize(length);
+    
+    const int width_x = length[0];   // L (X) dimension size
+    const int height_y = length[1];  // M (Y) dimension size
+    
+    // For single 2D plane: freq and pol are single indices
+    const tensorstore::Index freq_idx = start[2];
+    const tensorstore::Index pol_idx = start[3];
+    
+    // Get L chunk size from _chunk_shape [T, F, S, L, M]
+    int chunk_width_l = kDefaultStripeHeight;  // fallback (256)
+    if (_chunk_shape.size() == kDimSize5D && _chunk_shape[3] > 0) {
+        chunk_width_l = _chunk_shape[3];
+    }
+    
+    // Calculate columns per batch: aim for kColumnBatchMaxDataMiB worth of data
+    // but ensure it's a multiple of chunk_width_l
+    const size_t bytes_per_column = static_cast<size_t>(height_y) * sizeof(float);
+    const size_t max_bytes = kColumnBatchMaxDataMiB * 1024 * 1024;
+    const size_t single_chunk_cols_bytes = static_cast<size_t>(chunk_width_l) * bytes_per_column;
+    const size_t effective_max = std::max(max_bytes, single_chunk_cols_bytes);
+    
+    int cols_per_batch = static_cast<int>(effective_max / bytes_per_column);
+    // Round down to chunk boundary
+    cols_per_batch = (cols_per_batch / chunk_width_l) * chunk_width_l;
+    if (cols_per_batch <= 0) {
+        cols_per_batch = chunk_width_l;
+    }
+    
+    float* dst_ptr = buffer.data();
+    int x_offset = 0;
+    
+    while (x_offset < width_x) {
+        // Batch width: try to align to chunk boundaries
+        int batch_width = std::min(cols_per_batch, width_x - x_offset);
+        
+        // For first batch: if start is not chunk-aligned, read to next boundary
+        if (x_offset == 0 && (start[0] % chunk_width_l) != 0) {
+            int to_boundary = chunk_width_l - (start[0] % chunk_width_l);
+            batch_width = std::min(to_boundary, width_x);
+        }
+        
+        // Create slice: L range for this batch, full M range, single F and S
+        auto slice_result =
+            _impl->store
+            | tensorstore::Dims(3).ClosedInterval(start[0] + x_offset, 
+                                                   start[0] + x_offset + batch_width - 1)
+            | tensorstore::Dims(4).ClosedInterval(start[1], stop[1])
+            | tensorstore::Dims(0, 1, 2).IndexSlice({0, freq_idx, pol_idx});
+
+        if (!slice_result.ok()) {
+            spdlog::error("Column batch slice failed: {}", slice_result.status().ToString());
+            return false;
+        }
+
+        auto slice_view = std::move(slice_result).value();
+
+        // Destination: directly write to correct position in buffer
+        // Buffer is Fortran-order [X, Y]: each column of height_y elements is contiguous
+        // Column x starts at offset x * height_y
+        float* batch_dst = dst_ptr + (static_cast<size_t>(x_offset) * height_y);
+        
+        // Create SharedArray with Fortran layout for this batch's shape
+        std::array<tensorstore::Index, 2> batch_shape = {
+            static_cast<tensorstore::Index>(batch_width),
+            static_cast<tensorstore::Index>(height_y)
+        };
+        
+        auto batch_array = tensorstore::SharedArray<float>(
+            tensorstore::internal::UnownedToShared(batch_dst),
+            batch_shape,
+            tensorstore::fortran_order);
+
+        auto read_status = tensorstore::Read(slice_view, batch_array).result();
+        if (!read_status.ok()) {
+            spdlog::error("Column batch read failed: {}", read_status.status().ToString());
+            return false;
+        }
+        
+        x_offset += batch_width;
+    }
+    
+    return true;
+}
+
+
+bool ZarrDataReader::ReadChannelSliceV4(casacore::Array<float>& buffer, const casacore::Slicer& section) {
+    if (!_initialized) {
+        spdlog::error("ZarrDataReader not initialized");
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(_read_mutex);
+
+    const auto& start = section.start();
+    const auto& stop = section.end();
+    const auto& length = section.length();
+
+    const int width_x = length[0];   // L (X) dimension size
+    const int height_y = length[1];  // M (Y) dimension size
+    
+    buffer.resize(length);
+    
+    // For single 2D plane: freq and pol are single indices
+    const tensorstore::Index freq_idx = start[2];
+    const tensorstore::Index pol_idx = start[3];
+    
+    // Get M chunk size from _chunk_shape [T, F, S, L, M]
+    int chunk_height_m = kDefaultStripeHeight;  // fallback (256)
+    if (_chunk_shape.size() == kDimSize5D && _chunk_shape[4] > 0) {
+        chunk_height_m = _chunk_shape[4];
+    }
+    
+    // Calculate rows per batch: aim for kColumnBatchMaxDataMiB worth of data
+    // but ensure it's a multiple of chunk_height_m
+    const size_t bytes_per_row = static_cast<size_t>(width_x) * sizeof(float);
+    const size_t max_bytes = kColumnBatchMaxDataMiB * 1024 * 1024;
+    const size_t single_chunk_rows_bytes = static_cast<size_t>(chunk_height_m) * bytes_per_row;
+    const size_t effective_max = std::max(max_bytes, single_chunk_rows_bytes);
+    
+    int rows_per_batch = static_cast<int>(effective_max / bytes_per_row);
+    // Round down to chunk boundary
+    rows_per_batch = (rows_per_batch / chunk_height_m) * chunk_height_m;
+    if (rows_per_batch <= 0) {
+        rows_per_batch = chunk_height_m;
+    }
+    
+    float* dst_ptr = buffer.data();
+    int y_offset = 0;
+    
+    while (y_offset < height_y) {
+        // Batch height: try to align to chunk boundaries
+        int batch_height = std::min(rows_per_batch, height_y - y_offset);
+        
+        // For first batch: if start is not chunk-aligned, read to next boundary
+        if (y_offset == 0 && (start[1] % chunk_height_m) != 0) {
+            int to_boundary = chunk_height_m - (start[1] % chunk_height_m);
+            batch_height = std::min(to_boundary, height_y);
+        }
+        
+        // Create slice: full L range, M range for this batch, single F and S
+        // XRADIO 5D order: [T, F, S, L, M]
+        auto slice_result =
+            _impl->store
+            | tensorstore::Dims(3).ClosedInterval(start[0], stop[0])   // L (full width)
+            | tensorstore::Dims(4).ClosedInterval(start[1] + y_offset, 
+                                                    start[1] + y_offset + batch_height - 1)  // M (batch)
+            | tensorstore::Dims(0, 1, 2).IndexSlice({0, freq_idx, pol_idx});
+
+        if (!slice_result.ok()) {
+            spdlog::error("Row batch slice failed: {}", slice_result.status().ToString());
+            return false;
+        }
+
+        auto slice_view = std::move(slice_result).value();
+
+        // Destination: directly write to correct position in buffer
+        // Buffer is C-order [L, M] = [width, height]: Zarr native order
+        // Each L-slice (column in image space) of batch_height elements is contiguous
+        // Batch at y_offset starts at offset width_x * y_offset
+        float* batch_dst = dst_ptr + (static_cast<size_t>(width_x) * y_offset);
+        
+        // Create SharedArray with C-order layout matching Zarr's native [L, M] order
+        // NO transpose needed - this is zero-copy from Zarr chunks
+        std::array<tensorstore::Index, 2> batch_shape = {
+            static_cast<tensorstore::Index>(width_x),
+            static_cast<tensorstore::Index>(batch_height)
+        };
+        
+        auto batch_array = tensorstore::SharedArray<float>(
+            tensorstore::internal::UnownedToShared(batch_dst),
+            batch_shape,
+            tensorstore::c_order);
+
+        auto read_status = tensorstore::Read(slice_view, batch_array).result();
+        if (!read_status.ok()) {
+            spdlog::error("Row batch read failed: {}", read_status.status().ToString());
+            return false;
+        }
+        
+        y_offset += batch_height;
+    }
+    
+    return true;
+}
+
+
+namespace {
+// Cache-friendly blocked transpose from C-order to Fortran-order
+// src: C-order [width][height], meaning src[x * height + y]
+// dst: F-order [width][height], meaning dst[y * width + x]
+void BlockedTranspose(const float* __restrict src, float* __restrict dst,
+                      int width, int height) {
+    constexpr int kBlockSize = 64;  // L1 cache friendly block size
+    
+    #pragma omp parallel for collapse(2) schedule(static)
+    for (int bx = 0; bx < width; bx += kBlockSize) {
+        for (int by = 0; by < height; by += kBlockSize) {
+            const int max_x = std::min(bx + kBlockSize, width);
+            const int max_y = std::min(by + kBlockSize, height);
+            
+            for (int ix = bx; ix < max_x; ++ix) {
+                for (int iy = by; iy < max_y; ++iy) {
+                    dst[(iy * width) + ix] = src[(ix * height) + iy];
+                }
+            }
+        }
+    }
+}
+}  // namespace
+
+
+bool ZarrDataReader::ReadChannelSliceV3(casacore::Array<float>& buffer, const casacore::Slicer& section) {
+    if (!_initialized) {
+        spdlog::error("ZarrDataReader not initialized");
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(_read_mutex);
+
+    const auto& start = section.start();
+    const auto& stop = section.end();
+    const auto& length = section.length();
+
+    const int width_x = length[0];
+    const int height_y = length[1];
+    const size_t plane_size = static_cast<size_t>(width_x) * height_y;
+
+    // Allocate temporary C-order buffer
+    std::vector<float> c_buffer(plane_size);
+
+    // Create slice for 2D plane
+    auto slice_result =
+        _impl->store
+        | tensorstore::Dims(3).ClosedInterval(start[0], stop[0])
+        | tensorstore::Dims(4).ClosedInterval(start[1], stop[1])
+        | tensorstore::Dims(0, 1, 2).IndexSlice({0, start[2], start[3]});
+
+    if (!slice_result.ok()) {
+        spdlog::error("ReadChannelSliceV3: Slice failed: {}", slice_result.status().ToString());
+        return false;
+    }
+
+    // Read in C-order (native Zarr order, avoids internal transpose buffer)
+    std::array<tensorstore::Index, 2> shape = {
+        static_cast<tensorstore::Index>(width_x),
+        static_cast<tensorstore::Index>(height_y)
+    };
+    auto src_array = tensorstore::SharedArray<float>(
+        tensorstore::internal::UnownedToShared(c_buffer.data()),
+        shape,
+        tensorstore::c_order);
+
+    auto read_status = tensorstore::Read(slice_result.value(), src_array).result();
+    if (!read_status.ok()) {
+        spdlog::error("ReadChannelSliceV3: Read failed: {}", read_status.status().ToString());
+        return false;
+    }
+
+    // Blocked transpose to Fortran-order output
+    buffer.resize(length);
+    BlockedTranspose(c_buffer.data(), buffer.data(), width_x, height_y);
+
+    return true;
+}
+
+
+bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::Slicer& section) {
     if (!_initialized) {
         spdlog::error("ZarrDataReader not initialized");
         return false;
     }
     
     std::lock_guard<std::mutex> lock(_read_mutex);
+
+    Timer t_total;
     
     try {
         const auto& start = section.start();
@@ -435,9 +771,10 @@ bool ZarrDataReader::ReadSlice(const casacore::Slicer& section, casacore::Array<
             
             y_offset += stripe_height;
         }
-        
-        spdlog::debug("ReadSlice: Completed reading {} stripes", 
-                      (height_y + chunk_height_m - 1) / chunk_height_m);
+
+        auto delta_t = t_total.Elapsed();
+        spdlog::debug("ReadSlice: Completed reading {} stripes in {} ms", 
+                      (height_y + chunk_height_m - 1) / chunk_height_m, delta_t.ms());
         return true;
         
     } catch (const std::exception& ex) {

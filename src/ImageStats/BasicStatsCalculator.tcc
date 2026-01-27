@@ -54,7 +54,7 @@ BasicStatsCalculator<T>::BasicStatsCalculator(const T* data, size_t data_size)
 
 template <typename T>
 void BasicStatsCalculator<T>::reduce() {
-    spdlog::info("SINGLE-CPU PROCESSING: BasicStatsCalculator::reduce - Processing {} elements", _data_size);
+    spdlog::debug("BasicStatsCalculator::reduce - Processing {} elements", _data_size);
     size_t i;
 #pragma omp parallel for private(i) shared(_data) reduction(min: _min_val) reduction(max:_max_val) reduction(+:_num_pixels) reduction(+:_sum) reduction(+:_sum_squares)
     for (i = 0; i < _data_size; i++) {
@@ -71,7 +71,7 @@ void BasicStatsCalculator<T>::reduce() {
             _sum_squares += std::pow(val, 2);
         }
     }
-    spdlog::info("SINGLE-CPU COMPLETE: Processed {} valid pixels (min={}, max={})", _num_pixels, _min_val, _max_val);
+    spdlog::debug("BasicStatsCalculator::reduce - Processed {} valid pixels (min={}, max={})", _num_pixels, _min_val, _max_val);
 }
 
 template <typename T>

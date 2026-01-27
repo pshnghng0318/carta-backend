@@ -233,7 +233,7 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
     auto t_batch_start = std::chrono::high_resolution_clock::now();
     {
         std::lock_guard<std::mutex> lock(image_mutex);
-        if (!reader->ReadSlice(casacore::Slicer(start, length), batch_data)) {
+        if (!reader->ReadSlice(batch_data, casacore::Slicer(start, length))) {
             spdlog::error("ZarrLoader::GetCursorSpectralData: ReadSlice failed");
             return false;
         }
@@ -483,7 +483,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     casacore::Array<float> batch_data;
     {
         std::lock_guard<std::mutex> lock(image_mutex);
-        if (!reader->ReadSlice(casacore::Slicer(start, length), batch_data)) {
+        if (!reader->ReadSlice(batch_data, casacore::Slicer(start, length))) {
             spdlog::error("ZarrLoader::GetRegionSpectralData: ReadSlice failed");
             return false;
         }
@@ -645,7 +645,7 @@ bool ZarrLoader::GetSpatialProfileX(std::vector<float>& profile, int start_x, in
         casacore::Slicer section(start, length);
         
         casacore::Array<float> line_data;
-        if (!reader->ReadSlice(section, line_data)) {
+        if (!reader->ReadSlice(line_data, section)) {
             spdlog::error("ZarrLoader::GetSpatialProfileX: ReadSlice failed");
             return false;
         }
@@ -687,7 +687,7 @@ bool ZarrLoader::GetSpatialProfileY(std::vector<float>& profile, int cursor_x,
         casacore::Slicer section(start, length);
         
         casacore::Array<float> line_data;
-        if (!reader->ReadSlice(section, line_data)) {
+        if (!reader->ReadSlice(line_data, section)) {
             spdlog::error("ZarrLoader::GetSpatialProfileY: ReadSlice failed");
             return false;
         }

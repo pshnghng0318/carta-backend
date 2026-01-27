@@ -592,7 +592,7 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
     }
 
     std::lock_guard<std::mutex> lock(_slice_mutex);
-    return _reader->ReadSlice(section, buffer);
+    return _reader->ReadChannelSliceV2(buffer, section);
 }
 
 void CartaZarrImage::doPutSlice(const Array<float>& buffer, const IPosition& where, const IPosition& stride) {
