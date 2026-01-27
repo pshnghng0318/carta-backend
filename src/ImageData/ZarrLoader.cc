@@ -164,8 +164,7 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, int stokes, int
         size_t init_delta_z = 32;
         
         // Detect CPU count for dynamic batch sizing
-        unsigned int num_cpus = std::thread::hardware_concurrency();
-        if (num_cpus == 0) num_cpus = 8;  // fallback
+        unsigned int num_cpus = 4;  // Fixed to 4 CPUs for TensorStore operations
         
         size_t delta_z = init_delta_z;  // Will be adjusted after first batch
         size_t target_delta_time = TARGET_DELTA_TIME;  // 50ms per batch (from Image.h)
@@ -515,38 +514,38 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                     // Get pointer to this channel's data
                     const float* channel_data = data_ptr + (ch_offset * pixels_per_channel);
                     
-                    // Collect valid pixels
-                    std::vector<float> valid_pixels;
-                    valid_pixels.reserve(pixels_per_channel / 2);
+                    // Zero-copy statistics: compute directly on tensorstore buffer without allocation
+                    double sum = 0.0;
+                    double sum_sq = 0.0;
+                    float min_val = std::numeric_limits<float>::max();
+                    float max_val = std::numeric_limits<float>::lowest();
+                    uint64_t valid_count = 0;
                     
+                    // Single-pass computation: check mask + NaN filter + statistics
                     for (size_t i = 0; i < pixels_per_channel; ++i) {
                         int y = i / region_width;
                         int x = i % region_width;
                         int mask_x = x + x_min - origin[0];
                         int mask_y = y + y_min - origin[1];
                         
+                        // Check if pixel is in mask bounds and enabled
                         if (mask_x >= 0 && mask_x < mask_shape[0] && mask_y >= 0 && mask_y < mask_shape[1]) {
                             casacore::IPosition mask_pos(2, mask_x, mask_y);
                             if (mask(mask_pos)) {
                                 float value = channel_data[i];
                                 if (std::isfinite(value)) {
-                                    valid_pixels.push_back(value);
+                                    sum += value;
+                                    sum_sq += value * value;
+                                    min_val = std::min(min_val, value);
+                                    max_val = std::max(max_val, value);
+                                    ++valid_count;
                                 }
                             }
                         }
                     }
                     
-                    uint64_t valid_count = valid_pixels.size();
+                    // Store results
                     if (valid_count > 0) {
-                        // Use xtensor for SIMD-accelerated statistics
-                        std::vector<size_t> shape_1d = {valid_pixels.size()};
-                        auto valid_arr = xt::adapt(valid_pixels.data(), valid_pixels.size(), xt::no_ownership(), shape_1d);
-                        
-                        double sum = xt::sum(valid_arr)();
-                        double sum_sq = xt::sum(xt::square(valid_arr))();
-                        float min_val = xt::amin(valid_arr)();
-                        float max_val = xt::amax(valid_arr)();
-                        
                         num_pixels_vec[profile_index] = valid_count;
                         sum_vec[profile_index] = sum;
                         sum_sq_vec[profile_index] = sum_sq;
@@ -559,10 +558,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& spectral_
                         min_vec[profile_index] = std::numeric_limits<float>::quiet_NaN();
                         max_vec[profile_index] = std::numeric_limits<float>::quiet_NaN();
                     }
-                    
-                    // Explicitly clear valid_pixels to free memory immediately
-                    valid_pixels.clear();
-                    valid_pixels.shrink_to_fit();
                 }
                 
                 // Explicitly clear batch_array to free memory before next thread iteration

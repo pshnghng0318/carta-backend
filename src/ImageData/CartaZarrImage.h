@@ -141,6 +141,7 @@ private:
     casacore::MFrequency::Types _cached_frequency_type;
     
     void setupCoordinateSystem();
+    void setupCoordinateSystemIfNeeded();
     bool hasFileChanged();
     bool parseWCSFromZattrs(const nlohmann::json& zattrs);
     bool parseWCSFromCoordinateArrays(const std::filesystem::path& ra_path, const std::filesystem::path& dec_path, const std::filesystem::path& freq_path);

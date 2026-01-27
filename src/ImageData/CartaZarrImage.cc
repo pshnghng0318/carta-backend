@@ -196,7 +196,7 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
         
         // After TensorStore initialization, we might have updated _shape and _ndim
         // so we need to setup coordinate system based on actual data dimensions
-        setupCoordinateSystem();
+        setupCoordinateSystemIfNeeded();
         
     } catch (std::exception& e) {
         spdlog::warn("Failed to read Zarr metadata for {}: {}", filename, e.what());
@@ -204,7 +204,7 @@ CartaZarrImage::CartaZarrImage(const std::string& filename) : ImageInterface<flo
         _ndim = _shape.size();  // Set _ndim based on default shape
         
         // Still try to setup coordinate system with default values
-        setupCoordinateSystem();
+        setupCoordinateSystemIfNeeded();
     }
     
     // Cache the initialized values for future instances
@@ -1593,9 +1593,9 @@ void CartaZarrImage::initializeTensorStore() {
     auto ts_start = std::chrono::high_resolution_clock::now();
     try {
         // Detect number of CPU cores for optimal parallelization
-        unsigned int num_cpus = std::thread::hardware_concurrency();
-        if (num_cpus == 0) num_cpus = 8;  // fallback to 8 if detection fails
-        
+        // unsigned int num_cpus = std::thread::hardware_concurrency();
+        // if (num_cpus == 0) num_cpus = 8;  // fallback to 8 if detection fails
+        unsigned int num_cpus = 4;
         // Create TensorStore context with aggressive parallelization
         // Using all available CPU cores for maximum I/O and decode throughput
         // Cache size calculation: 4 channels × 7763×4742 pixels × 4 bytes/pixel = ~560MB
@@ -2705,6 +2705,15 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
             
             spdlog::info("STEP 4: Data Copy - Copied {} elements to cache", total_elements);
             
+            // CRITICAL: Immediately release TensorStore read result to free memory
+            // After copying data to _channel_cache, we no longer need zarr_array or read_result
+            // This forces deallocation of the temporary read buffer (~147MB for 7763×4742 channel)
+            {
+                auto temp = std::move(zarr_array);
+                // temp goes out of scope and frees memory
+            }
+            spdlog::debug("Released TensorStore read result after cache copy");
+            
             // Store the cached channel identifier and number of channels
             _cached_channel = freq_channel * 1000 + stokes_channel;
             _num_cached_channels = num_cache_channels;
@@ -2925,32 +2934,21 @@ bool CartaZarrImage::loadChannelCache(int freq_channel, int stokes_channel) {
                 return false;
             }
             
-            auto zarr_array = std::move(read_result.value());
-            
-            // Debug: Check array properties
-            spdlog::debug("ZARR array dtype: {}", zarr_array.dtype().name());
-            spdlog::debug("ZARR array shape: [{}]", fmt::join(zarr_array.shape(), ", "));
-            
+            // Copy data to cache directly from read_result
             size_t total_elements = _cache_width * _cache_height;
             _channel_cache.resize(total_elements);
+            std::copy(
+                reinterpret_cast<const float*>(read_result.value().data()),
+                reinterpret_cast<const float*>(read_result.value().data()) + total_elements,
+                _channel_cache.data()
+            );
             
-            // Check if data type is float32
-            if (zarr_array.dtype() != tensorstore::dtype_v<float>) {
-                spdlog::error("ZARR array dtype is not float32: {}", zarr_array.dtype().name());
-                return false;
+            // CRITICAL: Immediately release TensorStore read result to free memory
+            {
+                auto temp = std::move(read_result);
+                // temp goes out of scope and frees memory
             }
-            
-            const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
-            
-            // Debug: Check first few values
-            spdlog::debug("First 5 ZARR values: [{}, {}, {}, {}, {}]", 
-                         src_data[0], src_data[1], src_data[2], src_data[3], src_data[4]);
-            
-            std::copy(src_data, src_data + total_elements, _channel_cache.data());
-            
-            // Debug: Check first few cached values
-            spdlog::debug("First 5 cached values: [{}, {}, {}, {}, {}]", 
-                         _channel_cache[0], _channel_cache[1], _channel_cache[2], _channel_cache[3], _channel_cache[4]);
+            spdlog::debug("Released TensorStore read result after cache copy");
             
             _cached_channel = freq_channel * 1000 + stokes_channel;
             _channel_cache_loaded = true;
@@ -3510,20 +3508,21 @@ bool CartaZarrImage::loadRegionCache(int freq_channel, int stokes_channel, int s
                 return false;
             }
             
-            auto zarr_array = std::move(read_result.value());
-            
-            // Verify data type
-            if (zarr_array.dtype().name() != "float32") {
-                spdlog::error("Unexpected data type in region cache: {}", zarr_array.dtype().name());
-                return false;
-            }
-            
-            // Copy data to cache
+            // Copy data to cache directly from read_result
             size_t total_elements = width * height;
             _channel_cache.resize(total_elements);
+            std::copy(
+                reinterpret_cast<const float*>(read_result.value().data()),
+                reinterpret_cast<const float*>(read_result.value().data()) + total_elements,
+                _channel_cache.data()
+            );
             
-            const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
-            std::copy(src_data, src_data + total_elements, _channel_cache.data());
+            // CRITICAL: Immediately release TensorStore read result to free memory
+            {
+                auto temp = std::move(read_result);
+                // temp goes out of scope and frees memory
+            }
+            spdlog::debug("Released TensorStore read result after region cache copy");
             
             // Store the cached region information
             _cached_channel = freq_channel * 1000 + stokes_channel;
@@ -3621,20 +3620,21 @@ bool CartaZarrImage::load4DRegionCache(int start_x, int start_y, int width, int 
                 return false;
             }
             
-            auto zarr_array = std::move(read_result.value());
-            
-            // Verify data type
-            if (zarr_array.dtype().name() != "float32") {
-                spdlog::error("Unexpected data type in 4D region cache: {}", zarr_array.dtype().name());
-                return false;
-            }
-            
-            // Copy data to cache - layout: [width, height, freq, stokes] (row-major)
+            // Copy data to cache directly from read_result - layout: [width, height, freq, stokes] (row-major)
             size_t total_elements = width * height * num_freq * num_stokes;
             _channel_cache.resize(total_elements);
+            std::copy(
+                reinterpret_cast<const float*>(read_result.value().data()),
+                reinterpret_cast<const float*>(read_result.value().data()) + total_elements,
+                _channel_cache.data()
+            );
             
-            const float* src_data = reinterpret_cast<const float*>(zarr_array.data());
-            std::copy(src_data, src_data + total_elements, _channel_cache.data());
+            // CRITICAL: Immediately release TensorStore read result to free memory
+            {
+                auto temp = std::move(read_result);
+                // temp goes out of scope and frees memory
+            }
+            spdlog::debug("Released TensorStore read result after 4D region cache copy");
             
             // Store the cached region information for 4D data
             _cached_channel = -1;  // Special marker for 4D cache
@@ -4479,6 +4479,28 @@ void CartaZarrImage::setupImageInfoIfNeeded() {
             spdlog::debug("CartaZarrImage: Applied cached image info (beam) for file: {}", _name);
         }
         spdlog::debug("CartaZarrImage: Skipping repeated image info setup for file: {}", _name);
+    }
+}
+
+void CartaZarrImage::setupCoordinateSystemIfNeeded() {
+    static std::unordered_map<std::string, bool> coord_sys_loaded;
+    static std::unordered_map<std::string, casacore::CoordinateSystem> cached_coord_sys;
+    
+    if (!coord_sys_loaded[_name]) {
+        // First time loading for this file - do the expensive tensorstore::Open operations
+        setupCoordinateSystem();
+        cached_coord_sys[_name] = _coord_sys;
+        coord_sys_loaded[_name] = true;
+        spdlog::debug("CartaZarrImage: Loaded and cached coordinate system for file: {}", _name);
+    } else {
+        // Reuse cached coordinate system - avoid expensive tensorstore::Open calls
+        if (cached_coord_sys.find(_name) != cached_coord_sys.end()) {
+            _coord_sys = cached_coord_sys[_name];
+            spdlog::debug("CartaZarrImage: Applied cached coordinate system for file: {}", _name);
+        } else {
+            // Fallback if cache is somehow missing
+            setupCoordinateSystem();
+        }
     }
 }
 
