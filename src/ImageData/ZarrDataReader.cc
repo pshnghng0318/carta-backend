@@ -35,9 +35,6 @@
 #include "tensorstore/internal/unowned_to_shared.h"
 #include "tensorstore/util/result.h"
 #include "tensorstore/context.h"
-// Include driver headers if necessary for Read
-
-#include "Timer/Timer.h"
 
 
 namespace carta {
@@ -311,7 +308,7 @@ bool ZarrDataReader::ReadChannelSlice(casacore::Array<float>& buffer, const casa
     const tensorstore::Index pol_idx = start[3];
     const tensorstore::Index time_idx = 0;
     
-    // Get L chunk size from _chunk_shape [T, F, S, L, M]
+    // Get L chunk size from _chunk_shape [T, F, P, L, M]
     int chunk_shape_l = _chunk_shape[3];
     int chunk_shape_f = _chunk_shape[2];
     
@@ -401,258 +398,99 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
     
     std::lock_guard<std::mutex> lock(_read_mutex);
 
-    Timer t_total;
-    
-    try {
-        const auto& start = section.start();
-        const auto& length = section.length();
+    const auto& start = section.start();
+    const auto& stop = section.end();
+    const auto& length = section.length();
 
-        spdlog::debug("ReadSlice: start={}, length={}", start.toString(), length.toString());
+    spdlog::debug("ZarrDataReader::ReadSlice: start={}, stop={}, length={}", 
+                start.toString(), stop.toString(), length.toString());
+
+    buffer.resize(length);
+    
+    const int width_x = length[0];
+    const int height_y = length[1];
+    const int num_freq = length[2];
+    const int num_stokes = length[3];
+    
+    // Time index is always 0 for now.
+    const tensorstore::Index time_idx = 0;
+    
+    // Get L chunk size for batching
+    const int chunk_shape_l = (_chunk_shape.size() == kDimSize5D) ? _chunk_shape[3] : 512;
+    
+    // Calculate columns per batch
+    const size_t max_bytes = kColumnBatchMaxDataMiB * 1024 * 1024;
+    const size_t bytes_per_column = static_cast<size_t>(height_y) * num_freq * num_stokes * sizeof(float);
+    int cols_per_batch = static_cast<int>(max_bytes / bytes_per_column);
+    cols_per_batch = std::max(cols_per_batch, chunk_shape_l);
+    // Align to chunk boundary
+    cols_per_batch = (cols_per_batch / chunk_shape_l) * chunk_shape_l;
+    
+    float* dst_ptr = buffer.data();
+    int x_offset = 0;
+    
+    while (x_offset < width_x) {
+        int batch_width = std::min(cols_per_batch, width_x - x_offset);
         
-        int width_x = length[0];   // target X size (CARTA L)
-        int height_y = length[1];  // target Y size (CARTA M)
-        int num_freq = (length.size() > 2) ? length[2] : 1;
-        int num_stokes = (length.size() > 3) ? length[3] : 1;
-        
-        // Get chunk size for M dimension (Y) to align stripe reads
-        // _chunk_shape is in XRADIO 5D order [T, F, S, L, M]
-        int chunk_height_m = kDefaultStripeHeight;
-        if (_chunk_shape.size() == kDimSize5D && _chunk_shape[4] > 0) {
-            chunk_height_m = _chunk_shape[4];
+        // Align first batch to chunk boundary
+        if (x_offset == 0 && (start[0] % chunk_shape_l) != 0) {
+            int to_boundary = chunk_shape_l - (start[0] % chunk_shape_l);
+            batch_width = std::min(to_boundary, width_x);
         }
         
-        // Read multiple chunks per stripe to reduce per-stripe overhead
-        // while still limiting memory usage
-        int stripe_chunk_height = chunk_height_m * kStripeChunkMultiplier;
-        
-        // Align stripe start with chunk boundaries in M dimension
-        int start_y = start[1];
-        int aligned_stripe_height = stripe_chunk_height;
-        
-        // Adjust first stripe to align with chunk boundary
-        int first_stripe_offset = start_y % chunk_height_m;
-        
-        spdlog::debug("ReadSlice: Dimensions: {}x{}, freq={}, stokes={}, chunk_height={}", 
-                      width_x, height_y, num_freq, num_stokes, chunk_height_m);
-        
-        // Pre-allocate output buffer
-        buffer.resize(length);
-        float* dst_ptr = buffer.data();
-        if (!dst_ptr) {
-            spdlog::error("ReadSlice: buffer.data() returned null");
+        // Create slice: [T=0, F range, P range, L batch, M full]
+        // XRADIO 5D: [T, F, P, L, M] -> CARTA 4D: [X, Y, F, S]
+        auto slice_result = _impl->store
+            | tensorstore::Dims(0).IndexSlice(time_idx)
+            | tensorstore::Dims(0).ClosedInterval(start[2], stop[2])       // F (now dim 0 after T slice)
+            | tensorstore::Dims(1).ClosedInterval(start[3], stop[3])   // P
+            | tensorstore::Dims(2).ClosedInterval(start[0] + x_offset, start[0] + x_offset + batch_width - 1)  // L
+            | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);         // M
+
+        if (!slice_result.ok()) {
+            spdlog::error("ReadSlice batch slice failed: {}", slice_result.status().ToString());
             return false;
-        }
-        
-        // Read in stripes aligned with chunk boundaries to minimize memory usage
-        // and avoid reading the same chunk multiple times
-        int y_offset = 0;
-        while (y_offset < height_y) {
-            // Calculate stripe height aligned with chunk boundaries
-            int stripe_height;
-            if (y_offset == 0 && first_stripe_offset > 0) {
-                // First stripe: align to next chunk boundary
-                stripe_height = std::min(chunk_height_m - first_stripe_offset, height_y);
-            } else {
-                // Subsequent stripes: full chunk height or remainder
-                stripe_height = std::min(aligned_stripe_height, height_y - y_offset);
-            }
-            
-            // Build zarr coordinates for this stripe
-            std::vector<tensorstore::Index> zarr_start(kDimSize5D, 0);
-            zarr_start[0] = 0;                                          // T
-            zarr_start[1] = (start.size() > 2) ? start[2] : 0;          // F
-            zarr_start[2] = (start.size() > 3) ? start[3] : 0;          // S
-            zarr_start[3] = start[0];                                   // L (X)
-            zarr_start[4] = start[1] + y_offset;                        // M (Y)
-            
-            std::vector<tensorstore::Index> zarr_shape(kDimSize5D, 1);
-            zarr_shape[0] = 1;                                          // T
-            zarr_shape[1] = num_freq;                                   // F
-            zarr_shape[2] = num_stokes;                                 // S
-            zarr_shape[3] = width_x;                                    // L (X)
-            zarr_shape[4] = stripe_height;                              // M (Y stripe)
-            
-            // Bounds validation for this stripe
-            bool bounds_ok = true;
-            for (size_t dim = 0; dim < kDimSize5D; ++dim) {
-                tensorstore::Index end_idx = zarr_start[dim] + zarr_shape[dim] - 1;
-                if (zarr_start[dim] < 0 || end_idx >= _original_shape[dim]) {
-                    spdlog::error("ReadSlice: Bounds error! dim={}, start={}, end={}, array_size={}",
-                                  dim, zarr_start[dim], end_idx, _original_shape[dim]);
-                    bounds_ok = false;
-                    break;
-                }
-            }
-            if (!bounds_ok) {
-                return false;
-            }
-            
-            // Create sliced store for this stripe
-            tensorstore::TensorStore<> sliced_store = _impl->store;
-            for (size_t dim = 0; dim < kDimSize5D; ++dim) {
-                auto transform_result = sliced_store | 
-                    tensorstore::Dims(static_cast<tensorstore::DimensionIndex>(dim))
-                        .ClosedInterval(zarr_start[dim], zarr_start[dim] + zarr_shape[dim] - 1);
-                
-                if (!transform_result.ok()) {
-                    spdlog::error("ZarrDataReader: Error creating slice transform: {}", 
-                                  transform_result.status().ToString());
-                    return false;
-                }
-                sliced_store = transform_result.value();
-            }
-            
-            // Cast to typed float store
-            auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<float>>(sliced_store);
-            if (!typed_store_result.ok()) {
-                spdlog::error("ZarrDataReader: Error casting to float store: {}", 
-                              typed_store_result.status().ToString());
-                return false;
-            }
-            
-            // Slice time dimension and transpose
-            auto time_slice_result = typed_store_result.value() | tensorstore::Dims(0).IndexSlice(0);
-            if (!time_slice_result.ok()) {
-                spdlog::error("ZarrDataReader: Error slicing time dimension: {}",
-                              time_slice_result.status().ToString());
-                return false;
-            }
-            
-            // Transpose from [F, S, L, M] to [L, M, F, S] = [X, Y, F, S]
-            auto reorder_result = time_slice_result.value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
-            if (!reorder_result.ok()) {
-                spdlog::error("ZarrDataReader: Error reordering dimensions: {}",
-                              reorder_result.status().ToString());
-                return false;
-            }
-            
-            // Calculate destination pointer for this stripe
-            // Buffer is in Fortran order [X, Y, F, S], so Y varies in the second dimension
-            // Stride in Y is width_x (one column)
-            float* stripe_dst = dst_ptr + (static_cast<size_t>(y_offset) * width_x);
-            
-            std::array<tensorstore::Index, 4> stripe_output_shape = {
-                static_cast<tensorstore::Index>(width_x),
-                static_cast<tensorstore::Index>(stripe_height),
-                static_cast<tensorstore::Index>(num_freq),
-                static_cast<tensorstore::Index>(num_stokes)
-            };
-            
-            // Create output array pointing to the stripe location in the buffer
-            auto output_array = tensorstore::SharedArray<float>(
-                tensorstore::internal::UnownedToShared(stripe_dst), stripe_output_shape,
-                tensorstore::fortran_order);
-            
-            // Read this stripe
-            auto read_status = tensorstore::Read(reorder_result.value(), output_array).result();
-            if (!read_status.ok()) {
-                spdlog::error("ZarrDataReader: ReadSlice stripe failed: {}", 
-                              read_status.status().ToString());
-                return false;
-            }
-            
-            y_offset += stripe_height;
         }
 
-        auto delta_t = t_total.Elapsed();
-        spdlog::debug("ReadSlice: Completed reading {} stripes in {} ms", 
-                      (height_y + chunk_height_m - 1) / chunk_height_m, delta_t.ms());
-        return true;
-        
-    } catch (const std::exception& ex) {
-        spdlog::error("Exception in ReadSlice: {}", ex.what());
-        return false;
-    }
-}
+        // Transpose [F, P, L, M] -> [L, M, F, P]
+        auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+        if (!reorder_result.ok()) {
+            spdlog::error("ReadSlice reorder failed: {}", reorder_result.status().ToString());
+            return false;
+        }
 
-bool ZarrDataReader::ReadChannel(int channel, int stokes, std::vector<float>& data) {
-    if (!_initialized) {
-        spdlog::error("ZarrDataReader not initialized");
-        return false;
-    }
-    
-    std::lock_guard<std::mutex> lock(_read_mutex);
-    
-    try {
-        int width = _shape[0];
-        int height = _shape[1];
-        size_t channel_size = static_cast<size_t>(width) * height;
+        // Destination pointer: x_offset into Fortran-order buffer [X, Y, F, S]
+        float* batch_dst = dst_ptr + x_offset;
         
-        // XRADIO always 5D [T, F, S, L, M]
-        // L -> X (width), M -> Y (height)
-        std::vector<tensorstore::Index> zarr_start = {
-            0,
-            static_cast<tensorstore::Index>(channel),
-            static_cast<tensorstore::Index>(stokes),
-            0,  // L start
-            0   // M start
-        };
-        std::vector<tensorstore::Index> zarr_shape = {
-            1,
-            1,
-            1,
-            static_cast<tensorstore::Index>(width),   // L = X = width
-            static_cast<tensorstore::Index>(height)   // M = Y = height
+        // Strides for Fortran order in 4D [X, Y, F, S]
+        std::array<tensorstore::Index, 4> batch_shape = {
+            static_cast<tensorstore::Index>(batch_width),
+            static_cast<tensorstore::Index>(height_y),
+            static_cast<tensorstore::Index>(num_freq),
+            static_cast<tensorstore::Index>(num_stokes)
         };
         
-        // Bounds validation
-        for (size_t dim = 0; dim < kDimSize5D; ++dim) {
-            tensorstore::Index end_idx = zarr_start[dim] + zarr_shape[dim] - 1;
-            if (zarr_start[dim] < 0 || end_idx >= _original_shape[dim]) {
-                spdlog::error("ReadChannel: Bounds error! dim={}, start={}, end={}, array_size={}",
-                              dim, zarr_start[dim], end_idx, _original_shape[dim]);
-                return false;
-            }
-        }
-        
-        auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<float>>(_impl->store);
-        if (!typed_store_result.ok()) {
-            spdlog::error("ZarrDataReader: Error casting to float store: {}",
-                          typed_store_result.status().ToString());
-            return false;
-        }
-        
-        std::array<tensorstore::Index, 3> slice_indices = {
-            0,
-            static_cast<tensorstore::Index>(channel),
-            static_cast<tensorstore::Index>(stokes)
-        };
-        auto plane_result =
-            typed_store_result.value() | tensorstore::Dims(0, 1, 2).IndexSlice(slice_indices);
-        if (!plane_result.ok()) {
-            spdlog::error("ReadChannel: Error slicing T/F/S dimensions: {}",
-                          plane_result.status().ToString());
-            return false;
-        }
-        
-        data.resize(channel_size);
-        float* dst_ptr = data.data();
-        if (!dst_ptr) {
-            spdlog::error("ReadChannel: data pointer is null after resize");
-            return false;
-        }
-        
-        std::array<tensorstore::Index, 2> output_shape = {
-            static_cast<tensorstore::Index>(width),
-            static_cast<tensorstore::Index>(height)
+        std::array<tensorstore::Index, 4> batch_byte_strides = {
+            static_cast<tensorstore::Index>(sizeof(float)),
+            static_cast<tensorstore::Index>(width_x * sizeof(float)),
+            static_cast<tensorstore::Index>(width_x * height_y * sizeof(float)),
+            static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(float))
         };
         
-        auto output_array = tensorstore::SharedArray<float>(
-            tensorstore::internal::UnownedToShared(dst_ptr), output_shape,
-            tensorstore::fortran_order);
-        
-        auto read_status = tensorstore::Read(plane_result.value(), output_array).result();
+        tensorstore::StridedLayout<4> batch_layout(batch_shape, batch_byte_strides);
+        tensorstore::ArrayView<float, 4> batch_view(batch_dst, batch_layout);
+        auto batch_array = tensorstore::UnownedToShared(batch_view);
+
+        auto read_status = tensorstore::Read(reorder_result.value(), batch_array).result();
         if (!read_status.ok()) {
-            spdlog::error("TensorStore ReadChannel failed: {}", read_status.status().ToString());
+            spdlog::error("ReadSlice batch read failed: {}", read_status.status().ToString());
             return false;
         }
         
-        return true;
-        
-    } catch (const std::exception& ex) {
-        spdlog::error("Exception in ReadChannel: {}", ex.what());
-        return false;
+        x_offset += batch_width;
     }
+    
+    return true;
 }
 
 bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& data_height,

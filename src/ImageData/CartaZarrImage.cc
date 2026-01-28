@@ -590,13 +590,6 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         spdlog::error("ZarrDataReader not initialized");
         return false;
     }
-
-    const auto& length = section.length();
-
-    if (length[2] == 1 && length[3] == 1) {
-        std::lock_guard<std::mutex> lock(_slice_mutex);
-        return _reader->ReadChannelSlice(buffer, section);
-    }
     return _reader->ReadSlice(buffer, section);
 }
 
