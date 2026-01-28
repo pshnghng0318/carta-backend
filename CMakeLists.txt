@@ -591,6 +591,7 @@ set(LINK_LIBS
         uuid
         zfp
         ${ZSTD_LIB}
+        ${BLOSC_LIB}
         cfitsio
         wcs
         gsl
