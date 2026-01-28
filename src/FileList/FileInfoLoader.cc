@@ -13,10 +13,53 @@
 #include <casacore/casa/OS/Directory.h>
 #include <casacore/casa/OS/File.h>
 
+#include <chrono>
+#include <filesystem>
+
 #include "Util/Casacore.h"
 #include "Util/File.h"
 
 using namespace carta;
+
+namespace {
+constexpr int kRecursiveDirSizeTimeoutMs = 1000;
+
+int64_t GetRecursiveDirSizeWithTimeout(const std::string& path, int timeout_ms) {
+    namespace fs = std::filesystem;
+    constexpr int kTimeoutCheckInterval = 100;
+    std::error_code err_code;
+    if (!fs::exists(path, err_code) || !fs::is_directory(path, err_code)) {
+        return 0;
+    }
+
+    int64_t size = 0;
+    auto start_time = std::chrono::steady_clock::now();
+    auto end_time = start_time + std::chrono::milliseconds(timeout_ms);
+    int counter = 0;
+
+    for (auto it = fs::recursive_directory_iterator(path, fs::directory_options::skip_permission_denied, err_code);
+         it != fs::recursive_directory_iterator();
+         it.increment(err_code)) {
+        if (err_code) {
+            err_code.clear();
+            continue;
+        }
+
+        if (++counter % kTimeoutCheckInterval == 0) {
+            if (std::chrono::steady_clock::now() > end_time) {
+                return -1;
+            }
+        }
+
+        if (!it->is_directory(err_code)) {
+            size += it->file_size(err_code);
+            if (err_code) { err_code.clear();
+}
+        }
+    }
+    return size;
+}
+}
 
 FileInfoLoader::FileInfoLoader(const std::string& filename) : _filename(filename) {
     _type = GetCartaFileType(filename);
@@ -41,8 +84,7 @@ bool FileInfoLoader::FillFileInfo(CARTA::FileInfo& file_info) {
     // fill FileInfo submessage
     int64_t file_size(cc_file.size());
     if (cc_file.isDirectory()) { // symlinked dirs are dirs
-        casacore::Directory cc_dir(cc_file);
-        file_size = cc_dir.size();
+        file_size = GetRecursiveDirSizeWithTimeout(cc_file.path().absoluteName(), kRecursiveDirSizeTimeoutMs);
     } else if (cc_file.isSymLink()) { // gets size of link not file
         casacore::String resolved_filename(cc_file.path().resolvedName());
         casacore::File linked_file(resolved_filename);
