@@ -193,7 +193,11 @@ add_subdirectory(third-party/json-schema-validator)
 # xtensor 0.26.0 (C++17 compatible) for optimized array operations
 # Add AFTER json-schema-validator to avoid affecting its compilation
 include_directories("${CMAKE_SOURCE_DIR}/third-party/xtensor/include")
-include_directories("/opt/homebrew/include")  # for xtl dependency
+if(APPLE)
+    include_directories("/opt/homebrew/include")  # for xtl dependency on macOS
+else()
+    include_directories("/usr/local/include" "/usr/include")
+endif()
 
 # TensorStore configuration
 set(TENSORSTORE_ROOT "${CMAKE_SOURCE_DIR}/third-party/tensorstore")
@@ -259,7 +263,11 @@ endforeach()
 include_directories("${TENSORSTORE_ROOT}/bazel-tensorstore/external/riegeli")
 
 # Include blosc headers for compression support
-include_directories("/opt/homebrew/opt/c-blosc/include")
+if(APPLE)
+    include_directories("/opt/homebrew/opt/c-blosc/include")
+else()
+    include_directories("/usr/local/include" "/usr/include")
+endif()
 
 # Include TensorStore absl headers for protobuf compatibility
 include_directories(BEFORE "${TENSORSTORE_ROOT}/_deps/absl-src")
@@ -292,60 +300,66 @@ if(EXISTS "${RIEGELI_ROOT}/riegeli")
     if(BZIP2_LIB)
         target_link_libraries(riegeli PUBLIC ${BZIP2_LIB})
     endif()
-    target_link_libraries(riegeli PUBLIC z /opt/homebrew/lib/libzstd.dylib)
+    find_library(ZSTD_LIB zstd PATHS /opt/homebrew/lib /usr/local/lib /usr/lib)
+    target_link_libraries(riegeli PUBLIC z ${ZSTD_LIB})
 endif()
 
 # Use system libraries instead of TensorStore static libraries
 find_package(PkgConfig REQUIRED)
 
 # Use system absl and other dependencies
-set(CMAKE_PREFIX_PATH "/opt/homebrew;${CMAKE_PREFIX_PATH}")
-find_library(ABSL_BASE_LIB absl_base PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_STRINGS_LIB absl_strings PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_STRINGS_INTERNAL_LIB absl_strings_internal PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_STATUS_LIB absl_status PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_STATUSOR_LIB absl_statusor PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_HASH_LIB absl_hash PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_LOG_INTERNAL_MESSAGE_LIB absl_log_internal_message PATHS /opt/homebrew/lib)
-find_library(ABSL_LOG_INTERNAL_CONDITIONS_LIB absl_log_internal_conditions PATHS /opt/homebrew/lib)
-find_library(ABSL_LOG_SEVERITY_LIB absl_log_severity PATHS /opt/homebrew/lib)
+if(APPLE)
+    set(CMAKE_PREFIX_PATH "/opt/homebrew;${CMAKE_PREFIX_PATH}")
+endif()
+find_library(ABSL_BASE_LIB absl_base PATHS /opt/homebrew/lib /usr/local/lib /usr/lib REQUIRED)
+# Set library search paths based on platform
+set(LIB_SEARCH_PATHS /opt/homebrew/lib /usr/local/lib /usr/lib /usr/lib/x86_64-linux-gnu)
+
+find_library(ABSL_STRINGS_LIB absl_strings PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_STRINGS_INTERNAL_LIB absl_strings_internal PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_STATUS_LIB absl_status PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_STATUSOR_LIB absl_statusor PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_HASH_LIB absl_hash PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_LOG_INTERNAL_MESSAGE_LIB absl_log_internal_message PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_LOG_INTERNAL_CONDITIONS_LIB absl_log_internal_conditions PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_LOG_SEVERITY_LIB absl_log_severity PATHS ${LIB_SEARCH_PATHS})
 
 # Additional critical absl libraries for TensorStore linking
-find_library(ABSL_CORD_LIB absl_cord PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_CORD_INTERNAL_LIB absl_cord_internal PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_CORDZ_FUNCTIONS_LIB absl_cordz_functions PATHS /opt/homebrew/lib)
-find_library(ABSL_CORDZ_HANDLE_LIB absl_cordz_handle PATHS /opt/homebrew/lib)
-find_library(ABSL_CORDZ_INFO_LIB absl_cordz_info PATHS /opt/homebrew/lib)
-find_library(ABSL_CORDZ_SAMPLE_TOKEN_LIB absl_cordz_sample_token PATHS /opt/homebrew/lib)
-find_library(ABSL_CRC32C_LIB absl_crc32c PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_CRC_INTERNAL_LIB absl_crc_internal PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_CRC_CORD_STATE_LIB absl_crc_cord_state PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_CRC_CPU_DETECT_LIB absl_crc_cpu_detect PATHS /opt/homebrew/lib)
-find_library(ABSL_SYNCHRONIZATION_LIB absl_synchronization PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_TIME_LIB absl_time PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_CIVIL_TIME_LIB absl_civil_time PATHS /opt/homebrew/lib)
-find_library(ABSL_TIME_ZONE_LIB absl_time_zone PATHS /opt/homebrew/lib)
-find_library(ABSL_INT128_LIB absl_int128 PATHS /opt/homebrew/lib)
-find_library(ABSL_RAW_LOGGING_INTERNAL_LIB absl_raw_logging_internal PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_LOG_INTERNAL_CHECK_OP_LIB absl_log_internal_check_op PATHS /opt/homebrew/lib)
-find_library(ABSL_LOG_INTERNAL_GLOBALS_LIB absl_log_internal_globals PATHS /opt/homebrew/lib)
-find_library(ABSL_THROW_DELEGATE_LIB absl_throw_delegate PATHS /opt/homebrew/lib REQUIRED)
-find_library(ABSL_MALLOC_INTERNAL_LIB absl_malloc_internal PATHS /opt/homebrew/lib)
-find_library(ABSL_SPINLOCK_WAIT_LIB absl_spinlock_wait PATHS /opt/homebrew/lib)
-find_library(ABSL_RAW_HASH_SET_LIB absl_raw_hash_set PATHS /opt/homebrew/lib)
-find_library(ABSL_HASHTABLEZ_SAMPLER_LIB absl_hashtablez_sampler PATHS /opt/homebrew/lib)
-find_library(ABSL_CITY_LIB absl_city PATHS /opt/homebrew/lib)
-find_library(ABSL_STR_FORMAT_INTERNAL_LIB absl_str_format_internal PATHS /opt/homebrew/lib)
-find_library(ABSL_RANDOM_DISTRIBUTIONS_LIB absl_random_distributions PATHS /opt/homebrew/lib)
-find_library(ABSL_RANDOM_INTERNAL_ENTROPY_POOL_LIB absl_random_internal_entropy_pool PATHS /opt/homebrew/lib)  # Optional, may not exist in older Abseil
-find_library(ABSL_RANDOM_INTERNAL_PLATFORM_LIB absl_random_internal_platform PATHS /opt/homebrew/lib)
-find_library(ABSL_RANDOM_INTERNAL_RANDEN_LIB absl_random_internal_randen PATHS /opt/homebrew/lib)
-find_library(ABSL_RANDOM_INTERNAL_RANDEN_HWAES_LIB absl_random_internal_randen_hwaes PATHS /opt/homebrew/lib)
-find_library(ABSL_RANDOM_INTERNAL_RANDEN_HWAES_IMPL_LIB absl_random_internal_randen_hwaes_impl PATHS /opt/homebrew/lib)
-find_library(ABSL_RANDOM_INTERNAL_RANDEN_SLOW_LIB absl_random_internal_randen_slow PATHS /opt/homebrew/lib)
-find_library(ABSL_RANDOM_INTERNAL_SEED_MATERIAL_LIB absl_random_internal_seed_material PATHS /opt/homebrew/lib)
-find_library(ABSL_RANDOM_SEED_GEN_EXCEPTION_LIB absl_random_seed_gen_exception PATHS /opt/homebrew/lib)
-find_library(ABSL_RANDOM_SEED_SEQUENCES_LIB absl_random_seed_sequences PATHS /opt/homebrew/lib)
+find_library(ABSL_CORD_LIB absl_cord PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_CORD_INTERNAL_LIB absl_cord_internal PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_CORDZ_FUNCTIONS_LIB absl_cordz_functions PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_CORDZ_HANDLE_LIB absl_cordz_handle PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_CORDZ_INFO_LIB absl_cordz_info PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_CORDZ_SAMPLE_TOKEN_LIB absl_cordz_sample_token PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_CRC32C_LIB absl_crc32c PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_CRC_INTERNAL_LIB absl_crc_internal PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_CRC_CORD_STATE_LIB absl_crc_cord_state PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_CRC_CPU_DETECT_LIB absl_crc_cpu_detect PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_SYNCHRONIZATION_LIB absl_synchronization PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_TIME_LIB absl_time PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_CIVIL_TIME_LIB absl_civil_time PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_TIME_ZONE_LIB absl_time_zone PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_INT128_LIB absl_int128 PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RAW_LOGGING_INTERNAL_LIB absl_raw_logging_internal PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_LOG_INTERNAL_CHECK_OP_LIB absl_log_internal_check_op PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_LOG_INTERNAL_GLOBALS_LIB absl_log_internal_globals PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_THROW_DELEGATE_LIB absl_throw_delegate PATHS ${LIB_SEARCH_PATHS} REQUIRED)
+find_library(ABSL_MALLOC_INTERNAL_LIB absl_malloc_internal PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_SPINLOCK_WAIT_LIB absl_spinlock_wait PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RAW_HASH_SET_LIB absl_raw_hash_set PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_HASHTABLEZ_SAMPLER_LIB absl_hashtablez_sampler PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_CITY_LIB absl_city PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_STR_FORMAT_INTERNAL_LIB absl_str_format_internal PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RANDOM_DISTRIBUTIONS_LIB absl_random_distributions PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RANDOM_INTERNAL_ENTROPY_POOL_LIB absl_random_internal_entropy_pool PATHS ${LIB_SEARCH_PATHS})  # Optional
+find_library(ABSL_RANDOM_INTERNAL_PLATFORM_LIB absl_random_internal_platform PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RANDOM_INTERNAL_RANDEN_LIB absl_random_internal_randen PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RANDOM_INTERNAL_RANDEN_HWAES_LIB absl_random_internal_randen_hwaes PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RANDOM_INTERNAL_RANDEN_HWAES_IMPL_LIB absl_random_internal_randen_hwaes_impl PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RANDOM_INTERNAL_RANDEN_SLOW_LIB absl_random_internal_randen_slow PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RANDOM_INTERNAL_SEED_MATERIAL_LIB absl_random_internal_seed_material PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RANDOM_SEED_GEN_EXCEPTION_LIB absl_random_seed_gen_exception PATHS ${LIB_SEARCH_PATHS})
+find_library(ABSL_RANDOM_SEED_SEQUENCES_LIB absl_random_seed_sequences PATHS ${LIB_SEARCH_PATHS})
 
 set(ABSL_LIBS
     ${ABSL_BASE_LIB}
@@ -443,8 +457,12 @@ set(TENSORSTORE_FORCE_LOAD_LIBS
     "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/internal/compression/libblosc.a"
     "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/internal/compression/libblosc_compressor.a"
     "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/internal/compression/libzstd_compressor.a"
-    "/opt/homebrew/opt/c-blosc/lib/libblosc.a"
 )
+# Find blosc library
+find_library(BLOSC_LIB blosc PATHS /opt/homebrew/opt/c-blosc/lib /usr/local/lib /usr/lib)
+if(BLOSC_LIB)
+    list(APPEND TENSORSTORE_STATIC_LIBS ${BLOSC_LIB})
+endif()
 
 # Additional dependencies that TensorStore might need
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
@@ -572,9 +590,9 @@ set(LINK_LIBS
         uSockets
         uuid
         zfp
-        /opt/homebrew/lib/libzstd.dylib
+        ${ZSTD_LIB}
         cfitsio
-        /opt/homebrew/lib/libwcs.dylib
+        wcs
         gsl
         nlohmann_json::nlohmann_json
         nlohmann_json_schema_validator
