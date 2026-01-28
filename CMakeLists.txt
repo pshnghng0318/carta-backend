@@ -337,7 +337,7 @@ find_library(ABSL_HASHTABLEZ_SAMPLER_LIB absl_hashtablez_sampler PATHS /opt/home
 find_library(ABSL_CITY_LIB absl_city PATHS /opt/homebrew/lib)
 find_library(ABSL_STR_FORMAT_INTERNAL_LIB absl_str_format_internal PATHS /opt/homebrew/lib)
 find_library(ABSL_RANDOM_DISTRIBUTIONS_LIB absl_random_distributions PATHS /opt/homebrew/lib)
-find_library(ABSL_RANDOM_INTERNAL_ENTROPY_POOL_LIB absl_random_internal_entropy_pool PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_INTERNAL_ENTROPY_POOL_LIB absl_random_internal_entropy_pool PATHS /opt/homebrew/lib)  # Optional, may not exist in older Abseil
 find_library(ABSL_RANDOM_INTERNAL_PLATFORM_LIB absl_random_internal_platform PATHS /opt/homebrew/lib)
 find_library(ABSL_RANDOM_INTERNAL_RANDEN_LIB absl_random_internal_randen PATHS /opt/homebrew/lib)
 find_library(ABSL_RANDOM_INTERNAL_RANDEN_HWAES_LIB absl_random_internal_randen_hwaes PATHS /opt/homebrew/lib)
@@ -383,7 +383,7 @@ set(ABSL_LIBS
     ${ABSL_CITY_LIB}
     ${ABSL_STR_FORMAT_INTERNAL_LIB}
     ${ABSL_RANDOM_DISTRIBUTIONS_LIB}
-    ${ABSL_RANDOM_INTERNAL_ENTROPY_POOL_LIB}
+    $<$<BOOL:${ABSL_RANDOM_INTERNAL_ENTROPY_POOL_LIB}>:${ABSL_RANDOM_INTERNAL_ENTROPY_POOL_LIB}>
     ${ABSL_RANDOM_INTERNAL_PLATFORM_LIB}
     ${ABSL_RANDOM_INTERNAL_RANDEN_LIB}
     ${ABSL_RANDOM_INTERNAL_RANDEN_HWAES_LIB}
