@@ -48,6 +48,7 @@
 	path = third-party/tensorstore
 	url = https://github.com/google/tensorstore.git
 	shallow = true
+	ignore = dirty
 [submodule "third-party/xtensor"]
 	path = third-party/xtensor
 	url = https://github.com/xtensor-stack/xtensor.git
