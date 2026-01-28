@@ -223,11 +223,6 @@ ts_fetch_if_missing(
     "https://github.com/google/riegeli/archive/4214a733e7aad4654cc789e3b1ff4687f923323d.tar.gz"
     "SHA256=06c618ffa11be504b561a0103bdd469ceae6b3b6b844bba5d581bdffc7301f4f"
 )
-# Patch Riegeli for newer Abseil API compatibility
-execute_process(
-    COMMAND bash "${CMAKE_SOURCE_DIR}/scripts/patch_riegeli.sh" "${TENSORSTORE_BUILD_ROOT}/riegeli-src"
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-)
 ts_fetch_if_missing(
     half
     "${TENSORSTORE_DEPS_DIR}/half-src/include/half.hpp"
