@@ -201,7 +201,7 @@ endif()
 
 # TensorStore configuration
 set(TENSORSTORE_ROOT "${CMAKE_SOURCE_DIR}/third-party/tensorstore")
-set(TENSORSTORE_BUILD_ROOT "${TENSORSTORE_ROOT}/build")
+set(TENSORSTORE_BUILD_ROOT "${CMAKE_BINARY_DIR}/third-party/tensorstore")
 set(TENSORSTORE_DEPS_DIR "${TENSORSTORE_BUILD_ROOT}/_deps")
 file(MAKE_DIRECTORY "${TENSORSTORE_BUILD_ROOT}")
 

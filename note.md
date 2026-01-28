@@ -1,12 +1,6 @@
 ## Install xtl for xtensor
 `brew install xtl`
 
-## Clean build folders
-```bash
-rm -rf build
-rm -rf third-party/tensorstore/build
-```
-
 ## Install abseil
 ### Remove existing version
 ```bash
