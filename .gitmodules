@@ -44,10 +44,11 @@
 	path = third-party/uSockets
 	url = https://github.com/uNetworking/uSockets.git
 	shallow = true
+[submodule "third-party/tensorstore"]
+	path = third-party/tensorstore
+	url = https://github.com/google/tensorstore.git
+	shallow = true
 [submodule "third-party/xtensor"]
 	path = third-party/xtensor
 	url = https://github.com/xtensor-stack/xtensor.git
 	shallow = true
-[submodule "third-party/tensorstore"]
-	path = third-party/tensorstore
-	url = https://github.com/google/tensorstore.git

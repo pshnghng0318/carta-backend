@@ -196,16 +196,64 @@ include_directories("${CMAKE_SOURCE_DIR}/third-party/xtensor/include")
 include_directories("/opt/homebrew/include")  # for xtl dependency
 
 # TensorStore configuration
-set(TENSORSTORE_ROOT "${CMAKE_SOURCE_DIR}/tensorstore")
+set(TENSORSTORE_ROOT "${CMAKE_SOURCE_DIR}/third-party/tensorstore")
 set(TENSORSTORE_BUILD_ROOT "${TENSORSTORE_ROOT}/build")
+set(TENSORSTORE_DEPS_DIR "${TENSORSTORE_BUILD_ROOT}/_deps")
+file(MAKE_DIRECTORY "${TENSORSTORE_BUILD_ROOT}")
 
-# TensorStore include directories  
-include_directories("${TENSORSTORE_ROOT}")
-include_directories("${TENSORSTORE_ROOT}/tensorstore")
-include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/re2-src")
-include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/riegeli-src")
-include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/absl-src")
-include_directories("${TENSORSTORE_BUILD_ROOT}/_deps/half-src/include")
+include(FetchContent)
+set(FETCHCONTENT_BASE_DIR "${TENSORSTORE_BUILD_ROOT}")
+
+# Fetch missing TensorStore deps.
+function(ts_fetch_if_missing name header_path url url_hash)
+    if(NOT EXISTS "${header_path}")
+        message(STATUS "Fetching ${name} for TensorStore")
+        FetchContent_Declare(
+            ${name}
+            URL ${url}
+            URL_HASH ${url_hash}
+        )
+        FetchContent_MakeAvailable(${name})
+    endif()
+endfunction()
+
+ts_fetch_if_missing(
+    riegeli
+    "${TENSORSTORE_DEPS_DIR}/riegeli-src/riegeli/bytes/reader.h"
+    "https://github.com/google/riegeli/archive/4214a733e7aad4654cc789e3b1ff4687f923323d.tar.gz"
+    "SHA256=06c618ffa11be504b561a0103bdd469ceae6b3b6b844bba5d581bdffc7301f4f"
+)
+ts_fetch_if_missing(
+    half
+    "${TENSORSTORE_DEPS_DIR}/half-src/include/half.hpp"
+    "https://sourceforge.net/projects/half/files/half/2.2.1/half-2.2.1.zip"
+    "SHA256=76ddbf406e9d9b772ec73af2bf925b38b290b4390cc4064720a08d4b4bca0aa9"
+)
+
+FetchContent_Declare(
+    re2
+    URL https://github.com/google/re2/releases/download/2024-07-02/re2-2024-07-02.tar.gz
+    URL_HASH SHA256=eb2df807c781601c14a260a507a5bb4509be1ee626024cb45acbd57cb9d4032b
+)
+message(STATUS "Fetching re2 for TensorStore")
+FetchContent_MakeAvailable(re2)
+
+# TensorStore include directories
+set(TENSORSTORE_INCLUDE_DIRS
+    "${TENSORSTORE_ROOT}"
+    "${TENSORSTORE_ROOT}/tensorstore"
+    "${TENSORSTORE_BUILD_ROOT}/_deps/re2-src"
+    "${TENSORSTORE_BUILD_ROOT}/_deps/riegeli-src"
+    "${TENSORSTORE_BUILD_ROOT}/_deps/absl-src"
+    "${TENSORSTORE_BUILD_ROOT}/_deps/half-src/include"
+    "${TENSORSTORE_BUILD_ROOT}/riegeli-src"
+    "${TENSORSTORE_BUILD_ROOT}/half-src/include"
+    "${TENSORSTORE_BUILD_ROOT}/re2-src"
+)
+list(REMOVE_DUPLICATES TENSORSTORE_INCLUDE_DIRS)
+foreach(dir ${TENSORSTORE_INCLUDE_DIRS})
+    include_directories("${dir}")
+endforeach()
 
 # TensorStore Bazel external dependencies (riegeli, etc.)
 include_directories("${TENSORSTORE_ROOT}/bazel-tensorstore/external/riegeli")
@@ -215,6 +263,37 @@ include_directories("/opt/homebrew/opt/c-blosc/include")
 
 # Include TensorStore absl headers for protobuf compatibility
 include_directories(BEFORE "${TENSORSTORE_ROOT}/_deps/absl-src")
+
+# Build a minimal riegeli static library (TensorStore uses riegeli sources directly).
+set(RIEGELI_ROOT "${TENSORSTORE_BUILD_ROOT}/riegeli-src")
+if(EXISTS "${RIEGELI_ROOT}/riegeli")
+    file(GLOB RIEGELI_BASE_SOURCES "${RIEGELI_ROOT}/riegeli/base/*.cc")
+    file(GLOB RIEGELI_BYTES_SOURCES "${RIEGELI_ROOT}/riegeli/bytes/*.cc")
+    # reader_cfile/cfile_writer use GNU extensions (off64_t, fopencookie) not on macOS.
+    list(FILTER RIEGELI_BYTES_SOURCES EXCLUDE REGEX "cfile")
+    file(GLOB RIEGELI_BZIP2_SOURCES "${RIEGELI_ROOT}/riegeli/bzip2/*.cc")
+    file(GLOB RIEGELI_ENDIAN_SOURCES "${RIEGELI_ROOT}/riegeli/endian/*.cc")
+    file(GLOB RIEGELI_VARINT_SOURCES "${RIEGELI_ROOT}/riegeli/varint/*.cc")
+    file(GLOB RIEGELI_ZLIB_SOURCES "${RIEGELI_ROOT}/riegeli/zlib/*.cc")
+    file(GLOB RIEGELI_ZSTD_SOURCES "${RIEGELI_ROOT}/riegeli/zstd/*.cc")
+
+    add_library(riegeli STATIC
+        ${RIEGELI_BASE_SOURCES}
+        ${RIEGELI_BYTES_SOURCES}
+        ${RIEGELI_BZIP2_SOURCES}
+        ${RIEGELI_ENDIAN_SOURCES}
+        ${RIEGELI_VARINT_SOURCES}
+        ${RIEGELI_ZLIB_SOURCES}
+        ${RIEGELI_ZSTD_SOURCES}
+    )
+    target_include_directories(riegeli PUBLIC "${RIEGELI_ROOT}")
+
+    find_library(BZIP2_LIB bz2)
+    if(BZIP2_LIB)
+        target_link_libraries(riegeli PUBLIC ${BZIP2_LIB})
+    endif()
+    target_link_libraries(riegeli PUBLIC z /opt/homebrew/lib/libzstd.dylib)
+endif()
 
 # Use system libraries instead of TensorStore static libraries
 find_package(PkgConfig REQUIRED)
@@ -257,29 +336,97 @@ find_library(ABSL_RAW_HASH_SET_LIB absl_raw_hash_set PATHS /opt/homebrew/lib)
 find_library(ABSL_HASHTABLEZ_SAMPLER_LIB absl_hashtablez_sampler PATHS /opt/homebrew/lib)
 find_library(ABSL_CITY_LIB absl_city PATHS /opt/homebrew/lib)
 find_library(ABSL_STR_FORMAT_INTERNAL_LIB absl_str_format_internal PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_DISTRIBUTIONS_LIB absl_random_distributions PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_INTERNAL_ENTROPY_POOL_LIB absl_random_internal_entropy_pool PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_INTERNAL_PLATFORM_LIB absl_random_internal_platform PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_INTERNAL_RANDEN_LIB absl_random_internal_randen PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_INTERNAL_RANDEN_HWAES_LIB absl_random_internal_randen_hwaes PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_INTERNAL_RANDEN_HWAES_IMPL_LIB absl_random_internal_randen_hwaes_impl PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_INTERNAL_RANDEN_SLOW_LIB absl_random_internal_randen_slow PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_INTERNAL_SEED_MATERIAL_LIB absl_random_internal_seed_material PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_SEED_GEN_EXCEPTION_LIB absl_random_seed_gen_exception PATHS /opt/homebrew/lib)
+find_library(ABSL_RANDOM_SEED_SEQUENCES_LIB absl_random_seed_sequences PATHS /opt/homebrew/lib)
 
-# TensorStore link directories - use bazel-bin path
-link_directories("${TENSORSTORE_ROOT}/bazel-bin/tensorstore")
+set(ABSL_LIBS
+    ${ABSL_BASE_LIB}
+    ${ABSL_STRINGS_LIB}
+    ${ABSL_STRINGS_INTERNAL_LIB}
+    ${ABSL_STATUS_LIB}
+    ${ABSL_STATUSOR_LIB}
+    ${ABSL_HASH_LIB}
+    ${ABSL_LOG_INTERNAL_MESSAGE_LIB}
+    ${ABSL_LOG_INTERNAL_CONDITIONS_LIB}
+    ${ABSL_LOG_SEVERITY_LIB}
+    ${ABSL_CORD_LIB}
+    ${ABSL_CORD_INTERNAL_LIB}
+    ${ABSL_CORDZ_FUNCTIONS_LIB}
+    ${ABSL_CORDZ_HANDLE_LIB}
+    ${ABSL_CORDZ_INFO_LIB}
+    ${ABSL_CORDZ_SAMPLE_TOKEN_LIB}
+    ${ABSL_CRC32C_LIB}
+    ${ABSL_CRC_INTERNAL_LIB}
+    ${ABSL_CRC_CORD_STATE_LIB}
+    ${ABSL_CRC_CPU_DETECT_LIB}
+    ${ABSL_SYNCHRONIZATION_LIB}
+    ${ABSL_TIME_LIB}
+    ${ABSL_CIVIL_TIME_LIB}
+    ${ABSL_TIME_ZONE_LIB}
+    ${ABSL_INT128_LIB}
+    ${ABSL_RAW_LOGGING_INTERNAL_LIB}
+    ${ABSL_LOG_INTERNAL_CHECK_OP_LIB}
+    ${ABSL_LOG_INTERNAL_GLOBALS_LIB}
+    ${ABSL_THROW_DELEGATE_LIB}
+    ${ABSL_MALLOC_INTERNAL_LIB}
+    ${ABSL_SPINLOCK_WAIT_LIB}
+    ${ABSL_RAW_HASH_SET_LIB}
+    ${ABSL_HASHTABLEZ_SAMPLER_LIB}
+    ${ABSL_CITY_LIB}
+    ${ABSL_STR_FORMAT_INTERNAL_LIB}
+    ${ABSL_RANDOM_DISTRIBUTIONS_LIB}
+    ${ABSL_RANDOM_INTERNAL_ENTROPY_POOL_LIB}
+    ${ABSL_RANDOM_INTERNAL_PLATFORM_LIB}
+    ${ABSL_RANDOM_INTERNAL_RANDEN_LIB}
+    ${ABSL_RANDOM_INTERNAL_RANDEN_HWAES_LIB}
+    ${ABSL_RANDOM_INTERNAL_RANDEN_HWAES_IMPL_LIB}
+    ${ABSL_RANDOM_INTERNAL_RANDEN_SLOW_LIB}
+    ${ABSL_RANDOM_INTERNAL_SEED_MATERIAL_LIB}
+    ${ABSL_RANDOM_SEED_GEN_EXCEPTION_LIB}
+    ${ABSL_RANDOM_SEED_SEQUENCES_LIB}
+)
 
-# Automatically collect all TensorStore library files
-file(GLOB_RECURSE TENSORSTORE_ALL_LIBS_FILES "${TENSORSTORE_ROOT}/bazel-bin/tensorstore/*.a")
+# TensorStore link directories - use bazel-bin path if present
+set(TENSORSTORE_BAZEL_BIN_DIR "${TENSORSTORE_ROOT}/bazel-bin/tensorstore")
+set(TENSORSTORE_BAZEL_EXTERNAL_DIR "${TENSORSTORE_ROOT}/bazel-bin/external")
 
-# Collect external dependencies from TensorStore Bazel build
-file(GLOB_RECURSE TENSORSTORE_EXTERNAL_DEPS "${TENSORSTORE_ROOT}/bazel-bin/external/*.a")
+if(EXISTS "${TENSORSTORE_BAZEL_BIN_DIR}")
+    link_directories("${TENSORSTORE_BAZEL_BIN_DIR}")
+    # Automatically collect all TensorStore library files
+    file(GLOB_RECURSE TENSORSTORE_ALL_LIBS_FILES "${TENSORSTORE_BAZEL_BIN_DIR}/*.a")
+else()
+    set(TENSORSTORE_ALL_LIBS_FILES "")
+endif()
+
+if(EXISTS "${TENSORSTORE_BAZEL_EXTERNAL_DIR}")
+    # Collect external dependencies from TensorStore Bazel build
+    file(GLOB_RECURSE TENSORSTORE_EXTERNAL_DEPS "${TENSORSTORE_BAZEL_EXTERNAL_DIR}/*.a")
+else()
+    set(TENSORSTORE_EXTERNAL_DEPS "")
+endif()
 
 # Sort the libraries to ensure consistent linking order
 list(SORT TENSORSTORE_ALL_LIBS_FILES)
 list(SORT TENSORSTORE_EXTERNAL_DEPS)
 
-# Display found libraries for debugging
-list(LENGTH TENSORSTORE_ALL_LIBS_FILES TENSORSTORE_COUNT)
-list(LENGTH TENSORSTORE_EXTERNAL_DEPS EXTERNAL_COUNT)
-message(STATUS "Found ${TENSORSTORE_COUNT} TensorStore libraries")
-message(STATUS "Found ${EXTERNAL_COUNT} external dependency libraries")
-foreach(lib ${TENSORSTORE_ALL_LIBS_FILES})
-    get_filename_component(lib_name ${lib} NAME)
-    message(STATUS "  TensorStore lib: ${lib_name}")
-endforeach()
+# Display found libraries for debugging (only when Bazel outputs are present)
+if(EXISTS "${TENSORSTORE_BAZEL_BIN_DIR}" OR EXISTS "${TENSORSTORE_BAZEL_EXTERNAL_DIR}")
+    list(LENGTH TENSORSTORE_ALL_LIBS_FILES TENSORSTORE_COUNT)
+    list(LENGTH TENSORSTORE_EXTERNAL_DEPS EXTERNAL_COUNT)
+    message(STATUS "TensorStore Bazel libraries: ${TENSORSTORE_COUNT}, external deps: ${EXTERNAL_COUNT}")
+    foreach(lib ${TENSORSTORE_ALL_LIBS_FILES})
+        get_filename_component(lib_name ${lib} NAME)
+        message(STATUS "  TensorStore lib: ${lib_name}")
+    endforeach()
+endif()
 
 # Add external dependencies from TensorStore build (re2, riegeli, absl, etc.)
 set(TENSORSTORE_EXTERNAL_LIBS
@@ -313,6 +460,110 @@ set(TENSORSTORE_ALL_LIBS
     ${TENSORSTORE_SYSTEM_LIBS}
 )
 
+# TensorStore core sources (exclude tests) for non-Bazel builds
+file(GLOB TENSORSTORE_CORE_SOURCES "${TENSORSTORE_ROOT}/tensorstore/*.cc")
+list(FILTER TENSORSTORE_CORE_SOURCES EXCLUDE REGEX "test")
+list(REMOVE_ITEM TENSORSTORE_CORE_SOURCES "${TENSORSTORE_ROOT}/tensorstore/context.cc")
+
+file(GLOB TENSORSTORE_INDEX_SPACE_SOURCES "${TENSORSTORE_ROOT}/tensorstore/index_space/*.cc")
+list(FILTER TENSORSTORE_INDEX_SPACE_SOURCES EXCLUDE REGEX "test")
+
+file(GLOB TENSORSTORE_INDEX_SPACE_INTERNAL_SOURCES "${TENSORSTORE_ROOT}/tensorstore/index_space/internal/*.cc")
+list(FILTER TENSORSTORE_INDEX_SPACE_INTERNAL_SOURCES EXCLUDE REGEX "test")
+
+file(GLOB TENSORSTORE_INTERNAL_SOURCES "${TENSORSTORE_ROOT}/tensorstore/internal/*.cc")
+list(FILTER TENSORSTORE_INTERNAL_SOURCES EXCLUDE REGEX "test")
+list(REMOVE_ITEM TENSORSTORE_INTERNAL_SOURCES
+    "${TENSORSTORE_ROOT}/tensorstore/internal/concurrency_resource.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/data_copy_concurrency_resource.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/file_io_concurrency_resource.cc"
+)
+
+file(GLOB TENSORSTORE_INTERNAL_CONTAINER_SOURCES "${TENSORSTORE_ROOT}/tensorstore/internal/container/*.cc")
+list(FILTER TENSORSTORE_INTERNAL_CONTAINER_SOURCES EXCLUDE REGEX "test")
+
+file(GLOB TENSORSTORE_INTERNAL_LOG_SOURCES "${TENSORSTORE_ROOT}/tensorstore/internal/log/*.cc")
+list(FILTER TENSORSTORE_INTERNAL_LOG_SOURCES EXCLUDE REGEX "test")
+
+file(GLOB TENSORSTORE_INTERNAL_RIEGELI_SOURCES "${TENSORSTORE_ROOT}/tensorstore/internal/riegeli/*.cc")
+list(FILTER TENSORSTORE_INTERNAL_RIEGELI_SOURCES EXCLUDE REGEX "test")
+
+file(GLOB TENSORSTORE_INTERNAL_THREAD_SOURCES "${TENSORSTORE_ROOT}/tensorstore/internal/thread/*.cc")
+list(FILTER TENSORSTORE_INTERNAL_THREAD_SOURCES EXCLUDE REGEX "test|benchmark")
+
+file(GLOB TENSORSTORE_INTERNAL_TRACING_SOURCES "${TENSORSTORE_ROOT}/tensorstore/internal/tracing/*.cc")
+list(FILTER TENSORSTORE_INTERNAL_TRACING_SOURCES EXCLUDE REGEX "test")
+
+file(GLOB TENSORSTORE_INTERNAL_CACHE_SOURCES "${TENSORSTORE_ROOT}/tensorstore/internal/cache/*.cc")
+list(FILTER TENSORSTORE_INTERNAL_CACHE_SOURCES EXCLUDE REGEX "test")
+list(REMOVE_ITEM TENSORSTORE_INTERNAL_CACHE_SOURCES
+    "${TENSORSTORE_ROOT}/tensorstore/internal/cache/cache_pool_resource.cc"
+)
+
+file(GLOB TENSORSTORE_INTERNAL_JSON_SOURCES "${TENSORSTORE_ROOT}/tensorstore/internal/json/*.cc")
+list(FILTER TENSORSTORE_INTERNAL_JSON_SOURCES EXCLUDE REGEX "test")
+
+file(GLOB TENSORSTORE_INTERNAL_JSON_BINDING_SOURCES "${TENSORSTORE_ROOT}/tensorstore/internal/json_binding/*.cc")
+list(FILTER TENSORSTORE_INTERNAL_JSON_BINDING_SOURCES EXCLUDE REGEX "test")
+
+file(GLOB TENSORSTORE_KVSTORE_SOURCES "${TENSORSTORE_ROOT}/tensorstore/kvstore/*.cc")
+list(FILTER TENSORSTORE_KVSTORE_SOURCES EXCLUDE REGEX "test")
+
+file(GLOB TENSORSTORE_UTIL_SOURCES "${TENSORSTORE_ROOT}/tensorstore/util/*.cc")
+list(FILTER TENSORSTORE_UTIL_SOURCES EXCLUDE REGEX "test")
+
+set(TENSORSTORE_INTERNAL_OS_SOURCES
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/aligned_alloc.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/error_code_posix.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/file_descriptor.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/file_info_posix.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/file_lock.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/file_lister_posix.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/file_util.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/file_util_posix.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/filesystem.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/fork_detection.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/internal/os/memory_region.cc"
+)
+
+file(GLOB TENSORSTORE_INTERNAL_METRICS_SOURCES "${TENSORSTORE_ROOT}/tensorstore/internal/metrics/*.cc")
+# Exclude tests/benchmarks, protobuf-backed metrics, and Prometheus push (HTTP deps).
+list(FILTER TENSORSTORE_INTERNAL_METRICS_SOURCES EXCLUDE REGEX "test|benchmark|protobuf|prometheus")
+
+file(GLOB TENSORSTORE_SERIALIZATION_SOURCES "${TENSORSTORE_ROOT}/tensorstore/serialization/*.cc")
+# Exclude tests and protobuf serialization (pulls in riegeli/protobuf glue).
+list(FILTER TENSORSTORE_SERIALIZATION_SOURCES EXCLUDE REGEX "test|protobuf")
+
+set(TENSORSTORE_DRIVER_SOURCES
+    "${TENSORSTORE_ROOT}/tensorstore/driver/driver.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/driver/read.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/driver/write.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/driver/copy.cc"
+    "${TENSORSTORE_ROOT}/tensorstore/driver/url_registry.cc"
+)
+
+set(TENSORSTORE_EXTRA_SOURCES
+    ${TENSORSTORE_CORE_SOURCES}
+    ${TENSORSTORE_INDEX_SPACE_SOURCES}
+    ${TENSORSTORE_INDEX_SPACE_INTERNAL_SOURCES}
+    ${TENSORSTORE_INTERNAL_SOURCES}
+    ${TENSORSTORE_INTERNAL_CONTAINER_SOURCES}
+    ${TENSORSTORE_INTERNAL_LOG_SOURCES}
+    ${TENSORSTORE_INTERNAL_CACHE_SOURCES}
+    ${TENSORSTORE_INTERNAL_JSON_SOURCES}
+    ${TENSORSTORE_INTERNAL_JSON_BINDING_SOURCES}
+    ${TENSORSTORE_INTERNAL_RIEGELI_SOURCES}
+    ${TENSORSTORE_INTERNAL_OS_SOURCES}
+    ${TENSORSTORE_INTERNAL_METRICS_SOURCES}
+    ${TENSORSTORE_INTERNAL_THREAD_SOURCES}
+    ${TENSORSTORE_INTERNAL_TRACING_SOURCES}
+    ${TENSORSTORE_KVSTORE_SOURCES}
+    ${TENSORSTORE_SERIALIZATION_SOURCES}
+    ${TENSORSTORE_UTIL_SOURCES}
+    ${TENSORSTORE_DRIVER_SOURCES}
+    "${TENSORSTORE_ROOT}/tensorstore/kvstore/file/util.cc"
+)
+
 
 set(LINK_LIBS
         ${LINK_LIBS}
@@ -320,7 +571,6 @@ set(LINK_LIBS
         ${PROTOBUF_LIBRARY}
         uSockets
         uuid
-        z
         zfp
         /opt/homebrew/lib/libzstd.dylib
         cfitsio
@@ -343,6 +593,19 @@ set(LINK_LIBS
         ${CMAKE_THREAD_LIBS_INIT}
         # Add TensorStore libraries and all dependencies
         ${TENSORSTORE_ALL_LIBS})
+
+if(TARGET riegeli)
+    set(LINK_LIBS ${LINK_LIBS} riegeli)
+endif()
+
+if(TARGET re2)
+    set(LINK_LIBS ${LINK_LIBS} re2)
+elseif(TARGET re2::re2)
+    set(LINK_LIBS ${LINK_LIBS} re2::re2)
+endif()
+
+# Ensure absl libraries come after riegeli/static objects for link order.
+set(LINK_LIBS ${LINK_LIBS} ${ABSL_LIBS})
 
 set(SOURCE_FILES
         ${SOURCE_FILES}
@@ -377,29 +640,33 @@ set(SOURCE_FILES
         src/ImageData/ZarrLoader.cc
         src/ImageData/ZarrDataReader.cc
         # Include TensorStore zarr driver to ensure registration
-        tensorstore/tensorstore/driver/zarr/driver.cc
-        tensorstore/tensorstore/driver/zarr/metadata.cc
-        tensorstore/tensorstore/driver/zarr/spec.cc
-        tensorstore/tensorstore/driver/zarr/dtype.cc
-        tensorstore/tensorstore/driver/zarr/compressor.cc
-        tensorstore/tensorstore/driver/zarr/blosc_compressor.cc
-        tensorstore/tensorstore/driver/zarr/zstd_compressor.cc
-        tensorstore/tensorstore/driver/zarr/zlib_compressor.cc
-        tensorstore/tensorstore/driver/zarr/bzip2_compressor.cc
+        third-party/tensorstore/tensorstore/driver/driver_spec.cc
+        third-party/tensorstore/tensorstore/driver/kvs_backed_chunk_driver.cc
+        third-party/tensorstore/tensorstore/driver/zarr/driver.cc
+        third-party/tensorstore/tensorstore/driver/zarr/metadata.cc
+        third-party/tensorstore/tensorstore/driver/zarr/spec.cc
+        third-party/tensorstore/tensorstore/driver/zarr/dtype.cc
+        third-party/tensorstore/tensorstore/driver/zarr/compressor.cc
+        third-party/tensorstore/tensorstore/driver/zarr/blosc_compressor.cc
+        third-party/tensorstore/tensorstore/driver/zarr/zstd_compressor.cc
+        third-party/tensorstore/tensorstore/driver/zarr/zlib_compressor.cc
+        third-party/tensorstore/tensorstore/driver/zarr/bzip2_compressor.cc
         # Include internal compression implementations
-        tensorstore/tensorstore/internal/compression/blosc_compressor.cc
-        tensorstore/tensorstore/internal/compression/zstd_compressor.cc
-        tensorstore/tensorstore/internal/compression/zlib_compressor.cc
-        tensorstore/tensorstore/internal/compression/bzip2_compressor.cc
-        tensorstore/tensorstore/internal/compression/json_specified_compressor.cc
-        tensorstore/tensorstore/context.cc
-        tensorstore/tensorstore/internal/concurrency_resource.cc
-        tensorstore/tensorstore/internal/data_copy_concurrency_resource.cc
-        tensorstore/tensorstore/internal/file_io_concurrency_resource.cc
-        tensorstore/tensorstore/internal/cache/cache_pool_resource.cc
+        third-party/tensorstore/tensorstore/internal/compression/blosc_compressor.cc
+        third-party/tensorstore/tensorstore/internal/compression/blosc.cc
+        third-party/tensorstore/tensorstore/internal/compression/zstd_compressor.cc
+        third-party/tensorstore/tensorstore/internal/compression/zlib_compressor.cc
+        third-party/tensorstore/tensorstore/internal/compression/bzip2_compressor.cc
+        third-party/tensorstore/tensorstore/internal/compression/json_specified_compressor.cc
+        third-party/tensorstore/tensorstore/context.cc
+        third-party/tensorstore/tensorstore/internal/concurrency_resource.cc
+        third-party/tensorstore/tensorstore/internal/data_copy_concurrency_resource.cc
+        third-party/tensorstore/tensorstore/internal/file_io_concurrency_resource.cc
+        third-party/tensorstore/tensorstore/internal/cache/cache_pool_resource.cc
         # Include file KvStore driver for file:// URLs
-        tensorstore/tensorstore/kvstore/file/file_key_value_store.cc
-        tensorstore/tensorstore/kvstore/file/file_resource.cc
+        third-party/tensorstore/tensorstore/kvstore/file/file_key_value_store.cc
+        third-party/tensorstore/tensorstore/kvstore/file/file_resource.cc
+        ${TENSORSTORE_EXTRA_SOURCES}
         src/ImageFitting/ImageFitter.cc
         src/ImageFitting/InitialValueCalculator.cc
         src/ImageGenerators/MomentGenerator.cc
@@ -457,13 +724,21 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
             list(APPEND FORCE_LOAD_ARGS "-Wl,-force_load,${lib}")
         endif()
     endforeach()
+
+    # Force-load TensorStore main lib only if it exists (Bazel build optional)
+    set(TENSORSTORE_MAIN_FORCE_LOAD "")
+    if(EXISTS ${TENSORSTORE_MAIN_LIB})
+        set(TENSORSTORE_MAIN_FORCE_LOAD "-Wl,-force_load,${TENSORSTORE_MAIN_LIB}")
+    else()
+        # No Bazel output: force-load not applicable.
+    endif()
     
     target_link_libraries(carta_backend
         PRIVATE
             protobuf
             /opt/homebrew/lib/libuv.dylib
             ${LINK_LIBS}
-            -Wl,-force_load,${TENSORSTORE_MAIN_LIB}
+            ${TENSORSTORE_MAIN_FORCE_LOAD}
             ${FORCE_LOAD_ARGS})
             
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
@@ -477,12 +752,20 @@ if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
         endif()
     endforeach()
 
+    # Force-load TensorStore main lib only if it exists (Bazel build optional)
+    set(TENSORSTORE_MAIN_FORCE_LOAD "")
+    if(EXISTS ${TENSORSTORE_MAIN_LIB})
+        list(APPEND TENSORSTORE_MAIN_FORCE_LOAD "-Wl,--whole-archive" "${TENSORSTORE_MAIN_LIB}" "-Wl,--no-whole-archive")
+    else()
+        # No Bazel output: force-load not applicable.
+    endif()
+
     target_link_libraries(carta_backend
         PRIVATE
             protobuf
             uv
             ${LINK_LIBS}
-            -Wl,--whole-archive ${TENSORSTORE_MAIN_LIB} -Wl,--no-whole-archive
+            ${TENSORSTORE_MAIN_FORCE_LOAD}
             ${FORCE_LOAD_ARGS})
             
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
