@@ -7,11 +7,11 @@
 #ifndef CARTA_SRC_IMAGEDATA_ZARRDATAREADER_H_
 #define CARTA_SRC_IMAGEDATA_ZARRDATAREADER_H_
 
+#include <map> // Added for std::map
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
-#include <map>  // Added for std::map
 
 #include <casacore/casa/Arrays/Array.h>
 #include <casacore/casa/Arrays/Slicer.h>
@@ -20,11 +20,11 @@ namespace carta {
 
 /**
  * @brief Encapsulates TensorStore operations for Zarr file access.
- * 
+ *
  * This class provides a clean interface for reading Zarr data, handling
  * coordinate transformations between CARTA format [x,y,z,stokes] and
  * ZARR native format (e.g., [time,freq,pol,l,m] for 5D data).
- * 
+ *
  * Uses Pimpl idiom to hide TensorStore dependencies from the header.
  */
 class ZarrDataReader {
@@ -78,15 +78,14 @@ public:
      * @param stokes Stokes/polarization index
      * @return true if read succeeded
      */
-    bool GetChunk(std::vector<float>& data, int& data_width, int& data_height,
-                  int min_x, int min_y, int channel, int stokes);
+    bool GetChunk(std::vector<float>& data, int& data_width, int& data_height, int min_x, int min_y, int channel, int stokes);
 
     /**
      * @brief Read spectral profile at a single spatial position (all channels).
-     * 
+     *
      * This method reads the entire frequency axis in a single TensorStore request,
      * which is much more efficient than calling ReadSlice for each channel.
-     * 
+     *
      * @param x The X coordinate (L axis in XRADIO schema)
      * @param y The Y coordinate (M axis in XRADIO schema)
      * @param stokes The stokes/polarization index
@@ -130,14 +129,14 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> _impl;
-    
+
     // Cached metadata for quick access without dereferencing impl
-    casacore::IPosition _shape;          
-    casacore::IPosition _original_shape; 
+    casacore::IPosition _shape;
+    casacore::IPosition _original_shape;
     casacore::IPosition _chunk_shape;
     std::string _filename;
     bool _initialized = false;
-    
+
     mutable std::mutex _read_mutex;
 
     /**
