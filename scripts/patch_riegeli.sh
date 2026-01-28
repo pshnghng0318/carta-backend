@@ -13,8 +13,8 @@ patch_file() {
         return
     fi
     
-    # Check if already patched
-    if grep -q "MutexLock lock(&mutex_)" "$file"; then
+    # Check if already patched (check for either pattern)
+    if grep -q "MutexLock lock(&mutex_)" "$file" || grep -q "MutexLock lock(&shared_->mutex)" "$file"; then
         return
     fi
     
@@ -22,6 +22,9 @@ patch_file() {
     
     # Fix MutexLock: mutex_ -> &mutex_
     sed -i.bak 's/MutexLock lock(mutex_)/MutexLock lock(\&mutex_)/g' "$file"
+    
+    # Fix MutexLock: shared_->mutex -> &shared_->mutex
+    sed -i.bak 's/MutexLock lock(shared_->mutex)/MutexLock lock(\&shared_->mutex)/g' "$file"
     
     # Fix ReleasableMutexLock: mutex_ -> &mutex_
     sed -i.bak 's/ReleasableMutexLock lock(mutex_)/ReleasableMutexLock lock(\&mutex_)/g' "$file"
@@ -44,5 +47,8 @@ echo "Patching Riegeli for Abseil compatibility..."
 # Patch all files that use MutexLock with mutex_
 patch_file "${RIEGELI_DIR}/riegeli/base/background_cleaning.cc"
 patch_file "${RIEGELI_DIR}/riegeli/base/parallelism.cc"
+patch_file "${RIEGELI_DIR}/riegeli/base/recycling_pool.h"
+patch_file "${RIEGELI_DIR}/riegeli/records/record_writer.cc"
+patch_file "${RIEGELI_DIR}/riegeli/bytes/reader_factory.cc"
 
 echo "Riegeli patched successfully"
