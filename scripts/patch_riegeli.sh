@@ -13,21 +13,19 @@ patch_file() {
         return
     fi
     
-    # Check if already patched (check for either pattern)
-    if grep -q "MutexLock lock(&mutex_)" "$file" || grep -q "MutexLock lock(&shared_->mutex)" "$file"; then
+    # Check if file contains any MutexLock patterns that need patching
+    if ! grep -qE "MutexLock lock\([^&]" "$file" && ! grep -qE "ReleasableMutexLock lock\([^&]" "$file" && ! grep -q "mutex_\.lock()" "$file"; then
         return
     fi
     
     echo "Patching $(basename "$file")..."
     
-    # Fix MutexLock: mutex_ -> &mutex_
-    sed -i.bak 's/MutexLock lock(mutex_)/MutexLock lock(\&mutex_)/g' "$file"
+    # Fix MutexLock: any_mutex_var -> &any_mutex_var (generic pattern)
+    # Matches: MutexLock lock(foo) -> MutexLock lock(&foo) where foo doesn't start with &
+    sed -i.bak 's/MutexLock lock(\([^&)][^)]*\))/MutexLock lock(\&\1)/g' "$file"
     
-    # Fix MutexLock: shared_->mutex -> &shared_->mutex
-    sed -i.bak 's/MutexLock lock(shared_->mutex)/MutexLock lock(\&shared_->mutex)/g' "$file"
-    
-    # Fix ReleasableMutexLock: mutex_ -> &mutex_
-    sed -i.bak 's/ReleasableMutexLock lock(mutex_)/ReleasableMutexLock lock(\&mutex_)/g' "$file"
+    # Fix ReleasableMutexLock: same pattern
+    sed -i.bak 's/ReleasableMutexLock lock(\([^&)][^)]*\))/ReleasableMutexLock lock(\&\1)/g' "$file"
     
     # Fix lowercase lock/unlock -> Lock/Unlock
     sed -i.bak 's/mutex_\.lock()/mutex_.Lock()/g' "$file"
@@ -50,5 +48,8 @@ patch_file "${RIEGELI_DIR}/riegeli/base/parallelism.cc"
 patch_file "${RIEGELI_DIR}/riegeli/base/recycling_pool.h"
 patch_file "${RIEGELI_DIR}/riegeli/records/record_writer.cc"
 patch_file "${RIEGELI_DIR}/riegeli/bytes/reader_factory.cc"
+patch_file "${RIEGELI_DIR}/riegeli/zstd/zstd_dictionary.cc"
+patch_file "${RIEGELI_DIR}/riegeli/csv/csv_record.cc"
+patch_file "${RIEGELI_DIR}/riegeli/csv/csv_record.h"
 
 echo "Riegeli patched successfully"
