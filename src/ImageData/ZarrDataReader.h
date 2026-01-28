@@ -43,14 +43,6 @@ public:
     bool Initialize();
 
     /**
-     * @brief Read a channel slice of data directly from TensorStore.
-     * @param section The slicer defining the region to read (CARTA coordinates)
-     * @param buffer Output array to fill with data
-     * @return true if read succeeded
-     */
-    bool ReadChannelSlice(casacore::Array<float>& buffer, const casacore::Slicer& section);
-
-    /**
      * @brief Read a slice of data directly from TensorStore.
      * @param section The slicer defining the region to read (CARTA coordinates)
      * @param buffer Output array to fill with data

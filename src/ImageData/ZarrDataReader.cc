@@ -60,30 +60,111 @@ constexpr size_t kColumnBatchMaxDataMiB = 16;
 // Pimpl Implementation Helper
 //-----------------------------------------------------------------------------
 struct ZarrDataReader::Impl {
-    tensorstore::Context context;
     tensorstore::TensorStore<> store;
 
     // Cached .zmetadata
     nlohmann::json zmetadata;
     bool has_zmetadata = false;
 
-    // Create Context
-    void CreateContext() {
-        unsigned int num_cpus = std::thread::hardware_concurrency();
-        if (num_cpus == 0) {
-            num_cpus = kDefaultCpuCount;
+    // Get shared TensorStore context (created once, reused by all instances)
+    // This saves memory (single cache pool) and reduces initialization overhead
+    static tensorstore::Context GetSharedContext() {
+        static tensorstore::Context shared_context = []() {
+            static const unsigned int num_cpus = []() {
+                auto cpu_count = std::thread::hardware_concurrency();
+                return cpu_count ? cpu_count : kDefaultCpuCount;
+            }();
+
+            nlohmann::json context_spec = {{"cache_pool", {{"total_bytes_limit", kDefaultCacheSizeMB * 1024 * 1024}}},
+                {"data_copy_concurrency", {{"limit", num_cpus}}}, {"file_io_concurrency", {{"limit", num_cpus}}}};
+
+            auto context_result = tensorstore::Context::FromJson(context_spec);
+            if (context_result.ok()) {
+                spdlog::info("Created shared TensorStore context with {} CPU cores, {}MB cache", num_cpus, kDefaultCacheSizeMB);
+                return context_result.value();
+            }
+            spdlog::warn("Failed to create custom context, using default");
+            return tensorstore::Context::Default();
+        }();
+        return shared_context;
+    }
+
+    // Early dimension validation before creating expensive TensorStore context
+    // Returns: 0 = success/skip, -1 = failed (wrong dimension)
+    static int ValidateEarlyDimension(const std::string& array_path) {
+        std::filesystem::path zarray_path = std::filesystem::path(array_path) / ".zarray";
+        if (!std::filesystem::exists(zarray_path)) {
+            return 0; // Skip check if file doesn't exist
         }
+        try {
+            std::ifstream zarray_file(zarray_path);
+            nlohmann::json zarray;
+            zarray_file >> zarray;
+            if (zarray.contains("shape")) {
+                size_t ndim = zarray["shape"].size();
+                if (ndim != kDimSize5D) {
+                    spdlog::error("XRADIO schema requires 5D array, got {}D (early check)", ndim);
+                    return -1;
+                }
+            }
+        } catch (const std::exception& ex) {
+            spdlog::debug("Early dimension check skipped: {}", ex.what());
+        }
+        return 0;
+    }
 
-        nlohmann::json context_spec = {{"cache_pool", {{"total_bytes_limit", kDefaultCacheSizeMB * 1024 * 1024}}},
-            {"data_copy_concurrency", {{"limit", num_cpus}}}, {"file_io_concurrency", {{"limit", num_cpus}}}};
+    // Load .zmetadata file if present
+    bool LoadZmetadata(const std::string& filename) {
+        std::filesystem::path zmetadata_path = std::filesystem::path(filename) / ".zmetadata";
+        if (!std::filesystem::exists(zmetadata_path)) {
+            return false;
+        }
+        try {
+            std::ifstream file(zmetadata_path);
+            file >> zmetadata;
+            has_zmetadata = true;
+            spdlog::info("Loaded .zmetadata from {}", filename);
+            return true;
+        } catch (const std::exception& ex) {
+            spdlog::warn("Failed to parse .zmetadata: {}", ex.what());
+            has_zmetadata = false;
+            return false;
+        }
+    }
 
-        auto context_result = tensorstore::Context::FromJson(context_spec);
-        if (context_result.ok()) {
-            context = context_result.value();
-            spdlog::debug("Created TensorStore context with {} CPU cores", num_cpus);
-        } else {
-            spdlog::warn("Failed to create custom context: {}", context_result.status().ToString());
-            context = tensorstore::Context::Default();
+    // Validate _ARRAY_DIMENSIONS attribute
+    void ValidateArrayDimensions(const std::string& fallback_zattrs_str) {
+        try {
+            nlohmann::json zattrs;
+            if (has_zmetadata) {
+                // Direct access from cached metadata - no string serialization/parsing overhead
+                std::string key = "SKY/.zattrs";
+                if (zmetadata.contains("metadata") && zmetadata["metadata"].contains(key)) {
+                    zattrs = zmetadata["metadata"][key];
+                }
+            } else if (!fallback_zattrs_str.empty() && fallback_zattrs_str != "{}") {
+                zattrs = nlohmann::json::parse(fallback_zattrs_str);
+            }
+
+            if (zattrs.empty() || !zattrs.contains("_ARRAY_DIMENSIONS")) {
+                return;
+            }
+
+            std::vector<std::string> dims = zattrs["_ARRAY_DIMENSIONS"].get<std::vector<std::string>>();
+            if (dims.size() != kDimSize5D) {
+                return;
+            }
+
+            // Check for deviations from standard XRADIO order [time, freq, pol, l, m]
+            bool standard_order = (dims[0] == "time") && (dims[1] == "frequency") && (dims[2] == "polarization") &&
+                                  (dims[3] == "l" || dims[3] == "u") && (dims[4] == "m" || dims[4] == "v");
+            if (!standard_order) {
+                spdlog::warn("Effectively assuming [t, f, p, l, m] but _ARRAY_DIMENSIONS are: {}", fmt::join(dims, ", "));
+            }
+        } catch (const std::exception& ex) {
+            spdlog::debug("_ARRAY_DIMENSIONS validation skipped: {}", ex.what());
+        } catch (...) {
+            spdlog::debug("_ARRAY_DIMENSIONS validation skipped: unknown error");
         }
     }
 
@@ -169,21 +250,13 @@ bool ZarrDataReader::Initialize() {
             return false;
         }
 
-        // Try to read .zmetadata
-        std::filesystem::path zmetadata_path = std::filesystem::path(_filename) / ".zmetadata";
-        if (std::filesystem::exists(zmetadata_path)) {
-            try {
-                std::ifstream file(zmetadata_path);
-                file >> _impl->zmetadata;
-                _impl->has_zmetadata = true;
-                spdlog::info("Loaded .zmetadata from {}", _filename);
-            } catch (const std::exception& e) {
-                spdlog::warn("Failed to parse .zmetadata: {}", e.what());
-                _impl->has_zmetadata = false;
-            }
+        // Early dimension check before creating expensive TensorStore context
+        if (Impl::ValidateEarlyDimension(array_path) < 0) {
+            return false;
         }
 
-        _impl->CreateContext();
+        // Try to read .zmetadata
+        _impl->LoadZmetadata(_filename);
 
         nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", array_path}}}};
 
@@ -193,8 +266,9 @@ bool ZarrDataReader::Initialize() {
             return false;
         }
 
+        // Use shared context for all ZarrDataReader instances (saves memory and init time)
         auto open_future =
-            tensorstore::Open(spec_result.value(), _impl->context, tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
+            tensorstore::Open(spec_result.value(), Impl::GetSharedContext(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
 
         auto open_result = open_future.result();
         if (!open_result.ok()) {
@@ -207,37 +281,19 @@ bool ZarrDataReader::Initialize() {
         auto domain = _impl->store.domain();
         auto ts_shape = domain.shape();
 
+        // Pre-allocate vector for original shape
         std::vector<int> orig_shape_vec;
+        orig_shape_vec.reserve(ts_shape.size());
         for (size_t i = 0; i < ts_shape.size(); ++i) {
             orig_shape_vec.push_back(static_cast<int>(ts_shape[i]));
         }
         _original_shape = casacore::IPosition(orig_shape_vec);
 
-        // Validate _ARRAY_DIMENSIONS if present
-        try {
-            // Read .zattrs manually to check _ARRAY_DIMENSIONS
-            // (tensorstore might expose it via Schema but simple JSON read is reliable)
-            std::string zattrs_str = GetZattrsString("");
-            if (!zattrs_str.empty() && zattrs_str != "{}") {
-                nlohmann::json zattrs = nlohmann::json::parse(zattrs_str);
-                if (zattrs.contains("_ARRAY_DIMENSIONS")) {
-                    std::vector<std::string> dims = zattrs["_ARRAY_DIMENSIONS"].get<std::vector<std::string>>();
-                    if (dims.size() == 5) {
-                        // Check for deviations from standard XRADIO order [time, freq, pol, l, m]
-                        // Note: names might vary slightly, but we expect l, m at end
-                        bool standard_order =
-                            (dims[3] == "l" || dims[3] == "u" || dims[3] == "X") && (dims[4] == "m" || dims[4] == "v" || dims[4] == "Y");
-                        if (!standard_order) {
-                            spdlog::warn("Effectively assuming [t, f, p, l, m] but _ARRAY_DIMENSIONS are: {}", fmt::join(dims, ", "));
-                        }
-                    }
-                }
-            }
-        } catch (...) {
-            // Ignore metadata read errors during init, handled elsewhere or non-critical
-        }
+        // Validate _ARRAY_DIMENSIONS if present (uses cached zmetadata if available)
+        std::string fallback_zattrs = _impl->has_zmetadata ? "" : GetZattrsString("");
+        _impl->ValidateArrayDimensions(fallback_zattrs);
 
-        // XRADIO schema: always 5D [T, F, S, L, M]
+        // XRADIO schema: always 5D [T, F, P, L, M]
         if (ts_shape.size() != kDimSize5D) {
             spdlog::error("XRADIO schema requires 5D array, got {}D", ts_shape.size());
             return false;
@@ -246,11 +302,13 @@ bool ZarrDataReader::Initialize() {
         // Map to CARTA shape [X, Y, F, S]
         // L (index 3) is the horizontal axis -> X
         // M (index 4) is the vertical axis -> Y
+        // Pre-allocate with exact size needed
         std::vector<int> carta_shape;
+        carta_shape.reserve(4);
         carta_shape.push_back(orig_shape_vec[3]); // L -> X
         carta_shape.push_back(orig_shape_vec[4]); // M -> Y
-        carta_shape.push_back(orig_shape_vec[1]); // F
-        carta_shape.push_back(orig_shape_vec[2]); // S
+        carta_shape.push_back(orig_shape_vec[1]); // F -> F
+        carta_shape.push_back(orig_shape_vec[2]); // P -> S
         _shape = casacore::IPosition(carta_shape);
 
         auto chunk_layout_result = _impl->store.chunk_layout();
@@ -259,8 +317,8 @@ bool ZarrDataReader::Initialize() {
             if (!read_chunk_shape.empty()) {
                 std::vector<int> chunk_shape_vec;
                 chunk_shape_vec.reserve(read_chunk_shape.size());
-                for (auto size : read_chunk_shape) {
-                    chunk_shape_vec.push_back(static_cast<int>(size));
+                for (auto chunk_dim_size : read_chunk_shape) {
+                    chunk_shape_vec.push_back(static_cast<int>(chunk_dim_size));
                 }
                 _chunk_shape = casacore::IPosition(chunk_shape_vec);
                 spdlog::debug("ZarrDataReader chunk shape (read): {}", _chunk_shape.toString());
