@@ -51,37 +51,6 @@ public:
     bool ReadChannelSlice(casacore::Array<float>& buffer, const casacore::Slicer& section);
 
     /**
-     * @brief Read a channel slice of data directly from TensorStore.
-     * @param section The slicer defining the region to read (CARTA coordinates)
-     * @param buffer Output array to fill with data
-     * @return true if read succeeded
-     */
-    bool ReadChannelSliceV2(casacore::Array<float>& buffer, const casacore::Slicer& section);
-
-    /**
-     * @brief Read a channel slice using C-order read + OpenMP blocked transpose.
-     * @param section The slicer defining the region to read (CARTA coordinates)
-     * @param buffer Output array to fill with data
-     * @return true if read succeeded
-     */
-    bool ReadChannelSliceV3(casacore::Array<float>& buffer, const casacore::Slicer& section);
-
-    /**
-     * @brief Read a channel slice optimized for C-order (row-major) output.
-     * 
-     * This method reads data in row batches aligned with Zarr chunk boundaries
-     * in the M (Y) dimension. Unlike ReadChannelSliceV2 which outputs Fortran-order
-     * (column-major) data, this outputs C-order data where each row is contiguous
-     * in memory. This is more efficient when downstream consumers expect row-major
-     * layout or when the data will be processed row by row.
-     * 
-     * @param section The slicer defining the region to read (CARTA coordinates)
-     * @param buffer Output array to fill with data in C-order [height][width]
-     * @return true if read succeeded
-     */
-    bool ReadChannelSliceV4(casacore::Array<float>& buffer, const casacore::Slicer& section);
-
-    /**
      * @brief Read a slice of data directly from TensorStore.
      * @param section The slicer defining the region to read (CARTA coordinates)
      * @param buffer Output array to fill with data
