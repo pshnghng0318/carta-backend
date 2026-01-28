@@ -1,33 +1,48 @@
 #!/bin/bash
-# Patch Riegeli background_cleaning.cc for newer Abseil API compatibility
+# Patch Riegeli for newer Abseil API compatibility
 # Fixes:
 #   1. absl::MutexLock expects Mutex* not Mutex&
-#   2. mutex_.lock()/unlock() should be Lock()/Unlock()
+#   2. absl::ReleasableMutexLock expects Mutex* not Mutex&
+#   3. mutex_.lock()/unlock() should be Lock()/Unlock()
 
 RIEGELI_DIR="$1"
-TARGET_FILE="${RIEGELI_DIR}/riegeli/base/background_cleaning.cc"
 
-if [ ! -f "$TARGET_FILE" ]; then
-    echo "Riegeli background_cleaning.cc not found at: $TARGET_FILE"
+patch_file() {
+    local file="$1"
+    if [ ! -f "$file" ]; then
+        return
+    fi
+    
+    # Check if already patched
+    if grep -q "MutexLock lock(&mutex_)" "$file"; then
+        return
+    fi
+    
+    echo "Patching $(basename "$file")..."
+    
+    # Fix MutexLock: mutex_ -> &mutex_
+    sed -i.bak 's/MutexLock lock(mutex_)/MutexLock lock(\&mutex_)/g' "$file"
+    
+    # Fix ReleasableMutexLock: mutex_ -> &mutex_
+    sed -i.bak 's/ReleasableMutexLock lock(mutex_)/ReleasableMutexLock lock(\&mutex_)/g' "$file"
+    
+    # Fix lowercase lock/unlock -> Lock/Unlock
+    sed -i.bak 's/mutex_\.lock()/mutex_.Lock()/g' "$file"
+    sed -i.bak 's/mutex_\.unlock()/mutex_.Unlock()/g' "$file"
+    
+    # Clean up backup files
+    rm -f "${file}.bak"
+}
+
+if [ ! -d "${RIEGELI_DIR}/riegeli" ]; then
+    echo "Riegeli directory not found at: $RIEGELI_DIR"
     exit 0
 fi
 
-# Check if already patched
-if grep -q "MutexLock lock(&mutex_)" "$TARGET_FILE"; then
-    echo "Riegeli already patched"
-    exit 0
-fi
+echo "Patching Riegeli for Abseil compatibility..."
 
-echo "Patching Riegeli background_cleaning.cc for Abseil compatibility..."
-
-# Fix MutexLock: mutex_ -> &mutex_
-sed -i.bak 's/MutexLock lock(mutex_)/MutexLock lock(\&mutex_)/g' "$TARGET_FILE"
-
-# Fix lowercase lock/unlock -> Lock/Unlock
-sed -i.bak 's/mutex_\.lock()/mutex_.Lock()/g' "$TARGET_FILE"
-sed -i.bak 's/mutex_\.unlock()/mutex_.Unlock()/g' "$TARGET_FILE"
-
-# Clean up backup files
-rm -f "${TARGET_FILE}.bak"
+# Patch all files that use MutexLock with mutex_
+patch_file "${RIEGELI_DIR}/riegeli/base/background_cleaning.cc"
+patch_file "${RIEGELI_DIR}/riegeli/base/parallelism.cc"
 
 echo "Riegeli patched successfully"
