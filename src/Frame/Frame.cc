@@ -1569,8 +1569,6 @@ bool Frame::FillSpectralProfileData(std::function<void(CARTA::SpectralProfileDat
                         cb(partial_data);
                     }
                 }
-
-                spdlog::performance("Fill cursor spectral profile in {:.3f} ms", t.Elapsed().ms());
                 continue;
             }
 
