@@ -1,5 +1,0 @@
-cc_library(
-    name = "tiff",
-    linkopts = ["-ltiff"],
-    visibility = ["//visibility:public"],
-)

@@ -1,2 +1,0 @@
-include grpc_version.py
-include python_version.py

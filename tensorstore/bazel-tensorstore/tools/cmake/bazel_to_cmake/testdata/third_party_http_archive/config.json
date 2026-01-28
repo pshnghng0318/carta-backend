@@ -1,5 +1,0 @@
-{
-    "modules": [
-        ".bzl_library.third_party_http_archive"
-    ]
-}

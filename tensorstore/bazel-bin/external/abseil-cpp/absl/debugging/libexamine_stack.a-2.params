@@ -1,6 +1,0 @@
--D
--no_warning_for_no_symbols
--static
--o
-bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/debugging/libexamine_stack.a
-bazel-out/darwin_arm64-opt/bin/external/abseil-cpp/absl/debugging/_objs/examine_stack/examine_stack.o

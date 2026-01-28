@@ -1,9 +1,0 @@
--D
--no_warning_for_no_symbols
--static
--o
-bazel-out/darwin_arm64-opt/bin/external/org_blosc_cblosc/libblosc.a
-bazel-out/darwin_arm64-opt/bin/external/org_blosc_cblosc/_objs/blosc/blosc.o
-bazel-out/darwin_arm64-opt/bin/external/org_blosc_cblosc/_objs/blosc/blosclz.o
-bazel-out/darwin_arm64-opt/bin/external/org_blosc_cblosc/_objs/blosc/fastcopy.o
-bazel-out/darwin_arm64-opt/bin/external/org_blosc_cblosc/_objs/blosc/shuffle.o

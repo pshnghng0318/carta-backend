@@ -1,6 +1,0 @@
--D
--no_warning_for_no_symbols
--static
--o
-bazel-out/darwin_arm64-opt/bin/tensorstore/libopen_options.a
-bazel-out/darwin_arm64-opt/bin/tensorstore/_objs/open_options/open_options.o

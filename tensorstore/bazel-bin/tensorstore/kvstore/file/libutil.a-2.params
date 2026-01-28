@@ -1,6 +1,0 @@
--D
--no_warning_for_no_symbols
--static
--o
-bazel-out/darwin_arm64-opt/bin/tensorstore/kvstore/file/libutil.a
-bazel-out/darwin_arm64-opt/bin/tensorstore/kvstore/file/_objs/util/util.o

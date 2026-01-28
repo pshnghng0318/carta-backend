@@ -1,5 +1,0 @@
-cc_library(
-    name = "png",
-    linkopts = ["-lpng"],
-    visibility = ["//visibility:public"],
-)

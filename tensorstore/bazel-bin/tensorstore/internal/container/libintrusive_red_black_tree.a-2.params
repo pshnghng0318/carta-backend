@@ -1,6 +1,0 @@
--D
--no_warning_for_no_symbols
--static
--o
-bazel-out/darwin_arm64-opt/bin/tensorstore/internal/container/libintrusive_red_black_tree.a
-bazel-out/darwin_arm64-opt/bin/tensorstore/internal/container/_objs/intrusive_red_black_tree/intrusive_red_black_tree.o

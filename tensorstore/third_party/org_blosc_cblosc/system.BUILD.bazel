@@ -1,5 +1,0 @@
-cc_library(
-    name = "blosc",
-    linkopts = ["-lblosc"],
-    visibility = ["//visibility:public"],
-)
