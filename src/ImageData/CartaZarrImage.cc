@@ -172,7 +172,14 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
     int bitpix = kBitpixFloat32;
     safe_exec([&]() {
         // TODO: currently XRADIO only supports float32 and float64
-        nlohmann::json zarray = nlohmann::json::parse(_reader->GetZarrayString("SKY"));
+        nlohmann::json zarray;
+        for (const auto& key : {"SKY", "APERTURE"}) {
+            try {
+                zarray = nlohmann::json::parse(_reader->GetZarrayString(key));
+                break;
+            } catch (...) {
+            }
+        }
         const auto* dtype = get_ptr(zarray, "/dtype");
         if (dtype && dtype->is_string()) {
             std::string dtype_str = dtype->get<std::string>();
@@ -196,7 +203,7 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         }
     }
 
-    // 3. Direction Information (.zattrs)
+    // 3. Direction Information
     {
         nlohmann::json zattrs;
         bool zattrs_valid = false;
@@ -307,29 +314,97 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         }
     }
 
-    // 4. Direction Increments
+    // 4. Spatial Axis Increments (l/m for sky images, u/v for UV images)
     safe_exec([&]() {
         std::vector<double> l_arr = _reader->ReadVector("l");
         std::vector<double> m_arr = _reader->ReadVector("m");
-        if (l_arr.size() > 1) {
-            double cdelt1_rad = l_arr[1] - l_arr[0];
-            add_double_header("CDELT1", cdelt1_rad * kRadToDeg);
-            if (cdelt1_rad != 0.0) {
-                add_double_header("CRPIX1", (-l_arr[0] / cdelt1_rad) + 1.0); // +1 for FITS 1-indexed
+        if (!l_arr.empty() && !m_arr.empty()) {
+            // Sky image with l/m coordinates
+            if (l_arr.size() > 1) {
+                double cdelt1_rad = l_arr[1] - l_arr[0];
+                add_double_header("CDELT1", cdelt1_rad * kRadToDeg);
+                if (cdelt1_rad != 0.0) {
+                    add_double_header("CRPIX1", (-l_arr[0] / cdelt1_rad) + 1.0); // +1 for FITS 1-indexed
+                }
+            }
+            if (m_arr.size() > 1) {
+                double cdelt2_rad = m_arr[1] - m_arr[0];
+                add_double_header("CDELT2", cdelt2_rad * kRadToDeg);
+                if (cdelt2_rad != 0.0) {
+                    add_double_header("CRPIX2", (-m_arr[0] / cdelt2_rad) + 1.0); // +1 for FITS 1-indexed
+                }
+            }
+            add_string_header("CUNIT1", "deg");
+            add_string_header("CUNIT2", "deg");
+        } else {
+            // Try UV image with u/v coordinates
+            std::vector<double> u_arr = _reader->ReadVector("u");
+            std::vector<double> v_arr = _reader->ReadVector("v");
+            if (!u_arr.empty() || !v_arr.empty()) {
+                nlohmann::json u_zattrs;
+                nlohmann::json v_zattrs;
+                try {
+                    u_zattrs = nlohmann::json::parse(_reader->GetZattrsString("u"));
+                } catch (...) {
+                }
+                try {
+                    v_zattrs = nlohmann::json::parse(_reader->GetZattrsString("v"));
+                } catch (...) {
+                }
+
+                // CTYPE for UV coordinates
+                add_string_header("CTYPE1", "UU");
+                add_string_header("CTYPE2", "VV");
+
+                // U axis
+                const auto* u_cdelt_ptr = get_ptr(u_zattrs, "/cdelt");
+                const auto* u_crval_ptr = get_ptr(u_zattrs, "/crval");
+                const auto* u_units = get_ptr(u_zattrs, "/units");
+                double u_cdelt;
+                if (u_cdelt_ptr && u_cdelt_ptr->is_number()) {
+                    u_cdelt = u_cdelt_ptr->get<double>();
+                } else if (u_arr.size() > 1) {
+                    u_cdelt = u_arr[1] - u_arr[0];
+                } else {
+                    u_cdelt = 1.0;
+                }
+                double u_crval = (u_crval_ptr && u_crval_ptr->is_number()) ? u_crval_ptr->get<double>() : 0.0;
+                add_double_header("CDELT1", u_cdelt);
+                add_double_header("CRVAL1", u_crval);
+                if (u_cdelt != 0.0 && !u_arr.empty()) {
+                    add_double_header("CRPIX1", (-(u_arr[0] - u_crval) / u_cdelt) + 1.0); // +1 for FITS 1-indexed
+                }
+                if (u_units && u_units->is_string()) {
+                    add_string_header("CUNIT1", u_units->get<std::string>());
+                }
+
+                // V axis
+                const auto* v_cdelt_ptr = get_ptr(v_zattrs, "/cdelt");
+                const auto* v_crval_ptr = get_ptr(v_zattrs, "/crval");
+                const auto* v_units = get_ptr(v_zattrs, "/units");
+                double v_cdelt;
+                if (v_cdelt_ptr && v_cdelt_ptr->is_number()) {
+                    v_cdelt = v_cdelt_ptr->get<double>();
+                } else if (v_arr.size() > 1) {
+                    v_cdelt = v_arr[1] - v_arr[0];
+                } else {
+                    v_cdelt = 1.0;
+                }
+                double v_crval = (v_crval_ptr && v_crval_ptr->is_number()) ? v_crval_ptr->get<double>() : 0.0;
+                add_double_header("CDELT2", v_cdelt);
+                add_double_header("CRVAL2", v_crval);
+                if (v_cdelt != 0.0 && !v_arr.empty()) {
+                    add_double_header("CRPIX2", (-(v_arr[0] - v_crval) / v_cdelt) + 1.0); // +1 for FITS 1-indexed
+                }
+                if (v_units && v_units->is_string()) {
+                    add_string_header("CUNIT2", v_units->get<std::string>());
+                }
             }
         }
-        if (m_arr.size() > 1) {
-            double cdelt2_rad = m_arr[1] - m_arr[0];
-            add_double_header("CDELT2", cdelt2_rad * kRadToDeg);
-            if (cdelt2_rad != 0.0) {
-                add_double_header("CRPIX2", (-m_arr[0] / cdelt2_rad) + 1.0); // +1 for FITS 1-indexed
-            }
-        }
-        add_string_header("CUNIT1", "deg");
-        add_string_header("CUNIT2", "deg");
-    }, "Direction Increments");
+    }, "Spatial Axis Increments");
 
     // 5. Spectral Axis
+    std::string specsys_value; // Shared for VELREF calculation in Section 8
     safe_exec([&]() {
         std::vector<double> freq_arr = _reader->ReadVector("frequency");
         nlohmann::json zattrs = nlohmann::json::parse(_reader->GetZattrsString("frequency"));
@@ -359,9 +434,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 }
                 const auto* observer = get_ptr(*ref_attrs, "/observer");
                 if (observer && observer->is_string()) {
-                    std::string specsys = observer->get<std::string>();
-                    to_upper_ascii(specsys);
-                    add_string_header("SPECSYS", specsys);
+                    specsys_value = observer->get<std::string>();
+                    to_upper_ascii(specsys_value);
+                    add_string_header("SPECSYS", specsys_value);
                 }
             } else {
                 // No frequency axis or simple units
@@ -371,9 +446,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 }
                 const auto* frame = get_ptr(zattrs, "/frame");
                 if (frame && frame->is_string()) {
-                    std::string specsys = frame->get<std::string>();
-                    to_upper_ascii(specsys);
-                    add_string_header("SPECSYS", specsys);
+                    specsys_value = frame->get<std::string>();
+                    to_upper_ascii(specsys_value);
+                    add_string_header("SPECSYS", specsys_value);
                 }
             }
             
@@ -422,11 +497,16 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
     {
         nlohmann::json zattrs_sky;
         bool zattrs_sky_valid = false;
-        try {
-            zattrs_sky = nlohmann::json::parse(_reader->GetZattrsString("SKY"));
-            zattrs_sky_valid = true;
-        } catch (...) {
-            spdlog::warn("Error parsing SKY zattrs");
+        for (const auto& key : {"SKY", "APERTURE"}) {
+            try {
+                zattrs_sky = nlohmann::json::parse(_reader->GetZattrsString(key));
+                zattrs_sky_valid = true;
+                break;
+            } catch (...) {
+            }
+        }
+        if (!zattrs_sky_valid) {
+            spdlog::warn("Error parsing SKY or APERTURE zattrs");
         }
 
         if (zattrs_sky_valid) {
@@ -522,7 +602,62 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         }
     }
 
-    // 8. Beam Parameters
+    // 8. Velocity (VELREF from doppler_type + SPECSYS)
+    safe_exec([&]() {
+        nlohmann::json vel_zattrs;
+        try {
+            vel_zattrs = nlohmann::json::parse(_reader->GetZattrsString("velocity"));
+        } catch (...) {
+            return; // No velocity metadata
+        }
+
+        const auto* doppler_type = get_ptr(vel_zattrs, "/doppler_type");
+        if (!doppler_type || !doppler_type->is_string()) {
+            return;
+        }
+
+        std::string doppler_str = doppler_type->get<std::string>();
+        to_upper_ascii(doppler_str);
+
+        // AIPS VELREF convention: add 256 for radio velocity (VRAD), 0 for optical velocity (VOPT)
+        int velocity_flag = 0;
+        if (doppler_str == "RADIO") {
+            velocity_flag = 256;
+        }
+
+        // AIPS-convention VELREF frame codes:
+        // 1: LSR kinematic (originally "LSR")
+        // 2: Barycentric (originally "HEL"/heliocentric)
+        // 3: Topocentric (originally "OBS"/geocentric but widely interpreted as topocentric)
+        // AIPS++ extensions:
+        // 4: LSR dynamic
+        // 5: Geocentric
+        // 6: Source rest frame
+        // 7: Galactocentric
+        int frame_code = 0; // Default: undefined
+        if (specsys_value == "LSRK" || specsys_value == "LSR") {
+            frame_code = 1;
+        } else if (specsys_value == "BARYCENT" || specsys_value == "HELIOCENT" || specsys_value == "BARY" || specsys_value == "HELIO") {
+            frame_code = 2;
+        } else if (specsys_value == "TOPOCENT" || specsys_value == "TOPO") {
+            frame_code = 3;
+        } else if (specsys_value == "LSRD") {
+            frame_code = 4;
+        } else if (specsys_value == "GEOCENT" || specsys_value == "GEO") {
+            frame_code = 5;
+        } else if (specsys_value == "SOURCE" || specsys_value == "REST") {
+            frame_code = 6;
+        } else if (specsys_value == "GALACTOC" || specsys_value == "GALCEN") {
+            frame_code = 7;
+        }
+
+        // Output VELREF: frame_code + velocity_flag
+        // VELREF = 0 or 256 is valid (optical/radio without specifying frame)
+        int velref = frame_code + velocity_flag;
+        add_int_header("VELREF", velref);
+    }, "Velocity");
+
+    // 9. Beam Parameters
     safe_exec([&]() {
         std::vector<double> beam_data = _reader->ReadFlattenedVector("BEAM");
         if (beam_data.size() >= 3) {
