@@ -39,7 +39,6 @@ public:
     casacore::String name(casacore::Bool stripPath = false) const override;
     casacore::IPosition shape() const override;
     casacore::Bool ok() const override;
-    casacore::DataType dataType() const override;
 
     casacore::Bool doGetSlice(casacore::Array<float>& buffer, const casacore::Slicer& section) override;
     void doPutSlice(const casacore::Array<float>& buffer, const casacore::IPosition& where, const casacore::IPosition& stride) override;

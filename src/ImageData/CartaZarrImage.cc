@@ -52,7 +52,7 @@ CartaZarrImage::CartaZarrImage(const std::string& filename)
 
 CartaZarrImage::CartaZarrImage(const CartaZarrImage& other)
     : ImageInterface<float>(other),
-      _reader(other._reader), // Share reader!
+      _reader(other._reader),
       _shape(other._shape),
       _name(other._name),
       _tiled_shape(other._tiled_shape),
@@ -88,10 +88,6 @@ IPosition CartaZarrImage::shape() const {
 
 Bool CartaZarrImage::ok() const {
     return _reader && _reader->IsInitialized();
-}
-
-DataType CartaZarrImage::dataType() const {
-    return TpFloat;
 }
 
 Vector<String> CartaZarrImage::FitsHeaderStrings() {

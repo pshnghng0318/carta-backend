@@ -31,8 +31,6 @@ public:
     ~ZarrLoader() override = default;
 
     // FileLoader interface
-    bool HasData(FileInfo::Data data_type) const override;
-    bool HasMip(int mip_level) const override;
     bool UseTileCache() const override;
     
     // Tile/chunk access for TileCache integration
@@ -52,14 +50,6 @@ public:
         std::map<CARTA::StatsType, std::vector<double>>& results, float& progress,
         std::function<bool()> cancellation_check = nullptr) override;
     void ClearRegionSpectralCache(int region_id) override;
-
-    // Spatial profile methods required by Frame.cc for ZARR optimization
-    bool GetSpatialProfileX(std::vector<float>& profile, int start_x, int end_x, 
-                            int cursor_y, int channel, int stokes, 
-                            std::mutex& image_mutex);
-    bool GetSpatialProfileY(std::vector<float>& profile, int cursor_x, 
-                            int start_y, int end_y, int channel, int stokes, 
-                            std::mutex& image_mutex);
 
 private:
     void AllocateImage(const std::string& hdu) override;
