@@ -9,6 +9,7 @@
 // Standard library includes MUST come before TensorStore to ensure types are defined
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
@@ -65,6 +66,13 @@ struct ZarrDataReader::Impl {
     // Cached .zmetadata
     nlohmann::json zmetadata;
     bool has_zmetadata = false;
+
+    // Cached mask store for efficient repeated mask reads
+    // Note: Mask may be stored as int8 (0/1) or bool, so we use dynamic type
+    tensorstore::TensorStore<int8_t> mask_store;
+    bool mask_store_checked = false;  // True after first check (avoid repeated filesystem lookups)
+    bool has_mask_store = false;      // True if mask_store is valid and ready
+    std::string cached_mask_path;     // Cached active mask path
 
     // Get shared TensorStore context (created once, reused by all instances)
     // This saves memory (single cache pool) and reduces initialization overhead
@@ -428,6 +436,73 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
         }
 
         x_offset += batch_width;
+    }
+
+    // Apply mask if present: convert masked pixels to NaN
+    if (EnsureMaskStore()) {
+        // Read mask using cached mask store (same slicing logic as data)
+        try {
+            const size_t num_elements = buffer.nelements();
+
+            // Create slice using cached mask store: XRADIO 5D [T, F, P, L, M] -> CARTA 4D [X, Y, F, S]
+            auto mask_slice_result = _impl->mask_store | tensorstore::Dims(0).IndexSlice(time_idx) |
+                                tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F
+                                | tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) // P
+                                | tensorstore::Dims(2).ClosedInterval(start[0], stop[0]) // L (X)
+                                | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]); // M (Y)
+
+            if (!mask_slice_result.ok()) {
+                spdlog::warn("ReadSlice: Mask slice failed, returning unmasked data: {}", mask_slice_result.status().ToString());
+                return true;
+            }
+
+            // Transpose [F, P, L, M] -> [L, M, F, P] (CARTA order)
+            auto mask_reorder_result = std::move(mask_slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+            if (!mask_reorder_result.ok()) {
+                spdlog::warn("ReadSlice: Mask reorder failed, returning unmasked data: {}", mask_reorder_result.status().ToString());
+                return true;
+            }
+
+            // Read mask as int8 (mask is stored as int8 with 0/1 values)
+            std::vector<int8_t> mask_buffer(num_elements);
+            int8_t* mask_dst_ptr = mask_buffer.data();
+
+            std::array<tensorstore::Index, 4> mask_shape = {
+                static_cast<tensorstore::Index>(width_x),
+                static_cast<tensorstore::Index>(height_y),
+                static_cast<tensorstore::Index>(num_freq),
+                static_cast<tensorstore::Index>(num_stokes)};
+
+            std::array<tensorstore::Index, 4> mask_byte_strides = {
+                static_cast<tensorstore::Index>(sizeof(int8_t)),
+                static_cast<tensorstore::Index>(width_x * sizeof(int8_t)),
+                static_cast<tensorstore::Index>(width_x * height_y * sizeof(int8_t)),
+                static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(int8_t))};
+
+            tensorstore::StridedLayout<4> mask_layout(mask_shape, mask_byte_strides);
+            tensorstore::ArrayView<int8_t, 4> mask_view(mask_dst_ptr, mask_layout);
+            auto mask_array = tensorstore::UnownedToShared(mask_view);
+
+            auto mask_read_status = tensorstore::Read(mask_reorder_result.value(), mask_array).result();
+            if (!mask_read_status.ok()) {
+                spdlog::warn("ReadSlice: Mask read failed, returning unmasked data: {}", mask_read_status.status().ToString());
+                return true;
+            }
+
+            // Apply mask: set masked pixels (mask == 1) to NaN
+            float* data_ptr = buffer.data();
+
+            for (size_t i = 0; i < num_elements; ++i) {
+                if (mask_buffer[i] != 0) {
+                    data_ptr[i] = NAN;
+                }
+            }
+
+            spdlog::debug("ReadSlice: Applied mask to {} elements", num_elements);
+
+        } catch (const std::exception& ex) {
+            spdlog::warn("ReadSlice: Exception applying mask, returning unmasked data: {}", ex.what());
+        }
     }
 
     return true;
@@ -964,32 +1039,31 @@ std::string ZarrDataReader::GetActiveMaskPath() const {
     return "";
 }
 
-bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore::Slicer& section) {
-    if (!_initialized) {
-        spdlog::error("ZarrDataReader not initialized");
-        return false;
+bool ZarrDataReader::EnsureMaskStore() {
+    // Already checked - return cached result
+    if (_impl->mask_store_checked) {
+        return _impl->has_mask_store;
     }
 
+    // Mark as checked to avoid repeated filesystem lookups
+    _impl->mask_store_checked = true;
+    _impl->has_mask_store = false;
+
+    // Find active mask path
     std::string mask_path = GetActiveMaskPath();
     if (mask_path.empty()) {
-        // No mask - return all true
-        buffer.resize(section.length());
-        buffer = true;
+        spdlog::debug("EnsureMaskStore: No active mask found");
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(_read_mutex);
-
     try {
-        // Open mask array
+        // Open mask array and cache it
         std::filesystem::path full_mask_path = std::filesystem::path(_filename) / mask_path;
         nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", full_mask_path.string()}}}};
 
         auto spec_result = tensorstore::Spec::FromJson(spec_json);
         if (!spec_result.ok()) {
-            spdlog::error("ReadMaskSlice: Failed to create spec: {}", spec_result.status().ToString());
-            buffer.resize(section.length());
-            buffer = true;
+            spdlog::warn("EnsureMaskStore: Failed to create spec: {}", spec_result.status().ToString());
             return false;
         }
 
@@ -998,48 +1072,70 @@ bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore
 
         auto open_result = open_future.result();
         if (!open_result.ok()) {
-            spdlog::error("ReadMaskSlice: Failed to open mask array: {}", open_result.status().ToString());
-            buffer.resize(section.length());
-            buffer = true;
+            spdlog::warn("EnsureMaskStore: Failed to open mask array: {}", open_result.status().ToString());
             return false;
         }
 
-        auto mask_store = open_result.value();
-
-        // Verify mask has expected 5D shape (same as data)
-        auto domain = mask_store.domain();
+        // Verify mask has expected 5D shape
+        auto domain = open_result.value().domain();
         if (domain.rank() != kDimSize5D) {
-            spdlog::error("ReadMaskSlice: Mask array has unexpected rank {} (expected 5)", domain.rank());
-            buffer.resize(section.length());
-            buffer = true;
+            spdlog::warn("EnsureMaskStore: Mask array has unexpected rank {} (expected 5)", domain.rank());
             return false;
         }
 
+        // Cast to int8_t store and cache (mask is typically stored as int8 with 0/1 values)
+        auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<int8_t>>(open_result.value());
+        if (!typed_store_result.ok()) {
+            spdlog::warn("EnsureMaskStore: Error casting to int8 store: {}", typed_store_result.status().ToString());
+            return false;
+        }
+
+        _impl->mask_store = typed_store_result.value();
+        _impl->cached_mask_path = mask_path;
+        _impl->has_mask_store = true;
+
+        spdlog::info("EnsureMaskStore: Cached mask store for '{}'", mask_path);
+        return true;
+
+    } catch (const std::exception& ex) {
+        spdlog::warn("EnsureMaskStore: Exception: {}", ex.what());
+        return false;
+    }
+}
+
+bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore::Slicer& section) {
+    if (!_initialized) {
+        spdlog::error("ZarrDataReader not initialized");
+        return false;
+    }
+
+    // Use cached mask store via EnsureMaskStore
+    // Note: EnsureMaskStore should be called within the lock to ensure thread safety
+    std::lock_guard<std::mutex> lock(_read_mutex);
+
+    if (!EnsureMaskStore()) {
+        // No mask - return all true
+        buffer.resize(section.length());
+        buffer = true;
+        return false;
+    }
+
+    try {
         const auto& start = section.start();
         const auto& stop = section.end();
         const auto& length = section.length();
-
-        buffer.resize(length);
 
         const int width_x = length[0];
         const int height_y = length[1];
         const int num_freq = length[2];
         const int num_stokes = length[3];
+        const size_t num_elements = static_cast<size_t>(width_x) * height_y * num_freq * num_stokes;
 
         // Time index is always 0
         const tensorstore::Index time_idx = 0;
 
-        // Cast to bool store
-        auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<bool>>(mask_store);
-        if (!typed_store_result.ok()) {
-            spdlog::error("ReadMaskSlice: Error casting to bool store: {}", typed_store_result.status().ToString());
-            buffer.resize(section.length());
-            buffer = true;
-            return false;
-        }
-
-        // Create slice: XRADIO 5D [T, F, P, L, M] -> CARTA 4D [X, Y, F, S]
-        auto slice_result = typed_store_result.value() | tensorstore::Dims(0).IndexSlice(time_idx) |
+        // Create slice using cached mask store: XRADIO 5D [T, F, P, L, M] -> CARTA 4D [X, Y, F, S]
+        auto slice_result = _impl->mask_store | tensorstore::Dims(0).IndexSlice(time_idx) |
                             tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F
                             | tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) // P
                             | tensorstore::Dims(2).ClosedInterval(start[0], stop[0]) // L (X)
@@ -1061,8 +1157,9 @@ bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore
             return false;
         }
 
-        // Prepare output array with Fortran order for casacore
-        bool* dst_ptr = buffer.data();
+        // Read into int8_t buffer first (mask is stored as int8)
+        std::vector<int8_t> int8_buffer(num_elements);
+        int8_t* int8_ptr = int8_buffer.data();
 
         std::array<tensorstore::Index, 4> output_shape = {
             static_cast<tensorstore::Index>(width_x),
@@ -1071,13 +1168,13 @@ bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore
             static_cast<tensorstore::Index>(num_stokes)};
 
         std::array<tensorstore::Index, 4> byte_strides = {
-            static_cast<tensorstore::Index>(sizeof(bool)),
-            static_cast<tensorstore::Index>(width_x * sizeof(bool)),
-            static_cast<tensorstore::Index>(width_x * height_y * sizeof(bool)),
-            static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(bool))};
+            static_cast<tensorstore::Index>(sizeof(int8_t)),
+            static_cast<tensorstore::Index>(width_x * sizeof(int8_t)),
+            static_cast<tensorstore::Index>(width_x * height_y * sizeof(int8_t)),
+            static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(int8_t))};
 
         tensorstore::StridedLayout<4> output_layout(output_shape, byte_strides);
-        tensorstore::ArrayView<bool, 4> output_view(dst_ptr, output_layout);
+        tensorstore::ArrayView<int8_t, 4> output_view(int8_ptr, output_layout);
         auto output_array = tensorstore::UnownedToShared(output_view);
 
         auto read_status = tensorstore::Read(reorder_result.value(), output_array).result();
@@ -1086,6 +1183,13 @@ bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore
             buffer.resize(section.length());
             buffer = true;
             return false;
+        }
+
+        // Convert int8 to bool: zero = true (valid), non-zero = false (masked)
+        buffer.resize(length);
+        bool* bool_ptr = buffer.data();
+        for (size_t i = 0; i < num_elements; ++i) {
+            bool_ptr[i] = (int8_ptr[i] == 0);
         }
 
         spdlog::debug("ReadMaskSlice: Successfully read mask slice with shape {}", length.toString());

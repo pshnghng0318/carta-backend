@@ -156,6 +156,12 @@ private:
      * @brief Find the Zarr array path (handles hierarchical zarr files)
      */
     std::string FindArrayPath() const;
+
+    /**
+     * @brief Ensure mask store is initialized (lazy loading).
+     * @return true if mask store is available and ready, false if no mask exists
+     */
+    bool EnsureMaskStore();
 };
 
 } // namespace carta
