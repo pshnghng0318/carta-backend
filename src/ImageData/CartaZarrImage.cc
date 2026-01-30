@@ -749,30 +749,88 @@ IPosition CartaZarrImage::doNiceCursorShape(uInt maxPixels) const {
 }
 
 // ============================================================================
-// Mask-related methods (ZARR typically doesn't have masks)
+// Mask-related methods
 // ============================================================================
 
+void CartaZarrImage::CheckMask() const {
+    if (_has_mask_checked) {
+        return;
+    }
+    _has_mask_checked = true;
+    _has_mask = _reader && _reader->HasMask();
+    if (_has_mask) {
+        spdlog::debug("CartaZarrImage: Pixel mask detected at '{}'", _reader->GetActiveMaskPath());
+    }
+}
+
 Bool CartaZarrImage::isMasked() const {
-    return false;
+    CheckMask();
+    return _has_mask;
 }
 
 Bool CartaZarrImage::hasPixelMask() const {
-    return false;
+    CheckMask();
+    return _has_mask;
 }
 
 const Lattice<Bool>& CartaZarrImage::pixelMask() const {
-    throw AipsError("CartaZarrImage::pixelMask - no pixel mask");
+    CheckMask();
+    if (!_has_mask) {
+        throw AipsError("CartaZarrImage::pixelMask - no pixel mask");
+    }
+
+    // Lazily construct full pixel mask if not yet created
+    if (!_pixel_mask) {
+        IPosition start(_shape.size(), 0);
+        Slicer slicer(start, _shape);
+        Array<Bool> array_mask;
+        const_cast<CartaZarrImage*>(this)->doGetMaskSlice(array_mask, slicer);
+        _pixel_mask = std::make_unique<ArrayLattice<Bool>>(array_mask);
+    }
+    return *_pixel_mask;
 }
 
 Lattice<Bool>& CartaZarrImage::pixelMask() {
-    throw AipsError("CartaZarrImage::pixelMask - no pixel mask");
+    CheckMask();
+    if (!_has_mask) {
+        throw AipsError("CartaZarrImage::pixelMask - no pixel mask");
+    }
+
+    // Lazily construct full pixel mask if not yet created
+    if (!_pixel_mask) {
+        IPosition start(_shape.size(), 0);
+        Slicer slicer(start, _shape);
+        Array<Bool> array_mask;
+        doGetMaskSlice(array_mask, slicer);
+        _pixel_mask = std::make_unique<ArrayLattice<Bool>>(array_mask);
+    }
+    return *_pixel_mask;
 }
 
 Bool CartaZarrImage::doGetMaskSlice(Array<Bool>& buffer, const Slicer& section) {
-    // Return all true (no mask)
-    buffer.resize(section.length());
-    buffer = true;
-    return false;
+    CheckMask();
+
+    if (!_has_mask) {
+        // No mask - return all true (all pixels valid)
+        buffer.resize(section.length());
+        buffer = true;
+        return false;
+    }
+
+    // If we have a cached full pixel mask, slice from it
+    if (_pixel_mask && !_pixel_mask->shape().empty()) {
+        return _pixel_mask->getSlice(buffer, section);
+    }
+
+    // Read mask slice directly from Zarr
+    if (!_reader || !_reader->ReadMaskSlice(buffer, section)) {
+        // Fallback: return all true if read fails
+        buffer.resize(section.length());
+        buffer = true;
+        return false;
+    }
+
+    return true;
 }
 
 // ============================================================================

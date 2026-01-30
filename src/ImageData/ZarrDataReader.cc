@@ -923,4 +923,180 @@ std::map<std::string, std::string> ZarrDataReader::GetZattrMap(const std::string
     return result;
 }
 
+//-----------------------------------------------------------------------------
+// Mask Support
+//-----------------------------------------------------------------------------
+
+bool ZarrDataReader::HasMask() const {
+    return !GetActiveMaskPath().empty();
+}
+
+std::string ZarrDataReader::GetActiveMaskPath() const {
+    if (!_initialized) {
+        return "";
+    }
+
+    // Check SKY/.zattrs and APERTURE/.zattrs for "active_mask" attribute
+    for (const auto& array_name : {"SKY", "APERTURE"}) {
+        try {
+            std::string zattrs_str = const_cast<ZarrDataReader*>(this)->GetZattrsString(array_name);
+            if (zattrs_str.empty() || zattrs_str == "{}") {
+                continue;
+            }
+
+            nlohmann::json zattrs = nlohmann::json::parse(zattrs_str);
+            if (zattrs.contains("active_mask") && zattrs["active_mask"].is_string()) {
+                std::string mask_path = zattrs["active_mask"].get<std::string>();
+                if (!mask_path.empty()) {
+                    // Verify the mask array exists
+                    std::filesystem::path full_path = std::filesystem::path(_filename) / mask_path;
+                    if (std::filesystem::exists(full_path / ".zarray")) {
+                        spdlog::debug("ZarrDataReader: Found active_mask '{}' in {}", mask_path, array_name);
+                        return mask_path;
+                    }
+                }
+            }
+        } catch (const std::exception& ex) {
+            spdlog::debug("ZarrDataReader: Error checking active_mask in {}: {}", array_name, ex.what());
+        }
+    }
+
+    return "";
+}
+
+bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore::Slicer& section) {
+    if (!_initialized) {
+        spdlog::error("ZarrDataReader not initialized");
+        return false;
+    }
+
+    std::string mask_path = GetActiveMaskPath();
+    if (mask_path.empty()) {
+        // No mask - return all true
+        buffer.resize(section.length());
+        buffer = true;
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(_read_mutex);
+
+    try {
+        // Open mask array
+        std::filesystem::path full_mask_path = std::filesystem::path(_filename) / mask_path;
+        nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", full_mask_path.string()}}}};
+
+        auto spec_result = tensorstore::Spec::FromJson(spec_json);
+        if (!spec_result.ok()) {
+            spdlog::error("ReadMaskSlice: Failed to create spec: {}", spec_result.status().ToString());
+            buffer.resize(section.length());
+            buffer = true;
+            return false;
+        }
+
+        auto open_future = tensorstore::Open(
+            spec_result.value(), Impl::GetSharedContext(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
+
+        auto open_result = open_future.result();
+        if (!open_result.ok()) {
+            spdlog::error("ReadMaskSlice: Failed to open mask array: {}", open_result.status().ToString());
+            buffer.resize(section.length());
+            buffer = true;
+            return false;
+        }
+
+        auto mask_store = open_result.value();
+
+        // Verify mask has expected 5D shape (same as data)
+        auto domain = mask_store.domain();
+        if (domain.rank() != kDimSize5D) {
+            spdlog::error("ReadMaskSlice: Mask array has unexpected rank {} (expected 5)", domain.rank());
+            buffer.resize(section.length());
+            buffer = true;
+            return false;
+        }
+
+        const auto& start = section.start();
+        const auto& stop = section.end();
+        const auto& length = section.length();
+
+        buffer.resize(length);
+
+        const int width_x = length[0];
+        const int height_y = length[1];
+        const int num_freq = length[2];
+        const int num_stokes = length[3];
+
+        // Time index is always 0
+        const tensorstore::Index time_idx = 0;
+
+        // Cast to bool store
+        auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<bool>>(mask_store);
+        if (!typed_store_result.ok()) {
+            spdlog::error("ReadMaskSlice: Error casting to bool store: {}", typed_store_result.status().ToString());
+            buffer.resize(section.length());
+            buffer = true;
+            return false;
+        }
+
+        // Create slice: XRADIO 5D [T, F, P, L, M] -> CARTA 4D [X, Y, F, S]
+        auto slice_result = typed_store_result.value() | tensorstore::Dims(0).IndexSlice(time_idx) |
+                            tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F
+                            | tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) // P
+                            | tensorstore::Dims(2).ClosedInterval(start[0], stop[0]) // L (X)
+                            | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]); // M (Y)
+
+        if (!slice_result.ok()) {
+            spdlog::error("ReadMaskSlice: Slice failed: {}", slice_result.status().ToString());
+            buffer.resize(section.length());
+            buffer = true;
+            return false;
+        }
+
+        // Transpose [F, P, L, M] -> [L, M, F, P] (CARTA order)
+        auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+        if (!reorder_result.ok()) {
+            spdlog::error("ReadMaskSlice: Reorder failed: {}", reorder_result.status().ToString());
+            buffer.resize(section.length());
+            buffer = true;
+            return false;
+        }
+
+        // Prepare output array with Fortran order for casacore
+        bool* dst_ptr = buffer.data();
+
+        std::array<tensorstore::Index, 4> output_shape = {
+            static_cast<tensorstore::Index>(width_x),
+            static_cast<tensorstore::Index>(height_y),
+            static_cast<tensorstore::Index>(num_freq),
+            static_cast<tensorstore::Index>(num_stokes)};
+
+        std::array<tensorstore::Index, 4> byte_strides = {
+            static_cast<tensorstore::Index>(sizeof(bool)),
+            static_cast<tensorstore::Index>(width_x * sizeof(bool)),
+            static_cast<tensorstore::Index>(width_x * height_y * sizeof(bool)),
+            static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(bool))};
+
+        tensorstore::StridedLayout<4> output_layout(output_shape, byte_strides);
+        tensorstore::ArrayView<bool, 4> output_view(dst_ptr, output_layout);
+        auto output_array = tensorstore::UnownedToShared(output_view);
+
+        auto read_status = tensorstore::Read(reorder_result.value(), output_array).result();
+        if (!read_status.ok()) {
+            spdlog::error("ReadMaskSlice: Read failed: {}", read_status.status().ToString());
+            buffer.resize(section.length());
+            buffer = true;
+            return false;
+        }
+
+        spdlog::debug("ReadMaskSlice: Successfully read mask slice with shape {}", length.toString());
+        return true;
+
+    } catch (const std::exception& ex) {
+        spdlog::error("ReadMaskSlice: Exception: {}", ex.what());
+        buffer.resize(section.length());
+        buffer = true;
+        return false;
+    }
+}
+
 } // namespace carta

@@ -85,11 +85,17 @@ private:
     mutable std::mutex _slice_mutex;
     casacore::Vector<casacore::String> _fits_header_strings; // Cached FITS headers
 
+    // Pixel mask support
+    mutable bool _has_mask_checked = false;
+    mutable bool _has_mask = false;
+    mutable std::unique_ptr<casacore::ArrayLattice<casacore::Bool>> _pixel_mask;
+
     // Coordinate system setup
     void SetupCoordinateSystem();
     void CreateDefaultCoordinateSystem();
 
     void SetBeams();
+    void CheckMask() const;
 };
 
 } // namespace carta

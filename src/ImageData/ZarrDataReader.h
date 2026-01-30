@@ -118,6 +118,27 @@ public:
     const std::string& GetFilename() const;
     int NumDimensions() const;
 
+    // Mask support
+    /**
+     * @brief Check if this Zarr file has an active pixel mask.
+     * @return true if "active_mask" attribute exists in SKY/.zattrs or APERTURE/.zattrs
+     */
+    bool HasMask() const;
+
+    /**
+     * @brief Get the path to the active mask array (e.g., "MASK0").
+     * @return Mask array path, or empty string if no mask
+     */
+    std::string GetActiveMaskPath() const;
+
+    /**
+     * @brief Read a slice of the pixel mask.
+     * @param buffer Output array to fill with mask data (true = valid pixel)
+     * @param section The slicer defining the region to read (CARTA coordinates)
+     * @return true if read succeeded
+     */
+    bool ReadMaskSlice(casacore::Array<bool>& buffer, const casacore::Slicer& section);
+
 private:
     struct Impl;
     std::unique_ptr<Impl> _impl;
