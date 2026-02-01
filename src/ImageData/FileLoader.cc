@@ -354,8 +354,8 @@ bool FileLoader::GetSlice(casacore::Array<float>& data, const StokesSlicer& stok
 
         auto image_type = image->imageType();
         spdlog::debug("FileLoader::GetSlice: Image type: {}", image_type);
-        if (image_type == "CartaFitsImage" || image_type == "CartaZarrImage") {
-            // Use cfitsio or tensorstore for slice
+        if (image_type == "CartaFitsImage") {
+            // Use cfitsio for slice
             return image->doGetSlice(data, slicer);
         } else if (image_type == "ImageExpr") {
             // Use ImageExpr for slice
