@@ -12,9 +12,9 @@
 #include <casacore/casa/OS/File.h>
 #include <casacore/casa/Quanta/UnitMap.h>
 
+#include <spdlog/fmt/fmt.h>
+
 #include "ImageData/CartaMiriadImage.h"
-#include "Logger/Logger.h"
-#include "String.h"
 
 const std::regex GILDAS_REGEX(" *[a-zA-Z]+[ .]+\\(T[a-zA-Z_]+[*.]*\\) *");
 
@@ -281,24 +281,52 @@ bool IsGildasUnit(const casacore::String& unit) {
 
 namespace fs = std::filesystem;
 
-namespace {
-bool HasZarrMetadataFile(const fs::path& dir_path) {
-    std::error_code err_code;
-    return fs::exists(dir_path / ".zattr", err_code) || fs::exists(dir_path / ".zgroup", err_code) ||
-           fs::exists(dir_path / ".zmetadata", err_code);
-}
-} // namespace
-
+/**
+ * @brief Validates required Zarr folder structure and metadata.
+ * 
+ * This function checks if the given directory contains a valid Zarr structure
+ * with either SKY/l,m or APERTURE/u,v coordinate arrays, along with the 
+ * necessary Zarr metadata files.
+ * 
+ * @param path The directory path to validate
+ * @return true if the directory has a valid Zarr structure, false otherwise
+ */
 bool IsZarrFile(const std::string& path) {
-    std::error_code err_code;
     fs::path fs_path(path);
     if (fs_path.empty()) {
         return false;
     }
 
-    if (fs::is_directory(fs_path, err_code)) {
-        return HasSuffix(fs_path.filename().string(), ".zarr") && HasZarrMetadataFile(fs_path);
+    std::error_code err_code;
+    
+    // Check if it is a directory
+    if (!fs::is_directory(fs_path, err_code)) {
+        return false;
     }
-
-    return false;
+    
+    // Check for Zarr metadata files (.zgroup and .zattrs)
+    bool has_zarr_metadata = fs::exists(fs_path / ".zgroup", err_code) && 
+                             fs::exists(fs_path / ".zattrs", err_code);
+    
+    if (!has_zarr_metadata) {
+        return false;
+    }
+    
+    // Check for SKY structure with coordinate arrays (.zarray and .zattrs files)
+    bool has_sky_structure = fs::exists(fs_path / "SKY" / ".zarray", err_code) &&
+                             fs::exists(fs_path / "SKY" / ".zattrs", err_code) &&
+                             fs::exists(fs_path / "l" / ".zarray", err_code) &&
+                             fs::exists(fs_path / "l" / ".zattrs", err_code) &&
+                             fs::exists(fs_path / "m" / ".zarray", err_code) &&
+                             fs::exists(fs_path / "m" / ".zattrs", err_code);
+    
+    // Check for APERTURE structure with coordinate arrays (.zarray and .zattrs files)
+    bool has_aperture_structure = fs::exists(fs_path / "APERTURE" / ".zarray", err_code) &&
+                                  fs::exists(fs_path / "APERTURE" / ".zattrs", err_code) &&
+                                  fs::exists(fs_path / "u" / ".zarray", err_code) &&
+                                  fs::exists(fs_path / "u" / ".zattrs", err_code) &&
+                                  fs::exists(fs_path / "v" / ".zarray", err_code) &&
+                                  fs::exists(fs_path / "v" / ".zattrs", err_code);
+    
+    return has_sky_structure || has_aperture_structure;
 }
