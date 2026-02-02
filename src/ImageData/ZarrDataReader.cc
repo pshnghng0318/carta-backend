@@ -13,7 +13,6 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
-#include <map>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -175,28 +174,6 @@ struct ZarrDataReader::Impl {
             spdlog::debug("_ARRAY_DIMENSIONS validation skipped: unknown error");
         }
     }
-
-    // Map Coordinates Helper - XRADIO schema: always 5D [T, F, S, L, M]
-    // Zarr is C-order (row-major): M (index 4) changes fastest
-    // CARTA is Fortran-order (column-major): X (index 0) changes fastest
-    // L is the horizontal axis (X), M is the vertical axis (Y)
-    static std::vector<tensorstore::Index> MapToZarrCoords(const casacore::IPosition& start) {
-        std::vector<tensorstore::Index> res(kDimSize5D, 0);
-        res[0] = 0; // T (always 0 for CARTA)
-        if (start.size() > 2) {
-            res[1] = start[2];
-        } // F
-        if (start.size() > 3) {
-            res[2] = start[3];
-        } // S
-        if (start.size() > 0) {
-            res[3] = start[0];
-        } // L (CARTA X)
-        if (start.size() > 1) {
-            res[4] = start[1];
-        } // M (CARTA Y)
-        return res;
-    }
 };
 
 //-----------------------------------------------------------------------------
@@ -214,17 +191,8 @@ bool ZarrDataReader::IsInitialized() const {
 const casacore::IPosition& ZarrDataReader::GetShape() const {
     return _shape;
 }
-const casacore::IPosition& ZarrDataReader::GetOriginalZarrShape() const {
-    return _original_shape;
-}
 const casacore::IPosition& ZarrDataReader::GetChunkShape() const {
     return _chunk_shape;
-}
-const std::string& ZarrDataReader::GetFilename() const {
-    return _filename;
-}
-int ZarrDataReader::NumDimensions() const {
-    return _shape.size();
 }
 
 std::string ZarrDataReader::FindArrayPath() const {
@@ -539,87 +507,6 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
     }
 }
 
-bool ZarrDataReader::ReadSpectralProfile(int x, int y, int stokes, std::vector<float>& data) {
-    if (!_initialized) {
-        spdlog::error("ZarrDataReader not initialized");
-        return false;
-    }
-
-    std::lock_guard<std::mutex> lock(_read_mutex);
-
-    try {
-        int num_channels = _shape[2]; // Frequency axis in CARTA shape [X, Y, F, S]
-
-        spdlog::debug("ReadSpectralProfile: x={}, y={}, stokes={}, channels={}", x, y, stokes, num_channels);
-
-        // XRADIO schema: always 5D [T, F, S, L, M]
-        // Read ALL channels at once (entire F axis)
-        std::vector<tensorstore::Index> zarr_start = {
-            0,                                       // T (always 0)
-            0,                                       // F start (all channels)
-            static_cast<tensorstore::Index>(stokes), // S
-            static_cast<tensorstore::Index>(x),      // L = X
-            static_cast<tensorstore::Index>(y)       // M = Y
-        };
-        std::vector<tensorstore::Index> zarr_shape = {
-            1,                                             // T
-            static_cast<tensorstore::Index>(num_channels), // F (all channels)
-            1,                                             // S
-            1,                                             // L
-            1                                              // M
-        };
-
-        // Bounds validation
-        for (size_t dim = 0; dim < kDimSize5D; ++dim) {
-            tensorstore::Index end_idx = zarr_start[dim] + zarr_shape[dim] - 1;
-            if (zarr_start[dim] < 0 || end_idx >= _original_shape[dim]) {
-                spdlog::error("ReadSpectralProfile: Bounds error! dim={}, start={}, end={}, array_size={}", dim, zarr_start[dim], end_idx,
-                    _original_shape[dim]);
-                return false;
-            }
-        }
-
-        auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<float>>(_impl->store);
-        if (!typed_store_result.ok()) {
-            spdlog::error("ReadSpectralProfile: Error casting to float store: {}", typed_store_result.status().ToString());
-            return false;
-        }
-
-        std::array<tensorstore::Index, 4> slice_indices = {
-            0, static_cast<tensorstore::Index>(stokes), static_cast<tensorstore::Index>(x), static_cast<tensorstore::Index>(y)};
-        auto spectrum_result = typed_store_result.value() | tensorstore::Dims(0, 2, 3, 4).IndexSlice(slice_indices);
-        if (!spectrum_result.ok()) {
-            spdlog::error("ReadSpectralProfile: Error slicing dimensions: {}", spectrum_result.status().ToString());
-            return false;
-        }
-
-        data.resize(num_channels);
-        float* dst_ptr = data.data();
-        if (!dst_ptr) {
-            spdlog::error("ReadSpectralProfile: data pointer is null after resize");
-            return false;
-        }
-
-        std::array<tensorstore::Index, 1> output_shape = {static_cast<tensorstore::Index>(num_channels)};
-
-        auto output_array = tensorstore::SharedArray<float>(tensorstore::internal::UnownedToShared(dst_ptr), output_shape);
-
-        auto read_status = tensorstore::Read(spectrum_result.value(), output_array).result();
-        if (!read_status.ok()) {
-            spdlog::error("ReadSpectralProfile: TensorStore read failed: {}", read_status.status().ToString());
-            return false;
-        }
-
-        spdlog::debug("ReadSpectralProfile: Successfully read {} channels", num_channels);
-
-        return true;
-
-    } catch (const std::exception& ex) {
-        spdlog::error("Exception in ReadSpectralProfile: {}", ex.what());
-        return false;
-    }
-}
-
 //-----------------------------------------------------------------------------
 // Metadata Helpers
 //-----------------------------------------------------------------------------
@@ -826,38 +713,6 @@ std::vector<double> ZarrDataReader::ReadFlattenedVector(const std::string& array
     }
 }
 
-std::string ZarrDataReader::GetAttributeString(const std::string& array_name, const std::string& attr_name) {
-    if (!_initialized) {
-        return "";
-    }
-
-    // Read .zattrs for the array
-    std::filesystem::path base_path(_filename);
-    std::filesystem::path attrs_path = base_path / array_name / ".zattrs";
-
-    if (!std::filesystem::exists(attrs_path)) {
-        return "";
-    }
-
-    try {
-        std::ifstream fstr(attrs_path);
-        nlohmann::json json_obj;
-        fstr >> json_obj;
-
-        if (json_obj.contains(attr_name)) {
-            if (json_obj[attr_name].is_string()) {
-                return json_obj[attr_name].get<std::string>();
-            }
-            if (json_obj[attr_name].is_array() && !json_obj[attr_name].empty() && json_obj[attr_name][0].is_string()) {
-                return json_obj[attr_name][0].get<std::string>(); // e.g. units: ["rad"]
-            }
-        }
-    } catch (...) {
-    }
-
-    return "";
-}
-
 std::string ZarrDataReader::GetZattrsString(const std::string& array_name) {
     if (_impl && _impl->has_zmetadata) {
         std::string key = array_name.empty() ? ".zattrs" : array_name + "/.zattrs";
@@ -910,25 +765,6 @@ std::string ZarrDataReader::GetZarrayString(const std::string& array_name) {
     std::stringstream buffer;
     buffer << file.rdbuf();
     return buffer.str();
-}
-
-std::map<std::string, std::string> ZarrDataReader::GetZattrMap(const std::string& array_name) {
-    std::map<std::string, std::string> result;
-    try {
-        std::string json_str = GetZattrsString(array_name);
-        nlohmann::json json_obj = nlohmann::json::parse(json_str);
-
-        for (const auto& [key, val] : json_obj.items()) {
-            if (val.is_string()) {
-                result[key] = val.get<std::string>();
-            } else {
-                result[key] = val.dump();
-            }
-        }
-    } catch (...) {
-    }
-
-    return result;
 }
 
 //-----------------------------------------------------------------------------
