@@ -124,9 +124,25 @@ absl::Status PerformTensorStoreRead(Store& store, Array& array) {
     return absl::OkStatus();
 }
 
+// Helper: Open a Zarr array using TensorStore and return the result
+// Returns empty result on failure (check .ok() on the returned value)
+tensorstore::Result<tensorstore::TensorStore<>> OpenZarrArray(const std::string& array_path) {
+    nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", array_path}}}};
+
+    auto spec_result = tensorstore::Spec::FromJson(spec_json);
+    if (!spec_result.ok()) {
+        return spec_result.status();
+    }
+
+    auto open_future = tensorstore::Open(
+        spec_result.value(), tensorstore::Context::Default(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
+
+    return open_future.result();
+}
+
 // Helper: Apply mask to data buffer by setting masked values to NaN
-void ApplyMaskToData(float* dst_ptr, int x_offset, int batch_width, int height_y, int num_freq, int num_stokes, 
-                     int width_x, const int8_t* mask_int8_buffer, float nan_value) {
+void ApplyMaskToData(float* dst_ptr, int x_offset, int batch_width, int height_y, int num_freq, int num_stokes, int width_x,
+    const int8_t* mask_int8_buffer, float nan_value) {
     const size_t batch_xy = static_cast<size_t>(batch_width) * height_y;
     const size_t batch_xyf = batch_xy * num_freq;
     const size_t image_xy = static_cast<size_t>(width_x) * height_y;
@@ -233,6 +249,31 @@ struct ZarrDataReader::Impl {
             has_zmetadata = false;
             return false;
         }
+    }
+
+    std::string GetZarrMetadataFile(const std::string& filename, const std::string& array_name, const std::string& meta_filename) {
+        if (has_zmetadata) {
+            std::string key = array_name.empty() ? meta_filename : array_name + "/" + meta_filename;
+            if (zmetadata.contains("metadata") && zmetadata["metadata"].contains(key)) {
+                const auto& val = zmetadata["metadata"][key];
+                return val.is_string() ? val.get<std::string>() : val.dump();
+            }
+        }
+
+        std::filesystem::path base_path(filename);
+        if (!array_name.empty()) {
+            base_path /= array_name;
+        }
+
+        std::filesystem::path meta_path = base_path / meta_filename;
+        if (!std::filesystem::exists(meta_path)) {
+            return "{}";
+        }
+
+        std::ifstream file(meta_path);
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        return buffer.str();
     }
 
     // Validate _ARRAY_DIMENSIONS attribute
@@ -691,38 +732,19 @@ std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
     std::lock_guard<std::mutex> lock(_read_mutex);
 
     try {
-        std::filesystem::path base_path(_filename);
-        std::filesystem::path target_path = base_path / array_name;
+        std::filesystem::path target_path = std::filesystem::path(_filename) / array_name;
 
-        // Open the array using TensorStore
-        nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", target_path.string()}}}};
-
-        // Reuse main context to share cache and reduce memory allocations
-        auto spec_result = tensorstore::Spec::FromJson(spec_json);
-        if (!spec_result.ok()) {
-            // Try searching in subdirs if main path fails
-            return {};
-        }
-
-        auto open_future = tensorstore::Open(
-            spec_result.value(), tensorstore::Context::Default(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
-
-        auto open_result = open_future.result();
+        auto open_result = OpenZarrArray(target_path.string());
         if (!open_result.ok()) {
             return {};
         }
 
         auto store = open_result.value();
-        auto domain = store.domain();
-
-        // Ensure 1D
-        if (domain.rank() != 1) {
-            spdlog::warn("ReadVector: Array {} is not 1D (rank={})", array_name, domain.rank());
+        if (store.domain().rank() != 1) {
+            spdlog::warn("ReadVector: Array {} is not 1D (rank={})", array_name, store.domain().rank());
             return {};
         }
 
-        // Read data
-        // We cast to double for uniformity
         auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<double>>(store);
         if (!typed_store_result.ok()) {
             return {};
@@ -736,8 +758,6 @@ std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
         auto array = read_result.value();
         size_t size = array.num_elements();
         std::vector<double> result(size);
-
-        // Copy data
         const double* ptr = array.data();
         std::copy(ptr, ptr + size, result.begin());
 
@@ -756,59 +776,37 @@ std::vector<std::string> ZarrDataReader::ReadStringVector(const std::string& arr
     std::lock_guard<std::mutex> lock(_read_mutex);
 
     try {
-        std::filesystem::path base_path(_filename);
-        std::filesystem::path target_path = base_path / array_name;
+        std::filesystem::path target_path = std::filesystem::path(_filename) / array_name;
 
-        nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", target_path.string()}}}};
-
-        auto spec_result = tensorstore::Spec::FromJson(spec_json);
-        if (!spec_result.ok()) {
-            return {};
-        }
-
-        auto open_future = tensorstore::Open(
-            spec_result.value(), tensorstore::Context::Default(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
-
-        auto open_result = open_future.result();
+        auto open_result = OpenZarrArray(target_path.string());
         if (!open_result.ok()) {
             return {};
         }
 
         auto store = open_result.value();
-        auto domain = store.domain();
-
-        if (domain.rank() != 1) {
-            spdlog::warn("ReadStringVector: Array {} is not 1D (rank={})", array_name, domain.rank());
+        if (store.domain().rank() != 1) {
+            spdlog::warn("ReadStringVector: Array {} is not 1D (rank={})", array_name, store.domain().rank());
             return {};
         }
 
-        // Try reading as string (TensorStore supports casting some types to string,
-        // but for Zarr fixed-length strings it usually maps to std::string or view)
-        // Explicitly casting to string store
         auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<std::string>>(store);
-
-        if (typed_store_result.ok()) {
-            // It's already a string-compatible type
-            auto read_result = tensorstore::Read(typed_store_result.value()).result();
-            if (!read_result.ok()) {
-                return {};
-            }
-            auto array = read_result.value();
-            size_t size = array.num_elements();
-            std::vector<std::string> result(size);
-
-            // Copy data
-            // Since we ensured rank 1, we can iterate by index
-            for (tensorstore::Index i = 0; i < array.domain().shape()[0]; ++i) {
-                result[i] = array(i);
-            }
-            return result;
-        } else {
-            // Fallback: maybe it's bytes or incompatible?
-            // If fits2xradio wrote it as JSON strings or unicode, StaticCast should verify compatibility.
+        if (!typed_store_result.ok()) {
             spdlog::warn("ReadStringVector: could not cast array {} to string", array_name);
             return {};
         }
+
+        auto read_result = tensorstore::Read(typed_store_result.value()).result();
+        if (!read_result.ok()) {
+            return {};
+        }
+
+        auto array = read_result.value();
+        size_t size = array.num_elements();
+        std::vector<std::string> result(size);
+        for (tensorstore::Index i = 0; i < array.domain().shape()[0]; ++i) {
+            result[i] = array(i);
+        }
+        return result;
 
     } catch (const std::exception& ex) {
         spdlog::warn("Error reading string vector {}: {}", array_name, ex.what());
@@ -823,38 +821,19 @@ std::vector<double> ZarrDataReader::ReadFlattenedVector(const std::string& array
     std::lock_guard<std::mutex> lock(_read_mutex);
 
     try {
-        std::filesystem::path base_path(_filename);
-        std::filesystem::path target_path = base_path / array_name;
+        std::filesystem::path target_path = std::filesystem::path(_filename) / array_name;
 
-        // Open the array using TensorStore
-        nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", target_path.string()}}}};
-
-        // Reuse main context to share cache and reduce memory allocations
-        auto spec_result = tensorstore::Spec::FromJson(spec_json);
-        if (!spec_result.ok()) {
-            return {};
-        }
-
-        auto open_future = tensorstore::Open(
-            spec_result.value(), tensorstore::Context::Default(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
-
-        auto open_result = open_future.result();
+        auto open_result = OpenZarrArray(target_path.string());
         if (!open_result.ok()) {
             return {};
         }
 
         auto store = open_result.value();
-
-        // No rank check - we want to flatten whatever it is
-
-        // Read data
-        // We cast to double for uniformity
         auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<double>>(store);
         if (!typed_store_result.ok()) {
             return {};
         }
 
-        // Read into memory
         auto read_result = tensorstore::Read(typed_store_result.value()).result();
         if (!read_result.ok()) {
             return {};
@@ -864,17 +843,11 @@ std::vector<double> ZarrDataReader::ReadFlattenedVector(const std::string& array
         size_t size = array.num_elements();
         std::vector<double> result(size);
 
-        // Copy data assuming C-order flattening is desired or at least some consistent order.
-        // If contiguity is not guaranteed we'd need to iterate.
-        // But typically Read() returns a contiguous array.
-
-        // If not contiguous, we can try to iterate, but iteration helpers might be complex.
-        // Let's rely on data() for now. If it's null (non-contiguous), we fail.
         const double* ptr = array.data();
         if (ptr) {
             std::copy(ptr, ptr + size, result.begin());
         } else {
-            spdlog::warn("ReadFlattenedVector: Array {} resulted in non-contiguous memory, simpler copy failed.", array_name);
+            spdlog::warn("ReadFlattenedVector: Array {} resulted in non-contiguous memory", array_name);
             return {};
         }
 
@@ -887,57 +860,11 @@ std::vector<double> ZarrDataReader::ReadFlattenedVector(const std::string& array
 }
 
 std::string ZarrDataReader::GetZattrsString(const std::string& array_name) {
-    if (_impl && _impl->has_zmetadata) {
-        std::string key = array_name.empty() ? ".zattrs" : array_name + "/.zattrs";
-        if (_impl->zmetadata.contains("metadata") && _impl->zmetadata["metadata"].contains(key)) {
-            const auto& val = _impl->zmetadata["metadata"][key];
-            if (val.is_string())
-                return val.get<std::string>();
-            return val.dump();
-        }
-    }
-
-    std::filesystem::path base_path(_filename);
-    if (!array_name.empty()) {
-        base_path /= array_name;
-    }
-
-    // Check for .zattrs in the resolved path
-    std::filesystem::path zattrs_path = base_path / ".zattrs";
-    if (std::filesystem::exists(zattrs_path)) {
-        std::ifstream file(zattrs_path);
-        std::stringstream buffer;
-        buffer << file.rdbuf();
-        return buffer.str();
-    }
-    return "{}";
+    return _impl->GetZarrMetadataFile(_filename, array_name, ".zattrs");
 }
 
 std::string ZarrDataReader::GetZarrayString(const std::string& array_name) {
-    if (_impl && _impl->has_zmetadata) {
-        std::string key = array_name.empty() ? ".zarray" : array_name + "/.zarray";
-        if (_impl->zmetadata.contains("metadata") && _impl->zmetadata["metadata"].contains(key)) {
-            const auto& val = _impl->zmetadata["metadata"][key];
-            if (val.is_string())
-                return val.get<std::string>();
-            return val.dump();
-        }
-    }
-
-    std::filesystem::path base_path(_filename);
-    if (!array_name.empty()) {
-        base_path /= array_name;
-    }
-
-    std::filesystem::path zarray_path = base_path / ".zarray";
-    if (!std::filesystem::exists(zarray_path)) {
-        return "{}";
-    }
-
-    std::ifstream file(zarray_path);
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    return buffer.str();
+    return _impl->GetZarrMetadataFile(_filename, array_name, ".zarray");
 }
 
 //-----------------------------------------------------------------------------
