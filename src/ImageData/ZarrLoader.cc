@@ -29,6 +29,7 @@ void ZarrLoader::AllocateImage(const std::string& hdu) {
             _coord_sys =
                 std::shared_ptr<casacore::CoordinateSystem>(static_cast<casacore::CoordinateSystem*>(_image->coordinates().clone()));
             _has_pixel_mask = _image->hasPixelMask();
+            _data_type = _image->dataType();
 
             spdlog::debug("ZarrLoader: Allocated image with shape {}", _image_shape.toString());
 
