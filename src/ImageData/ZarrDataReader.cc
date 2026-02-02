@@ -22,6 +22,8 @@
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
+#include "Logger/Logger.h"
+
 // TensorStore includes - isolated to implementation file
 #include "contiguous_layout.h"
 #include "tensorstore/array.h"
@@ -44,10 +46,10 @@ namespace carta {
 constexpr int K_TILE_SIZE = 256;
 #endif
 
-// Reduced from 128MB to 16MB to lower memory footprint.
-// TensorStore still handles chunk caching internally, and 16MB is sufficient
-// for typical tile operations (256x256 float tiles = 256KB each).
-constexpr size_t kDefaultCacheSizeMB = 16;
+// TensorStore cache pool size. Larger cache improves chunk hit rate for
+// repeated reads and reduces I/O overhead. 64MB provides good balance
+// between memory usage and performance for typical CARTA workflows.
+constexpr size_t kDefaultCacheSizeMB = 64;
 constexpr size_t kDefaultCpuCount = 8;
 constexpr size_t kDimSize5D = 5;
 constexpr int kDefaultStripeHeight = 256;
@@ -189,6 +191,8 @@ struct ZarrDataReader::Impl {
     // This saves memory (single cache pool) and reduces initialization overhead
     static tensorstore::Context GetSharedContext() {
         static tensorstore::Context shared_context = []() {
+            auto context_start = std::chrono::high_resolution_clock::now();
+
             static const unsigned int num_cpus = []() {
                 auto cpu_count = std::thread::hardware_concurrency();
                 return cpu_count ? cpu_count : kDefaultCpuCount;
@@ -199,7 +203,10 @@ struct ZarrDataReader::Impl {
 
             auto context_result = tensorstore::Context::FromJson(context_spec);
             if (context_result.ok()) {
-                spdlog::info("Created shared TensorStore context with {} CPU cores, {}MB cache", num_cpus, kDefaultCacheSizeMB);
+                auto context_end = std::chrono::high_resolution_clock::now();
+                auto context_duration = std::chrono::duration_cast<std::chrono::milliseconds>(context_end - context_start).count();
+                spdlog::performance("[PERF] TensorStore context creation: {}ms with {} CPU cores, {}MB cache", context_duration, num_cpus,
+                    kDefaultCacheSizeMB);
                 return context_result.value();
             }
             spdlog::warn("Failed to create custom context, using default");
@@ -357,30 +364,44 @@ bool ZarrDataReader::Initialize() {
         return true;
     }
 
+    auto init_start = std::chrono::high_resolution_clock::now();
+
     try {
+        auto t0 = std::chrono::high_resolution_clock::now();
         std::string array_path = FindArrayPath();
         if (array_path.empty()) {
             return false;
         }
+        auto t1 = std::chrono::high_resolution_clock::now();
+        spdlog::performance("[PERF] FindArrayPath: {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
 
         // Early dimension check before creating expensive TensorStore context
         if (Impl::ValidateEarlyDimension(array_path) < 0) {
             return false;
         }
+        auto t2 = std::chrono::high_resolution_clock::now();
+        spdlog::performance("[PERF] ValidateEarlyDimension: {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
 
         // Try to read .zmetadata
         _impl->LoadZmetadata(_filename);
+        auto t3 = std::chrono::high_resolution_clock::now();
+        spdlog::performance("[PERF] LoadZmetadata: {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count());
 
         auto open_result = OpenZarrArray(array_path, Impl::GetSharedContext());
         if (!open_result.ok()) {
             spdlog::error("Failed to open TensorStore: {}", open_result.status().ToString());
             return false;
         }
+        auto t4 = std::chrono::high_resolution_clock::now();
+        spdlog::performance("[PERF] OpenZarrArray (includes GetSharedContext): {}ms",
+            std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count());
 
         _impl->store = std::move(open_result).value();
 
         auto domain = _impl->store.domain();
         auto ts_shape = domain.shape();
+        auto t5 = std::chrono::high_resolution_clock::now();
+        spdlog::performance("[PERF] Get domain and shape: {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t5 - t4).count());
 
         // Pre-allocate vector for original shape
         std::vector<int> orig_shape_vec;
@@ -427,8 +448,14 @@ bool ZarrDataReader::Initialize() {
         } else {
             spdlog::debug("ZarrDataReader: chunk_layout unavailable: {}", chunk_layout_result.status().ToString());
         }
+        auto t6 = std::chrono::high_resolution_clock::now();
+        spdlog::performance("[PERF] Get chunk_layout: {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t6 - t5).count());
 
         _initialized = true;
+
+        auto init_end = std::chrono::high_resolution_clock::now();
+        spdlog::performance(
+            "[PERF] ★ Total Initialize(): {}ms ★", std::chrono::duration_cast<std::chrono::milliseconds>(init_end - init_start).count());
         spdlog::debug("ZarrDataReader initialized: ZARR shape={}, CARTA shape={}", _original_shape.toString(), _shape.toString());
 
         return true;

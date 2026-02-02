@@ -8,9 +8,13 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 
 #include <spdlog/fmt/fmt.h>
+#include <spdlog/spdlog.h>
+
+#include "Logger/Logger.h"
 
 #include <casacore/casa/OS/Path.h>
 #include <casacore/casa/Quanta/Unit.h>
@@ -21,7 +25,6 @@
 #include <casacore/images/Images/ImageFITSConverter.h>
 #include <casacore/images/Images/ImageInfo.h>
 #include <casacore/tables/DataMan/TiledFileAccess.h>
-#include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
 
 using namespace casacore;
@@ -30,10 +33,16 @@ namespace carta {
 
 CartaZarrImage::CartaZarrImage(const std::string& filename)
     : _reader(std::make_shared<ZarrDataReader>(filename)), _name(filename), _is_copy(false) {
+    auto ctor_start = std::chrono::high_resolution_clock::now();
+    spdlog::info("[PERF] ======== CartaZarrImage Constructor START: {} ========", filename);
+
     // Initialize the reader
+    auto t0 = std::chrono::high_resolution_clock::now();
     if (!_reader->Initialize()) {
         throw AipsError("Failed to initialize ZarrDataReader for: " + filename);
     }
+    auto t1 = std::chrono::high_resolution_clock::now();
+    spdlog::info("[PERF] _reader->Initialize(): {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
 
     // Get shape from reader
     _shape = _reader->GetShape();
@@ -54,11 +63,19 @@ CartaZarrImage::CartaZarrImage(const std::string& filename)
     _tiled_shape = TiledShape(_shape, tile_shape);
 
     // Set up coordinate system
+    auto t2 = std::chrono::high_resolution_clock::now();
     SetupCoordinateSystem();
+    auto t3 = std::chrono::high_resolution_clock::now();
+    spdlog::performance("[PERF] SetupCoordinateSystem(): {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count());
 
     // Set beams (must be after SetupCoordinateSystem)
     SetBeams();
+    auto t4 = std::chrono::high_resolution_clock::now();
+    spdlog::performance("[PERF] SetBeams(): {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t4 - t3).count());
 
+    auto ctor_end = std::chrono::high_resolution_clock::now();
+    spdlog::performance("[PERF] ★★★ Total CartaZarrImage Constructor: {}ms ★★★",
+        std::chrono::duration_cast<std::chrono::milliseconds>(ctor_end - ctor_start).count());
     spdlog::debug("CartaZarrImage created: {} with shape {}", filename, _shape.toString());
 }
 
@@ -912,15 +929,20 @@ void CartaZarrImage::reopen() {
 // ============================================================================
 
 void CartaZarrImage::SetupCoordinateSystem() {
+    auto setup_start = std::chrono::high_resolution_clock::now();
+
     try {
         // Get FITS header strings generated from Zarr metadata
+        auto t0 = std::chrono::high_resolution_clock::now();
         Vector<String> header_strings = FitsHeaderStrings();
+        auto t1 = std::chrono::high_resolution_clock::now();
+        spdlog::info("[PERF]   FitsHeaderStrings(): {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
 
         if (!header_strings.empty()) {
             // Use casacore's ImageFITSConverter to build coordinate system from FITS headers
             int stokes_fits_value(1);
             Record unused_headers;
-            LogSink sink; // null sink to suppress confusing FITS log messages
+            LogSink sink;
             LogIO log(sink);
             unsigned int which_rep(0);
             bool drop_stokes(true);
@@ -930,10 +952,8 @@ void CartaZarrImage::SetupCoordinateSystem() {
 
             setCoordinateInfo(coord_sys);
 
-            // Set image units from unused headers
             setUnits(ImageFITSConverter::getBrightnessUnit(unused_headers, log));
 
-            // Set image info (beam, image type, etc.)
             ImageInfo image_info = ImageFITSConverter::getImageInfo(unused_headers);
             if (stokes_fits_value != -1) {
                 ImageInfo::ImageTypes type = ImageInfo::imageTypeFromFITS(stokes_fits_value);
@@ -943,10 +963,13 @@ void CartaZarrImage::SetupCoordinateSystem() {
             }
             setImageInfo(image_info);
 
-            // Set misc info
             Record misc_info;
             ImageFITSConverter::extractMiscInfo(misc_info, unused_headers);
             setMiscInfo(misc_info);
+
+            auto t2 = std::chrono::high_resolution_clock::now();
+            spdlog::info(
+                "[PERF]   ImageFITSConverter processing: {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
 
             spdlog::debug("Successfully set up coordinate system for Zarr image from FITS headers");
             return;
@@ -959,6 +982,10 @@ void CartaZarrImage::SetupCoordinateSystem() {
 
     // Fall back to default coordinate system
     CreateDefaultCoordinateSystem();
+
+    auto setup_end = std::chrono::high_resolution_clock::now();
+    spdlog::info("[PERF]   Total SetupCoordinateSystem: {}ms",
+        std::chrono::duration_cast<std::chrono::milliseconds>(setup_end - setup_start).count());
 }
 
 void CartaZarrImage::CreateDefaultCoordinateSystem() {
@@ -1004,6 +1031,8 @@ void CartaZarrImage::CreateDefaultCoordinateSystem() {
 }
 
 void CartaZarrImage::SetBeams() {
+    auto beams_start = std::chrono::high_resolution_clock::now();
+
     if (_is_single_beam) {
         spdlog::debug("CartaZarrImage::SetBeams - Setting single beam from _beam: {} x {} @ {}", _beam.getMajor().getValue("arcsec"),
             _beam.getMinor().getValue("arcsec"), _beam.getPA().getValue("deg"));
@@ -1012,7 +1041,11 @@ void CartaZarrImage::SetBeams() {
         setImageInfo(info);
     } else {
         spdlog::debug("CartaZarrImage::SetBeams - Setting multiple beams from Zarr BEAM array");
+        auto t0 = std::chrono::high_resolution_clock::now();
         std::vector<double> beam_data = _reader->ReadFlattenedVector("BEAM");
+        auto t1 = std::chrono::high_resolution_clock::now();
+        spdlog::info("[PERF]   ReadFlattenedVector(BEAM): {}ms", std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count());
+
         if (beam_data.size() < 3) {
             return;
         }
