@@ -38,8 +38,20 @@ CartaZarrImage::CartaZarrImage(const std::string& filename)
     // Get shape from reader
     _shape = _reader->GetShape();
 
-    // Set up tiled shape for cursor operations
-    _tiled_shape = TiledShape(_shape, TiledFileAccess::makeTileShape(_shape));
+    // Set up tiled shape for cursor operations.
+    // Prefer aligning casacore's tile/cursor shape with the underlying Zarr chunk layout.
+    // Reader chunk shape uses XRADIO 5D order [T, F, P, L, M], while CARTA uses [X, Y, F, S].
+    // Map: X=L, Y=M, F=F, S=P.
+    auto tile_shape = TiledFileAccess::makeTileShape(_shape);
+    const auto& zarr_chunk_shape = _reader->GetChunkShape();
+    if (zarr_chunk_shape.size() == 5 && _shape.size() == 4) {
+        const int x = static_cast<int>(std::max<casacore::IPosition::value_type>(1, std::min(zarr_chunk_shape[3], _shape[0])));
+        const int y = static_cast<int>(std::max<casacore::IPosition::value_type>(1, std::min(zarr_chunk_shape[4], _shape[1])));
+        const int f = static_cast<int>(std::max<casacore::IPosition::value_type>(1, std::min(zarr_chunk_shape[1], _shape[2])));
+        const int s = static_cast<int>(std::max<casacore::IPosition::value_type>(1, std::min(zarr_chunk_shape[2], _shape[3])));
+        tile_shape = IPosition(4, x, y, f, s);
+    }
+    _tiled_shape = TiledShape(_shape, tile_shape);
 
     // Set up coordinate system
     SetupCoordinateSystem();

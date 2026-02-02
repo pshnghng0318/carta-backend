@@ -357,7 +357,12 @@ bool FileLoader::GetSlice(casacore::Array<float>& data, const StokesSlicer& stok
         if (image_type == "CartaFitsImage") {
             // Use cfitsio for slice
             return image->doGetSlice(data, slicer);
-        } else if (image_type == "ImageExpr") {
+        }
+        if (image_type == "CartaZarrImage" && !image->isMasked()) {
+            // Use CartaZarrImage for slice
+            return image->doGetSlice(data, slicer);
+        }
+        if (image_type == "ImageExpr") {
             // Use ImageExpr for slice
             casacore::Array<float> slice_data;
             image->doGetSlice(slice_data, slicer);
@@ -381,7 +386,8 @@ bool FileLoader::GetSlice(casacore::Array<float>& data, const StokesSlicer& stok
 
             data = slice_data; // copy from reference
             return true;
-        } else if (image_type == "RebinImage") {
+        }
+        if (image_type == "RebinImage") {
             // For PV preview, image coordinate system and headers only.
             // Data is rebinned and accessed in PvPreviewCube.
             return true;
@@ -875,7 +881,7 @@ FileInfo::ImageStats& FileLoader::GetImageStats(int current_stokes, int z) {
 }
 
 bool FileLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange& z_range, int stokes, int cursor_x, int count_x,
-                                       int cursor_y, int count_y, std::mutex& image_mutex, float& progress) {
+    int cursor_y, int count_y, std::mutex& image_mutex, float& progress) {
     progress = 1.0;
     // Must be implemented in subclasses
     return false;
