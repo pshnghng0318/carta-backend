@@ -20,7 +20,7 @@ namespace carta {
 
 /**
  * @brief FileLoader implementation for ZARR format files.
- * 
+ *
  * This loader follows the same pattern as FitsLoader and CasaLoader,
  * delegating most operations to CartaZarrImage. Supports TileCache
  * integration for efficient tile-based rendering.
@@ -32,28 +32,26 @@ public:
 
     // FileLoader interface
     bool UseTileCache() const override;
-    
+
     // Tile/chunk access for TileCache integration
-    bool GetChunk(std::vector<float>& data, int& data_width, int& data_height,
-                  int min_x, int min_y, int channel, int stokes, 
-                  std::mutex& image_mutex) override;
-    
+    bool GetChunk(std::vector<float>& data, int& data_width, int& data_height, int min_x, int min_y, int channel, int stokes,
+        std::mutex& image_mutex) override;
+
     // Spectral data access
-    bool GetCursorSpectralData(std::vector<float>& data, const AxisRange& z_range, int stokes, int cursor_x, int count_x,
-        int cursor_y, int count_y, std::mutex& image_mutex, float& progress) override;
+    bool GetCursorSpectralData(std::vector<float>& data, const AxisRange& z_range, int stokes, int cursor_x, int count_x, int cursor_y,
+        int count_y, std::mutex& image_mutex, float& progress) override;
     bool UseRegionSpectralData(const casacore::IPosition& region_shape, std::mutex& image_mutex) override;
-    bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
-        const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
-        std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) override;
-    bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
-        const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
-        std::map<CARTA::StatsType, std::vector<double>>& results, float& progress,
-        std::function<bool()> cancellation_check = nullptr) override;
+    bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes, const casacore::ArrayLattice<casacore::Bool>& mask,
+        const casacore::IPosition& origin, std::mutex& image_mutex, std::map<CARTA::StatsType, std::vector<double>>& results,
+        float& progress) override;
+    bool GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes, const casacore::ArrayLattice<casacore::Bool>& mask,
+        const casacore::IPosition& origin, std::mutex& image_mutex, std::map<CARTA::StatsType, std::vector<double>>& results,
+        float& progress, std::function<bool()> cancellation_check = nullptr) override;
     void ClearRegionSpectralCache(int region_id) override;
 
 private:
     void AllocateImage(const std::string& hdu) override;
-    
+
     // Helper to get typed image
     CartaZarrImage* GetZarrImage();
 

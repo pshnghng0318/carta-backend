@@ -70,9 +70,9 @@ struct ZarrDataReader::Impl {
     // Cached mask store for efficient repeated mask reads
     // Note: Mask may be stored as int8 (0/1) or bool, so we use dynamic type
     tensorstore::TensorStore<int8_t> mask_store;
-    bool mask_store_checked = false;  // True after first check (avoid repeated filesystem lookups)
-    bool has_mask_store = false;      // True if mask_store is valid and ready
-    std::string cached_mask_path;     // Cached active mask path
+    bool mask_store_checked = false; // True after first check (avoid repeated filesystem lookups)
+    bool has_mask_store = false;     // True if mask_store is valid and ready
+    std::string cached_mask_path;    // Cached active mask path
 
     // Get shared TensorStore context (created once, reused by all instances)
     // This saves memory (single cache pool) and reduces initialization overhead
@@ -1000,8 +1000,8 @@ bool ZarrDataReader::EnsureMaskStore() {
             return false;
         }
 
-        auto open_future = tensorstore::Open(
-            spec_result.value(), Impl::GetSharedContext(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
+        auto open_future =
+            tensorstore::Open(spec_result.value(), Impl::GetSharedContext(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
 
         auto open_result = open_future.result();
         if (!open_result.ok()) {
@@ -1069,9 +1069,9 @@ bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore
 
         // Create slice using cached mask store: XRADIO 5D [T, F, P, L, M] -> CARTA 4D [X, Y, F, S]
         auto slice_result = _impl->mask_store | tensorstore::Dims(0).IndexSlice(time_idx) |
-                            tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F
-                            | tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) // P
-                            | tensorstore::Dims(2).ClosedInterval(start[0], stop[0]) // L (X)
+                            tensorstore::Dims(0).ClosedInterval(start[2], stop[2])    // F
+                            | tensorstore::Dims(1).ClosedInterval(start[3], stop[3])  // P
+                            | tensorstore::Dims(2).ClosedInterval(start[0], stop[0])  // L (X)
                             | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]); // M (Y)
 
         if (!slice_result.ok()) {
@@ -1094,16 +1094,12 @@ bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore
         std::vector<int8_t> int8_buffer(num_elements);
         int8_t* int8_ptr = int8_buffer.data();
 
-        std::array<tensorstore::Index, 4> output_shape = {
-            static_cast<tensorstore::Index>(width_x),
-            static_cast<tensorstore::Index>(height_y),
-            static_cast<tensorstore::Index>(num_freq),
+        std::array<tensorstore::Index, 4> output_shape = {static_cast<tensorstore::Index>(width_x),
+            static_cast<tensorstore::Index>(height_y), static_cast<tensorstore::Index>(num_freq),
             static_cast<tensorstore::Index>(num_stokes)};
 
-        std::array<tensorstore::Index, 4> byte_strides = {
-            static_cast<tensorstore::Index>(sizeof(int8_t)),
-            static_cast<tensorstore::Index>(width_x * sizeof(int8_t)),
-            static_cast<tensorstore::Index>(width_x * height_y * sizeof(int8_t)),
+        std::array<tensorstore::Index, 4> byte_strides = {static_cast<tensorstore::Index>(sizeof(int8_t)),
+            static_cast<tensorstore::Index>(width_x * sizeof(int8_t)), static_cast<tensorstore::Index>(width_x * height_y * sizeof(int8_t)),
             static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(int8_t))};
 
         tensorstore::StridedLayout<4> output_layout(output_shape, byte_strides);
