@@ -23,15 +23,15 @@ void ZarrLoader::AllocateImage(const std::string& hdu) {
     if (!_image) {
         try {
             _image.reset(new CartaZarrImage(_filename));
-            
+
             _image_shape = _image->shape();
             _num_dims = _image_shape.size();
-            _coord_sys = std::shared_ptr<casacore::CoordinateSystem>(
-                static_cast<casacore::CoordinateSystem*>(_image->coordinates().clone()));
+            _coord_sys =
+                std::shared_ptr<casacore::CoordinateSystem>(static_cast<casacore::CoordinateSystem*>(_image->coordinates().clone()));
             _has_pixel_mask = _image->hasPixelMask();
-            
+
             spdlog::debug("ZarrLoader: Allocated image with shape {}", _image_shape.toString());
-            
+
         } catch (const casacore::AipsError& err) {
             spdlog::error("ZarrLoader: Failed to allocate image: {}", err.getMesg());
             throw;
@@ -47,28 +47,27 @@ CartaZarrImage* ZarrLoader::GetZarrImage() {
     return dynamic_cast<CartaZarrImage*>(_image.get());
 }
 
-bool ZarrLoader::GetChunk(std::vector<float>& data, int& data_width, int& data_height,
-                          int min_x, int min_y, int channel, int stokes, 
-                          std::mutex& image_mutex) {
+bool ZarrLoader::GetChunk(
+    std::vector<float>& data, int& data_width, int& data_height, int min_x, int min_y, int channel, int stokes, std::mutex& image_mutex) {
     std::lock_guard<std::mutex> lock(image_mutex);
-    
+
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
         spdlog::error("ZarrLoader::GetChunk: No valid ZARR image");
         return false;
     }
-    
+
     auto reader = zarr_image->GetReader();
     if (!reader || !reader->IsInitialized()) {
         spdlog::error("ZarrLoader::GetChunk: Reader not initialized");
         return false;
     }
-    
+
     return reader->GetChunk(data, data_width, data_height, min_x, min_y, channel, stokes);
 }
 
 bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange& z_range, int stokes, int cursor_x, int count_x,
-                                       int cursor_y, int count_y, std::mutex& image_mutex, float& progress) {
+    int cursor_y, int count_y, std::mutex& image_mutex, float& progress) {
     if (count_x <= 0 || count_y <= 0) {
         return false;
     }
@@ -108,11 +107,10 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
     {
         std::lock_guard<std::mutex> guard(_cursor_profile_mutex);
         bool cache_match = _cursor_profile_cache.valid && (_cursor_profile_cache.stokes == stokes) &&
-            (_cursor_profile_cache.cursor_x == cursor_x) && (_cursor_profile_cache.cursor_y == cursor_y) &&
-            (_cursor_profile_cache.count_x == count_x) && (_cursor_profile_cache.count_y == count_y) &&
-            (_cursor_profile_cache.z_from == spec_range.from) &&
-            (_cursor_profile_cache.z_to == spec_range.to) &&
-            (_cursor_profile_cache.data.size() == expected_size);
+                           (_cursor_profile_cache.cursor_x == cursor_x) && (_cursor_profile_cache.cursor_y == cursor_y) &&
+                           (_cursor_profile_cache.count_x == count_x) && (_cursor_profile_cache.count_y == count_y) &&
+                           (_cursor_profile_cache.z_from == spec_range.from) && (_cursor_profile_cache.z_to == spec_range.to) &&
+                           (_cursor_profile_cache.data.size() == expected_size);
 
         if (progress > 0.0F && cache_match) {
             data = _cursor_profile_cache.data;
@@ -148,7 +146,7 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
 
     // Cap batch to enable more frequent progress updates (aim for ~4-8 updates)
     size_t max_batch_for_updates = std::max<size_t>(freq_chunk, requested_depth / 8);
-    
+
     auto align_batch = [&](size_t batch_depth) {
         if (batch_depth == 0) {
             batch_depth = 1;
@@ -195,8 +193,8 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
     }
 
     z_batch = std::min<size_t>(z_batch, requested_depth - z_start_in_data);
-    spdlog::debug("ZarrLoader::GetCursorSpectralData: z_batch={}, freq_chunk={}, requested_depth={}, z_start_in_data={}",
-        z_batch, freq_chunk, requested_depth, z_start_in_data);
+    spdlog::debug("ZarrLoader::GetCursorSpectralData: z_batch={}, freq_chunk={}, requested_depth={}, z_start_in_data={}", z_batch,
+        freq_chunk, requested_depth, z_start_in_data);
 
     casacore::IPosition start(_num_dims, 0);
     casacore::IPosition length(_num_dims, 1);
@@ -213,11 +211,23 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
 
     casacore::Array<float> batch_data;
     auto t_batch_start = std::chrono::high_resolution_clock::now();
+    casacore::Array<bool> batch_mask;
+    const bool* mask_ptr = nullptr;
+    bool delete_mask_ptr(false);
     {
         std::lock_guard<std::mutex> lock(image_mutex);
-        if (!reader->ReadSlice(batch_data, casacore::Slicer(start, length))) {
+        casacore::Slicer batch_slicer(start, length);
+        if (!reader->ReadSlice(batch_data, batch_slicer)) {
             spdlog::error("ZarrLoader::GetCursorSpectralData: ReadSlice failed");
             return false;
+        }
+
+        if (_has_pixel_mask) {
+            // Best-effort: if mask read fails, the buffer is filled with `true` by the reader.
+            reader->ReadMaskSlice(batch_mask, batch_slicer);
+            if (batch_mask.shape() == batch_data.shape()) {
+                mask_ptr = batch_mask.getStorage(delete_mask_ptr);
+            }
         }
     }
 
@@ -228,8 +238,17 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
         return false;
     }
 
-    // Copy batch data to the main data vector at the correct position
-    std::copy(data_ptr, data_ptr + batch_data.nelements(), data.begin() + z_start_in_data * count_x * count_y);
+    // Copy batch data to the main data vector at the correct position, honoring pixel mask if present.
+    auto out_begin = data.begin() + z_start_in_data * count_x * count_y;
+    size_t n = batch_data.nelements();
+    if (mask_ptr) {
+        for (size_t i = 0; i < n; ++i) {
+            out_begin[i] = mask_ptr[i] ? data_ptr[i] : NAN;
+        }
+        batch_mask.freeStorage(mask_ptr, delete_mask_ptr);
+    } else {
+        std::copy(data_ptr, data_ptr + n, out_begin);
+    }
     batch_data.freeStorage(data_ptr, delete_data_ptr);
 
     auto t_batch_end = std::chrono::high_resolution_clock::now();
@@ -302,8 +321,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
 
 bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
     const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
-    std::map<CARTA::StatsType, std::vector<double>>& results, float& progress,
-    std::function<bool()> cancellation_check) {
+    std::map<CARTA::StatsType, std::vector<double>>& results, float& progress, std::function<bool()> cancellation_check) {
     std::shared_ptr<ZarrDataReader> reader;
     {
         std::lock_guard<std::mutex> lock(image_mutex);
@@ -340,8 +358,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         }
     }
 
-    if (existing_stats_ptr && existing_stats_ptr->IsValid(origin, mask_shape) && all_z &&
-        existing_stats_ptr->IsCompleted()) {
+    if (existing_stats_ptr && existing_stats_ptr->IsValid(origin, mask_shape) && all_z && existing_stats_ptr->IsCompleted()) {
         results = existing_stats_ptr->stats;
         progress = 1.0;
         return true;
@@ -426,8 +443,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         chunk_depth = static_cast<size_t>(freq_chunk);
     }
 
-    size_t bytes_per_chunk_depth =
-        static_cast<size_t>(width) * static_cast<size_t>(height) * chunk_depth * sizeof(float);
+    size_t bytes_per_chunk_depth = static_cast<size_t>(width) * static_cast<size_t>(height) * chunk_depth * sizeof(float);
     size_t chunks_per_batch = bytes_per_chunk_depth > 0 ? target_batch_bytes / bytes_per_chunk_depth : 1;
     chunks_per_batch = std::max<size_t>(chunks_per_batch, 1);
 
@@ -441,7 +457,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     if (batch_depth == 0 && chunk_depth > 0) {
         batch_depth = chunk_depth;
     }
-    
+
     // Cap batch to enable more frequent progress updates (aim for ~4-8 updates)
     size_t max_batch_for_updates = std::max<size_t>(chunk_depth, static_cast<size_t>(depth) / 8);
     batch_depth = std::min(batch_depth, max_batch_for_updates);
@@ -463,11 +479,23 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     }
 
     casacore::Array<float> batch_data;
+    casacore::Array<bool> batch_mask;
+    const bool* mask_ptr = nullptr;
+    bool delete_mask_ptr(false);
     {
         std::lock_guard<std::mutex> lock(image_mutex);
-        if (!reader->ReadSlice(batch_data, casacore::Slicer(start, length))) {
+        casacore::Slicer batch_slicer(start, length);
+        if (!reader->ReadSlice(batch_data, batch_slicer)) {
             spdlog::error("ZarrLoader::GetRegionSpectralData: ReadSlice failed");
             return false;
+        }
+
+        if (_has_pixel_mask) {
+            // Best-effort: if mask read fails, the buffer is filled with `true` by the reader.
+            reader->ReadMaskSlice(batch_mask, batch_slicer);
+            if (batch_mask.shape() == batch_data.shape()) {
+                mask_ptr = batch_mask.getStorage(delete_mask_ptr);
+            }
         }
     }
 
@@ -524,6 +552,12 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
                 if (!mask_cache[mask_row + x]) {
                     continue;
                 }
+
+                if (mask_ptr && !mask_ptr[row_offset + x]) {
+                    // Pixel is inside region, but masked out by the image pixel mask.
+                    local_nan++;
+                    continue;
+                }
                 double v = static_cast<double>(data_ptr[row_offset + x]);
                 if (std::isfinite(v)) {
                     local_count++;
@@ -566,6 +600,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         }
     }
     batch_data.freeStorage(data_ptr, delete_data_ptr);
+    if (mask_ptr) {
+        batch_mask.freeStorage(mask_ptr, delete_mask_ptr);
+    }
 
     results = stats;
     if (max_z == static_cast<size_t>(depth)) {
