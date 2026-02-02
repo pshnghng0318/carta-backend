@@ -58,6 +58,101 @@ constexpr int kStripeChunkMultiplier = 8; // Read multiple chunks per stripe to 
 constexpr size_t kColumnBatchMaxDataMiB = 16;
 
 //-----------------------------------------------------------------------------
+// Anonymous namespace for helper functions used by ReadSlice/ReadMaskedSlice/ReadMaskSlice
+//-----------------------------------------------------------------------------
+namespace {
+
+// Helper: Build XRADIO slice ranges for a data or mask store
+// XRADIO 5D: [T, F, P, L, M] -> CARTA 4D: [X, Y, F, S]
+// Returns tensorstore::Result for the sliced and time-indexed store
+template <typename Store>
+tensorstore::Result<tensorstore::TensorStore<typename Store::Element>> BuildXRadioSlice(Store& store, const casacore::IPosition& start,
+    const casacore::IPosition& stop, int x_offset, int batch_width, tensorstore::Index time_idx) {
+    auto slice_result = store | tensorstore::Dims(0).IndexSlice(time_idx) | tensorstore::Dims(0).ClosedInterval(start[2], stop[2]) // F
+                        | tensorstore::Dims(1).ClosedInterval(start[3], stop[3])                                                   // P
+                        | tensorstore::Dims(2).ClosedInterval(start[0] + x_offset, start[0] + x_offset + batch_width - 1)          // L
+                        | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);                                                  // M
+    return slice_result;
+}
+
+// Helper: Transpose [F, P, L, M] -> [L, M, F, P] for CARTA order
+template <typename Store>
+tensorstore::Result<tensorstore::TensorStore<typename Store::Element>> TransposeToCartaOrder(tensorstore::Result<Store>&& slice_result) {
+    if (!slice_result.ok()) {
+        return slice_result.status();
+    }
+    return std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+}
+
+// Helper: Construct StridedLayout, ArrayView, and UnownedToShared for 4D buffer
+// with configurable element size stride (for float or int8_t)
+template <typename T>
+tensorstore::SharedArray<T, 4> Build4DArrayView(
+    T* data_ptr, int batch_width, int height_y, int num_freq, int num_stokes, int full_width_x) {
+    std::array<tensorstore::Index, 4> shape = {static_cast<tensorstore::Index>(batch_width), static_cast<tensorstore::Index>(height_y),
+        static_cast<tensorstore::Index>(num_freq), static_cast<tensorstore::Index>(num_stokes)};
+
+    std::array<tensorstore::Index, 4> byte_strides = {static_cast<tensorstore::Index>(sizeof(T)),
+        static_cast<tensorstore::Index>(full_width_x * sizeof(T)), static_cast<tensorstore::Index>(full_width_x * height_y * sizeof(T)),
+        static_cast<tensorstore::Index>(full_width_x * height_y * num_freq * sizeof(T))};
+
+    tensorstore::StridedLayout<4> layout(shape, byte_strides);
+    return tensorstore::SharedArray<T, 4>(tensorstore::internal::UnownedToShared(data_ptr), layout);
+}
+
+// Helper: Construct StridedLayout for contiguous 4D buffer (used for mask reads where full_width == batch_width)
+template <typename T>
+tensorstore::SharedArray<T, 4> Build4DContiguousArrayView(T* data_ptr, int batch_width, int height_y, int num_freq, int num_stokes) {
+    std::array<tensorstore::Index, 4> shape = {static_cast<tensorstore::Index>(batch_width), static_cast<tensorstore::Index>(height_y),
+        static_cast<tensorstore::Index>(num_freq), static_cast<tensorstore::Index>(num_stokes)};
+
+    std::array<tensorstore::Index, 4> byte_strides = {static_cast<tensorstore::Index>(sizeof(T)),
+        static_cast<tensorstore::Index>(batch_width * sizeof(T)), static_cast<tensorstore::Index>(batch_width * height_y * sizeof(T)),
+        static_cast<tensorstore::Index>(batch_width * height_y * num_freq * sizeof(T))};
+
+    tensorstore::StridedLayout<4> layout(shape, byte_strides);
+    return tensorstore::SharedArray<T, 4>(tensorstore::internal::UnownedToShared(data_ptr), layout);
+}
+
+// Helper: Perform tensorstore::Read and return status
+template <typename Store, typename Array>
+absl::Status PerformTensorStoreRead(Store& store, Array& array) {
+    auto read_result = tensorstore::Read(store, array).result();
+    if (!read_result.ok()) {
+        return read_result.status();
+    }
+    return absl::OkStatus();
+}
+
+// Helper: Apply mask to data buffer by setting masked values to NaN
+void ApplyMaskToData(float* dst_ptr, int x_offset, int batch_width, int height_y, int num_freq, int num_stokes, 
+                     int width_x, const int8_t* mask_int8_buffer, float nan_value) {
+    const size_t batch_xy = static_cast<size_t>(batch_width) * height_y;
+    const size_t batch_xyf = batch_xy * num_freq;
+    const size_t image_xy = static_cast<size_t>(width_x) * height_y;
+    const size_t image_xyf = image_xy * num_freq;
+
+    for (int stokes_idx = 0; stokes_idx < num_stokes; ++stokes_idx) {
+        for (int freq_idx = 0; freq_idx < num_freq; ++freq_idx) {
+            for (int y_idx = 0; y_idx < height_y; ++y_idx) {
+                const size_t mask_base = (static_cast<size_t>(y_idx) * batch_width) + (static_cast<size_t>(freq_idx) * batch_xy) +
+                                         (static_cast<size_t>(stokes_idx) * batch_xyf);
+
+                float* data_row = dst_ptr + x_offset + (y_idx * width_x) + (freq_idx * image_xy) + (stokes_idx * image_xyf);
+
+                for (int x_idx = 0; x_idx < batch_width; ++x_idx) {
+                    if (mask_int8_buffer[mask_base + x_idx] != 0) {
+                        data_row[x_idx] = nan_value;
+                    }
+                }
+            }
+        }
+    }
+}
+
+} // anonymous namespace
+
+//-----------------------------------------------------------------------------
 // Pimpl Implementation Helper
 //-----------------------------------------------------------------------------
 struct ZarrDataReader::Impl {
@@ -336,18 +431,14 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
     const int num_freq = length[2];
     const int num_stokes = length[3];
 
-    // Time index is always 0 for now.
     const tensorstore::Index time_idx = 0;
 
-    // Get L chunk size for batching
     const int chunk_shape_l = (_chunk_shape.size() == kDimSize5D) ? _chunk_shape[3] : 512;
 
-    // Calculate columns per batch
     const size_t max_bytes = kColumnBatchMaxDataMiB * 1024 * 1024;
     const size_t bytes_per_column = static_cast<size_t>(height_y) * num_freq * num_stokes * sizeof(float);
     int cols_per_batch = static_cast<int>(max_bytes / bytes_per_column);
     cols_per_batch = std::max(cols_per_batch, chunk_shape_l);
-    // Align to chunk boundary
     cols_per_batch = (cols_per_batch / chunk_shape_l) * chunk_shape_l;
 
     float* dst_ptr = buffer.data();
@@ -356,51 +447,29 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
     while (x_offset < width_x) {
         int batch_width = std::min(cols_per_batch, width_x - x_offset);
 
-        // Align first batch to chunk boundary
         if (x_offset == 0 && (start[0] % chunk_shape_l) != 0) {
             int to_boundary = chunk_shape_l - (start[0] % chunk_shape_l);
             batch_width = std::min(to_boundary, width_x);
         }
 
-        // Create slice: [T=0, F range, P range, L batch, M full]
-        // XRADIO 5D: [T, F, P, L, M] -> CARTA 4D: [X, Y, F, S]
-        auto slice_result = _impl->store | tensorstore::Dims(0).IndexSlice(time_idx) |
-                            tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F (now dim 0 after T slice)
-                            | tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) // P
-                            | tensorstore::Dims(2).ClosedInterval(start[0] + x_offset, start[0] + x_offset + batch_width - 1) // L
-                            | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);                                         // M
-
+        auto slice_result = BuildXRadioSlice(_impl->store, start, stop, x_offset, batch_width, time_idx);
         if (!slice_result.ok()) {
             spdlog::error("ReadSlice batch slice failed: {}", slice_result.status().ToString());
             return false;
         }
 
-        // Transpose [F, P, L, M] -> [L, M, F, P]
-        auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+        auto reorder_result = TransposeToCartaOrder(std::move(slice_result));
         if (!reorder_result.ok()) {
             spdlog::error("ReadSlice reorder failed: {}", reorder_result.status().ToString());
             return false;
         }
 
-        // Destination pointer: x_offset into Fortran-order buffer [X, Y, F, S]
         float* batch_dst = dst_ptr + x_offset;
+        auto batch_array = Build4DArrayView(batch_dst, batch_width, height_y, num_freq, num_stokes, width_x);
 
-        // Strides for Fortran order in 4D [X, Y, F, S]
-        std::array<tensorstore::Index, 4> batch_shape = {static_cast<tensorstore::Index>(batch_width),
-            static_cast<tensorstore::Index>(height_y), static_cast<tensorstore::Index>(num_freq),
-            static_cast<tensorstore::Index>(num_stokes)};
-
-        std::array<tensorstore::Index, 4> batch_byte_strides = {static_cast<tensorstore::Index>(sizeof(float)),
-            static_cast<tensorstore::Index>(width_x * sizeof(float)), static_cast<tensorstore::Index>(width_x * height_y * sizeof(float)),
-            static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(float))};
-
-        tensorstore::StridedLayout<4> batch_layout(batch_shape, batch_byte_strides);
-        tensorstore::ArrayView<float, 4> batch_view(batch_dst, batch_layout);
-        auto batch_array = tensorstore::UnownedToShared(batch_view);
-
-        auto read_status = tensorstore::Read(reorder_result.value(), batch_array).result();
+        auto read_status = PerformTensorStoreRead(reorder_result.value(), batch_array);
         if (!read_status.ok()) {
-            spdlog::error("ReadSlice batch read failed: {}", read_status.status().ToString());
+            spdlog::error("ReadSlice batch read failed: {}", read_status.ToString());
             return false;
         }
 
@@ -435,24 +504,19 @@ bool ZarrDataReader::ReadMaskedSlice(casacore::Array<float>& buffer, const casac
     const int num_freq = length[2];
     const int num_stokes = length[3];
 
-    // Time index is always 0 for now.
     const tensorstore::Index time_idx = 0;
 
-    // Get L chunk size for batching
     const int chunk_shape_l = (_chunk_shape.size() == kDimSize5D) ? _chunk_shape[3] : 512;
 
-    // Calculate columns per batch
     const size_t max_bytes = kColumnBatchMaxDataMiB * 1024 * 1024;
     const size_t bytes_per_column = static_cast<size_t>(height_y) * num_freq * num_stokes * sizeof(float);
     int cols_per_batch = static_cast<int>(max_bytes / bytes_per_column);
     cols_per_batch = std::max(cols_per_batch, chunk_shape_l);
-    // Align to chunk boundary
     cols_per_batch = (cols_per_batch / chunk_shape_l) * chunk_shape_l;
 
     float* dst_ptr = buffer.data();
     int x_offset = 0;
 
-    // Reuse mask buffer across batches to reduce allocations.
     std::vector<int8_t> mask_int8_buffer;
     mask_int8_buffer.reserve(static_cast<size_t>(cols_per_batch) * height_y * num_freq * num_stokes);
 
@@ -461,118 +525,56 @@ bool ZarrDataReader::ReadMaskedSlice(casacore::Array<float>& buffer, const casac
     while (x_offset < width_x) {
         int batch_width = std::min(cols_per_batch, width_x - x_offset);
 
-        // Align first batch to chunk boundary
         if (x_offset == 0 && (start[0] % chunk_shape_l) != 0) {
             int to_boundary = chunk_shape_l - (start[0] % chunk_shape_l);
             batch_width = std::min(to_boundary, width_x);
         }
 
-        // Create slice: [T=0, F range, P range, L batch, M full]
-        // XRADIO 5D: [T, F, P, L, M] -> CARTA 4D: [X, Y, F, S]
-        auto slice_result = _impl->store | tensorstore::Dims(0).IndexSlice(time_idx) |
-                            tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F (now dim 0 after T slice)
-                            | tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) // P
-                            | tensorstore::Dims(2).ClosedInterval(start[0] + x_offset, start[0] + x_offset + batch_width - 1) // L
-                            | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);                                         // M
-
+        auto slice_result = BuildXRadioSlice(_impl->store, start, stop, x_offset, batch_width, time_idx);
         if (!slice_result.ok()) {
             spdlog::error("ReadSlice batch slice failed: {}", slice_result.status().ToString());
             return false;
         }
 
-        // Transpose [F, P, L, M] -> [L, M, F, P]
-        auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+        auto reorder_result = TransposeToCartaOrder(std::move(slice_result));
         if (!reorder_result.ok()) {
             spdlog::error("ReadSlice reorder failed: {}", reorder_result.status().ToString());
             return false;
         }
 
-        // Destination pointer: x_offset into Fortran-order buffer [X, Y, F, S]
         float* batch_dst = dst_ptr + x_offset;
+        auto batch_array = Build4DArrayView(batch_dst, batch_width, height_y, num_freq, num_stokes, width_x);
 
-        // Strides for Fortran order in 4D [X, Y, F, S]
-        std::array<tensorstore::Index, 4> batch_shape = {static_cast<tensorstore::Index>(batch_width),
-            static_cast<tensorstore::Index>(height_y), static_cast<tensorstore::Index>(num_freq),
-            static_cast<tensorstore::Index>(num_stokes)};
-
-        std::array<tensorstore::Index, 4> batch_byte_strides = {static_cast<tensorstore::Index>(sizeof(float)),
-            static_cast<tensorstore::Index>(width_x * sizeof(float)), static_cast<tensorstore::Index>(width_x * height_y * sizeof(float)),
-            static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(float))};
-
-        tensorstore::StridedLayout<4> batch_layout(batch_shape, batch_byte_strides);
-        tensorstore::ArrayView<float, 4> batch_view(batch_dst, batch_layout);
-        auto batch_array = tensorstore::UnownedToShared(batch_view);
-
-        auto read_status = tensorstore::Read(reorder_result.value(), batch_array).result();
+        auto read_status = PerformTensorStoreRead(reorder_result.value(), batch_array);
         if (!read_status.ok()) {
-            spdlog::error("ReadSlice batch read failed: {}", read_status.status().ToString());
+            spdlog::error("ReadSlice batch read failed: {}", read_status.ToString());
             return false;
         }
-
-        // Set masked pixels to NaN
 
         const size_t batch_elements = static_cast<size_t>(batch_width) * height_y * num_freq * num_stokes;
         mask_int8_buffer.resize(batch_elements);
 
-        auto mask_slice_result = _impl->mask_store | tensorstore::Dims(0).IndexSlice(time_idx) |
-                                 tensorstore::Dims(0).ClosedInterval(start[2], stop[2]) |
-                                 tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) |
-                                 tensorstore::Dims(2).ClosedInterval(start[0] + x_offset, start[0] + x_offset + batch_width - 1) |
-                                 tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);
-
+        auto mask_slice_result = BuildXRadioSlice(_impl->mask_store, start, stop, x_offset, batch_width, time_idx);
         if (!mask_slice_result.ok()) {
             spdlog::error("ReadMaskedSlice mask slice failed: {}", mask_slice_result.status().ToString());
             return false;
         }
 
-        auto mask_reorder_result = std::move(mask_slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+        auto mask_reorder_result = TransposeToCartaOrder(std::move(mask_slice_result));
         if (!mask_reorder_result.ok()) {
             spdlog::error("ReadMaskedSlice mask reorder failed: {}", mask_reorder_result.status().ToString());
             return false;
         }
 
-        // Read mask into a contiguous buffer with layout [X(batch), Y, F, S].
-        std::array<tensorstore::Index, 4> mask_shape = {static_cast<tensorstore::Index>(batch_width),
-            static_cast<tensorstore::Index>(height_y), static_cast<tensorstore::Index>(num_freq),
-            static_cast<tensorstore::Index>(num_stokes)};
+        auto mask_array = Build4DContiguousArrayView(mask_int8_buffer.data(), batch_width, height_y, num_freq, num_stokes);
 
-        std::array<tensorstore::Index, 4> mask_byte_strides = {static_cast<tensorstore::Index>(sizeof(int8_t)),
-            static_cast<tensorstore::Index>(batch_width * sizeof(int8_t)),
-            static_cast<tensorstore::Index>(batch_width * height_y * sizeof(int8_t)),
-            static_cast<tensorstore::Index>(batch_width * height_y * num_freq * sizeof(int8_t))};
-
-        tensorstore::StridedLayout<4> mask_layout(mask_shape, mask_byte_strides);
-        tensorstore::ArrayView<int8_t, 4> mask_view(mask_int8_buffer.data(), mask_layout);
-        auto mask_array = tensorstore::UnownedToShared(mask_view);
-
-        auto mask_read_status = tensorstore::Read(mask_reorder_result.value(), mask_array).result();
+        auto mask_read_status = PerformTensorStoreRead(mask_reorder_result.value(), mask_array);
         if (!mask_read_status.ok()) {
-            spdlog::error("ReadMaskedSlice mask read failed: {}", mask_read_status.status().ToString());
+            spdlog::error("ReadMaskedSlice mask read failed: {}", mask_read_status.ToString());
             return false;
         }
 
-        // Apply mask in-place. Mask semantics: 0 = valid, non-zero = masked.
-        const size_t batch_xy = static_cast<size_t>(batch_width) * height_y;
-        const size_t batch_xyf = batch_xy * num_freq;
-        const size_t image_xy = static_cast<size_t>(width_x) * height_y;
-        const size_t image_xyf = image_xy * num_freq;
-
-        for (int stokes_idx = 0; stokes_idx < num_stokes; ++stokes_idx) {
-            for (int freq_idx = 0; freq_idx < num_freq; ++freq_idx) {
-                for (int y_idx = 0; y_idx < height_y; ++y_idx) {
-                    const size_t mask_base = (static_cast<size_t>(y_idx) * batch_width) + (static_cast<size_t>(freq_idx) * batch_xy) +
-                                             (static_cast<size_t>(stokes_idx) * batch_xyf);
-
-                    float* data_row = dst_ptr + x_offset + (y_idx * width_x) + (freq_idx * image_xy) + (stokes_idx * image_xyf);
-
-                    for (int x_idx = 0; x_idx < batch_width; ++x_idx) {
-                        if (mask_int8_buffer[mask_base + x_idx] != 0) {
-                            data_row[x_idx] = nan_value;
-                        }
-                    }
-                }
-            }
-        }
+        ApplyMaskToData(dst_ptr, x_offset, batch_width, height_y, num_freq, num_stokes, width_x, mask_int8_buffer.data(), nan_value);
 
         x_offset += batch_width;
     }
@@ -1049,12 +1051,9 @@ bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore
         return false;
     }
 
-    // Use cached mask store via EnsureMaskStore
-    // Note: EnsureMaskStore should be called within the lock to ensure thread safety
     std::lock_guard<std::mutex> lock(_read_mutex);
 
     if (!EnsureMaskStore()) {
-        // No mask - return all true
         buffer.resize(section.length());
         buffer = true;
         return false;
@@ -1071,16 +1070,9 @@ bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore
         const int num_stokes = length[3];
         const size_t num_elements = static_cast<size_t>(width_x) * height_y * num_freq * num_stokes;
 
-        // Time index is always 0
         const tensorstore::Index time_idx = 0;
 
-        // Create slice using cached mask store: XRADIO 5D [T, F, P, L, M] -> CARTA 4D [X, Y, F, S]
-        auto slice_result = _impl->mask_store | tensorstore::Dims(0).IndexSlice(time_idx) |
-                            tensorstore::Dims(0).ClosedInterval(start[2], stop[2])    // F
-                            | tensorstore::Dims(1).ClosedInterval(start[3], stop[3])  // P
-                            | tensorstore::Dims(2).ClosedInterval(start[0], stop[0])  // L (X)
-                            | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]); // M (Y)
-
+        auto slice_result = BuildXRadioSlice(_impl->mask_store, start, stop, 0, width_x, time_idx);
         if (!slice_result.ok()) {
             spdlog::error("ReadMaskSlice: Slice failed: {}", slice_result.status().ToString());
             buffer.resize(section.length());
@@ -1088,8 +1080,7 @@ bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore
             return false;
         }
 
-        // Transpose [F, P, L, M] -> [L, M, F, P] (CARTA order)
-        auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+        auto reorder_result = TransposeToCartaOrder(std::move(slice_result));
         if (!reorder_result.ok()) {
             spdlog::error("ReadMaskSlice: Reorder failed: {}", reorder_result.status().ToString());
             buffer.resize(section.length());
@@ -1097,31 +1088,19 @@ bool ZarrDataReader::ReadMaskSlice(casacore::Array<bool>& buffer, const casacore
             return false;
         }
 
-        // Read into int8_t buffer first (mask is stored as int8)
         std::vector<int8_t> int8_buffer(num_elements);
         int8_t* int8_ptr = int8_buffer.data();
 
-        std::array<tensorstore::Index, 4> output_shape = {static_cast<tensorstore::Index>(width_x),
-            static_cast<tensorstore::Index>(height_y), static_cast<tensorstore::Index>(num_freq),
-            static_cast<tensorstore::Index>(num_stokes)};
+        auto output_array = Build4DContiguousArrayView(int8_ptr, width_x, height_y, num_freq, num_stokes);
 
-        std::array<tensorstore::Index, 4> byte_strides = {static_cast<tensorstore::Index>(sizeof(int8_t)),
-            static_cast<tensorstore::Index>(width_x * sizeof(int8_t)), static_cast<tensorstore::Index>(width_x * height_y * sizeof(int8_t)),
-            static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(int8_t))};
-
-        tensorstore::StridedLayout<4> output_layout(output_shape, byte_strides);
-        tensorstore::ArrayView<int8_t, 4> output_view(int8_ptr, output_layout);
-        auto output_array = tensorstore::UnownedToShared(output_view);
-
-        auto read_status = tensorstore::Read(reorder_result.value(), output_array).result();
+        auto read_status = PerformTensorStoreRead(reorder_result.value(), output_array);
         if (!read_status.ok()) {
-            spdlog::error("ReadMaskSlice: Read failed: {}", read_status.status().ToString());
+            spdlog::error("ReadMaskSlice: Read failed: {}", read_status.ToString());
             buffer.resize(section.length());
             buffer = true;
             return false;
         }
 
-        // Convert int8 to bool: zero = true (valid), non-zero = false (masked)
         buffer.resize(length);
         bool* bool_ptr = buffer.data();
         for (size_t i = 0; i < num_elements; ++i) {
