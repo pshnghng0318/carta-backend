@@ -1568,10 +1568,10 @@ void CartaZarrImage::initializeTensorStore() {
         // Create TensorStore context with aggressive parallelization
         // Using all available CPU cores for maximum I/O and decode throughput
         // Cache size calculation: 4 channels × 7763×4742 pixels × 4 bytes/pixel = ~560MB
-        // Set to 128MB to test smaller cache for PV diagram performance
+        // Set to 512MB to accommodate typical multi-channel viewing without excessive memory usage
         nlohmann::json context_spec = {
             {"cache_pool", {
-                {"total_bytes_limit", 128ULL << 20}  // 128MB cache limit - testing smaller cache
+                {"total_bytes_limit", 512ULL << 20}  // 512MB cache limit - sufficient for ~4 full channels
             }},
             {"data_copy_concurrency", {
                 {"limit", num_cpus}  // Use all CPU cores for chunk decode operations
@@ -1584,7 +1584,7 @@ void CartaZarrImage::initializeTensorStore() {
         auto context_result = tensorstore::Context::FromJson(context_spec);
         if (context_result.ok()) {
             _context = context_result.value();
-            spdlog::info("TensorStore context initialized: {} CPU cores, 128MB cache, {}-thread data_copy_concurrency, {}-thread file_io_concurrency",
+            spdlog::info("TensorStore context initialized: {} CPU cores, 512MB cache, {}-thread data_copy_concurrency, {}-thread file_io_concurrency",
                         num_cpus, num_cpus, num_cpus);
         } else {
             spdlog::warn("Failed to create TensorStore context with cache and concurrency: {}, using default", 
