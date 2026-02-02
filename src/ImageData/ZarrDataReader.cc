@@ -126,7 +126,8 @@ absl::Status PerformTensorStoreRead(Store& store, Array& array) {
 
 // Helper: Open a Zarr array using TensorStore and return the result
 // Returns empty result on failure (check .ok() on the returned value)
-tensorstore::Result<tensorstore::TensorStore<>> OpenZarrArray(const std::string& array_path) {
+tensorstore::Result<tensorstore::TensorStore<>> OpenZarrArray(
+    const std::string& array_path, const tensorstore::Context& context = tensorstore::Context::Default()) {
     nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", array_path}}}};
 
     auto spec_result = tensorstore::Spec::FromJson(spec_json);
@@ -134,8 +135,7 @@ tensorstore::Result<tensorstore::TensorStore<>> OpenZarrArray(const std::string&
         return spec_result.status();
     }
 
-    auto open_future = tensorstore::Open(
-        spec_result.value(), tensorstore::Context::Default(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
+    auto open_future = tensorstore::Open(spec_result.value(), context, tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
 
     return open_future.result();
 }
@@ -371,19 +371,7 @@ bool ZarrDataReader::Initialize() {
         // Try to read .zmetadata
         _impl->LoadZmetadata(_filename);
 
-        nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", array_path}}}};
-
-        auto spec_result = tensorstore::Spec::FromJson(spec_json);
-        if (!spec_result.ok()) {
-            spdlog::error("Failed to create TensorStore spec: {}", spec_result.status().ToString());
-            return false;
-        }
-
-        // Use shared context for all ZarrDataReader instances (saves memory and init time)
-        auto open_future =
-            tensorstore::Open(spec_result.value(), Impl::GetSharedContext(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
-
-        auto open_result = open_future.result();
+        auto open_result = OpenZarrArray(array_path, Impl::GetSharedContext());
         if (!open_result.ok()) {
             spdlog::error("Failed to open TensorStore: {}", open_result.status().ToString());
             return false;
@@ -926,33 +914,20 @@ bool ZarrDataReader::EnsureMaskStore() {
     }
 
     try {
-        // Open mask array and cache it
         std::filesystem::path full_mask_path = std::filesystem::path(_filename) / mask_path;
-        nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", full_mask_path.string()}}}};
 
-        auto spec_result = tensorstore::Spec::FromJson(spec_json);
-        if (!spec_result.ok()) {
-            spdlog::warn("EnsureMaskStore: Failed to create spec: {}", spec_result.status().ToString());
-            return false;
-        }
-
-        auto open_future =
-            tensorstore::Open(spec_result.value(), Impl::GetSharedContext(), tensorstore::OpenMode::open, tensorstore::ReadWriteMode::read);
-
-        auto open_result = open_future.result();
+        auto open_result = OpenZarrArray(full_mask_path.string(), Impl::GetSharedContext());
         if (!open_result.ok()) {
             spdlog::warn("EnsureMaskStore: Failed to open mask array: {}", open_result.status().ToString());
             return false;
         }
 
-        // Verify mask has expected 5D shape
         auto domain = open_result.value().domain();
         if (domain.rank() != kDimSize5D) {
             spdlog::warn("EnsureMaskStore: Mask array has unexpected rank {} (expected 5)", domain.rank());
             return false;
         }
 
-        // Cast to int8_t store and cache (mask is typically stored as int8 with 0/1 values)
         auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<int8_t>>(open_result.value());
         if (!typed_store_result.ok()) {
             spdlog::warn("EnsureMaskStore: Error casting to int8 store: {}", typed_store_result.status().ToString());
