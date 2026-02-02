@@ -358,7 +358,7 @@ bool FileLoader::GetSlice(casacore::Array<float>& data, const StokesSlicer& stok
             // Use cfitsio for slice
             return image->doGetSlice(data, slicer);
         }
-        if (image_type == "CartaZarrImage" && !image->isMasked()) {
+        if (image_type == "CartaZarrImage") {
             // Use CartaZarrImage for slice
             return image->doGetSlice(data, slicer);
         }

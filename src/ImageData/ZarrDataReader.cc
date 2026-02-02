@@ -13,6 +13,7 @@
 #include <cstddef>
 #include <filesystem>
 #include <fstream>
+#include <limits>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -401,6 +402,176 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
         if (!read_status.ok()) {
             spdlog::error("ReadSlice batch read failed: {}", read_status.status().ToString());
             return false;
+        }
+
+        x_offset += batch_width;
+    }
+
+    return true;
+}
+
+bool ZarrDataReader::ReadMaskedSlice(casacore::Array<float>& buffer, const casacore::Slicer& section) {
+    if (!EnsureMaskStore()) {
+        return ReadSlice(buffer, section);
+    }
+
+    if (!_initialized) {
+        spdlog::error("ZarrDataReader not initialized");
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(_read_mutex);
+
+    const auto& start = section.start();
+    const auto& stop = section.end();
+    const auto& length = section.length();
+
+    spdlog::debug("ZarrDataReader::ReadSlice: start={}, stop={}, length={}", start.toString(), stop.toString(), length.toString());
+
+    buffer.resize(length);
+
+    const int width_x = length[0];
+    const int height_y = length[1];
+    const int num_freq = length[2];
+    const int num_stokes = length[3];
+
+    // Time index is always 0 for now.
+    const tensorstore::Index time_idx = 0;
+
+    // Get L chunk size for batching
+    const int chunk_shape_l = (_chunk_shape.size() == kDimSize5D) ? _chunk_shape[3] : 512;
+
+    // Calculate columns per batch
+    const size_t max_bytes = kColumnBatchMaxDataMiB * 1024 * 1024;
+    const size_t bytes_per_column = static_cast<size_t>(height_y) * num_freq * num_stokes * sizeof(float);
+    int cols_per_batch = static_cast<int>(max_bytes / bytes_per_column);
+    cols_per_batch = std::max(cols_per_batch, chunk_shape_l);
+    // Align to chunk boundary
+    cols_per_batch = (cols_per_batch / chunk_shape_l) * chunk_shape_l;
+
+    float* dst_ptr = buffer.data();
+    int x_offset = 0;
+
+    // Reuse mask buffer across batches to reduce allocations.
+    std::vector<int8_t> mask_int8_buffer;
+    mask_int8_buffer.reserve(static_cast<size_t>(cols_per_batch) * height_y * num_freq * num_stokes);
+
+    const float nan_value = std::numeric_limits<float>::quiet_NaN();
+
+    while (x_offset < width_x) {
+        int batch_width = std::min(cols_per_batch, width_x - x_offset);
+
+        // Align first batch to chunk boundary
+        if (x_offset == 0 && (start[0] % chunk_shape_l) != 0) {
+            int to_boundary = chunk_shape_l - (start[0] % chunk_shape_l);
+            batch_width = std::min(to_boundary, width_x);
+        }
+
+        // Create slice: [T=0, F range, P range, L batch, M full]
+        // XRADIO 5D: [T, F, P, L, M] -> CARTA 4D: [X, Y, F, S]
+        auto slice_result = _impl->store | tensorstore::Dims(0).IndexSlice(time_idx) |
+                            tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F (now dim 0 after T slice)
+                            | tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) // P
+                            | tensorstore::Dims(2).ClosedInterval(start[0] + x_offset, start[0] + x_offset + batch_width - 1) // L
+                            | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);                                         // M
+
+        if (!slice_result.ok()) {
+            spdlog::error("ReadSlice batch slice failed: {}", slice_result.status().ToString());
+            return false;
+        }
+
+        // Transpose [F, P, L, M] -> [L, M, F, P]
+        auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+        if (!reorder_result.ok()) {
+            spdlog::error("ReadSlice reorder failed: {}", reorder_result.status().ToString());
+            return false;
+        }
+
+        // Destination pointer: x_offset into Fortran-order buffer [X, Y, F, S]
+        float* batch_dst = dst_ptr + x_offset;
+
+        // Strides for Fortran order in 4D [X, Y, F, S]
+        std::array<tensorstore::Index, 4> batch_shape = {static_cast<tensorstore::Index>(batch_width),
+            static_cast<tensorstore::Index>(height_y), static_cast<tensorstore::Index>(num_freq),
+            static_cast<tensorstore::Index>(num_stokes)};
+
+        std::array<tensorstore::Index, 4> batch_byte_strides = {static_cast<tensorstore::Index>(sizeof(float)),
+            static_cast<tensorstore::Index>(width_x * sizeof(float)), static_cast<tensorstore::Index>(width_x * height_y * sizeof(float)),
+            static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(float))};
+
+        tensorstore::StridedLayout<4> batch_layout(batch_shape, batch_byte_strides);
+        tensorstore::ArrayView<float, 4> batch_view(batch_dst, batch_layout);
+        auto batch_array = tensorstore::UnownedToShared(batch_view);
+
+        auto read_status = tensorstore::Read(reorder_result.value(), batch_array).result();
+        if (!read_status.ok()) {
+            spdlog::error("ReadSlice batch read failed: {}", read_status.status().ToString());
+            return false;
+        }
+
+        // Set masked pixels to NaN
+
+        const size_t batch_elements = static_cast<size_t>(batch_width) * height_y * num_freq * num_stokes;
+        mask_int8_buffer.resize(batch_elements);
+
+        auto mask_slice_result = _impl->mask_store | tensorstore::Dims(0).IndexSlice(time_idx) |
+                                 tensorstore::Dims(0).ClosedInterval(start[2], stop[2]) |
+                                 tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) |
+                                 tensorstore::Dims(2).ClosedInterval(start[0] + x_offset, start[0] + x_offset + batch_width - 1) |
+                                 tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);
+
+        if (!mask_slice_result.ok()) {
+            spdlog::error("ReadMaskedSlice mask slice failed: {}", mask_slice_result.status().ToString());
+            return false;
+        }
+
+        auto mask_reorder_result = std::move(mask_slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+        if (!mask_reorder_result.ok()) {
+            spdlog::error("ReadMaskedSlice mask reorder failed: {}", mask_reorder_result.status().ToString());
+            return false;
+        }
+
+        // Read mask into a contiguous buffer with layout [X(batch), Y, F, S].
+        std::array<tensorstore::Index, 4> mask_shape = {static_cast<tensorstore::Index>(batch_width),
+            static_cast<tensorstore::Index>(height_y), static_cast<tensorstore::Index>(num_freq),
+            static_cast<tensorstore::Index>(num_stokes)};
+
+        std::array<tensorstore::Index, 4> mask_byte_strides = {static_cast<tensorstore::Index>(sizeof(int8_t)),
+            static_cast<tensorstore::Index>(batch_width * sizeof(int8_t)),
+            static_cast<tensorstore::Index>(batch_width * height_y * sizeof(int8_t)),
+            static_cast<tensorstore::Index>(batch_width * height_y * num_freq * sizeof(int8_t))};
+
+        tensorstore::StridedLayout<4> mask_layout(mask_shape, mask_byte_strides);
+        tensorstore::ArrayView<int8_t, 4> mask_view(mask_int8_buffer.data(), mask_layout);
+        auto mask_array = tensorstore::UnownedToShared(mask_view);
+
+        auto mask_read_status = tensorstore::Read(mask_reorder_result.value(), mask_array).result();
+        if (!mask_read_status.ok()) {
+            spdlog::error("ReadMaskedSlice mask read failed: {}", mask_read_status.status().ToString());
+            return false;
+        }
+
+        // Apply mask in-place. Mask semantics: 0 = valid, non-zero = masked.
+        const size_t batch_xy = static_cast<size_t>(batch_width) * height_y;
+        const size_t batch_xyf = batch_xy * num_freq;
+        const size_t image_xy = static_cast<size_t>(width_x) * height_y;
+        const size_t image_xyf = image_xy * num_freq;
+
+        for (int stokes_idx = 0; stokes_idx < num_stokes; ++stokes_idx) {
+            for (int freq_idx = 0; freq_idx < num_freq; ++freq_idx) {
+                for (int y_idx = 0; y_idx < height_y; ++y_idx) {
+                    const size_t mask_base = (static_cast<size_t>(y_idx) * batch_width) + (static_cast<size_t>(freq_idx) * batch_xy) +
+                                             (static_cast<size_t>(stokes_idx) * batch_xyf);
+
+                    float* data_row = dst_ptr + x_offset + (y_idx * width_x) + (freq_idx * image_xy) + (stokes_idx * image_xyf);
+
+                    for (int x_idx = 0; x_idx < batch_width; ++x_idx) {
+                        if (mask_int8_buffer[mask_base + x_idx] != 0) {
+                            data_row[x_idx] = nan_value;
+                        }
+                    }
+                }
+            }
         }
 
         x_offset += batch_width;

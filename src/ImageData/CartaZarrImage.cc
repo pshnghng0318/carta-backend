@@ -771,7 +771,7 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
         spdlog::error("ZarrDataReader not initialized");
         return false;
     }
-    return _reader->ReadSlice(buffer, section);
+    return _reader->ReadMaskedSlice(buffer, section);
 }
 
 void CartaZarrImage::doPutSlice(const Array<float>& buffer, const IPosition& where, const IPosition& stride) {

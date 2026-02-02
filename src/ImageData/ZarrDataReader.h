@@ -50,6 +50,14 @@ public:
     bool ReadSlice(casacore::Array<float>& buffer, const casacore::Slicer& section);
 
     /**
+     * @brief Read a slice of data directly from TensorStore with masked pixels set to NaN.
+     * @param section The slicer defining the region to read (CARTA coordinates)
+     * @param buffer Output array to fill with data
+     * @return true if read succeeded
+     */
+    bool ReadMaskedSlice(casacore::Array<float>& buffer, const casacore::Slicer& section);
+
+    /**
      * @brief Read a chunk of data for TileCache integration.
      * @param data Output vector to fill with chunk data
      * @param data_width Output: actual width of returned data
