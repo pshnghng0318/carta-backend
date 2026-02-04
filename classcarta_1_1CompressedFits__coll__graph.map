@@ -1,0 +1,19 @@
+<map id="carta::CompressedFits" name="carta::CompressedFits">
+<area shape="rect" id="Node000001" title=" " alt="" coords="672,157,839,182"/>
+<area shape="rect" id="Node000002" title=" " alt="" coords="317,23,404,49"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="418,30,469,30,528,35,590,46,649,67,681,86,708,110,747,155,743,158,705,114,678,91,647,72,589,51,527,40,469,35,418,35"/>
+<area shape="rect" id="Node000003" title=" " alt="" coords="5,16,144,56"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="158,33,317,33,317,39,158,39"/>
+<area shape="rect" id="Node000004" title=" " alt="" coords="299,73,422,98"/>
+<area shape="poly" id="edge3_Node000001_Node000004" title=" " alt="" coords="436,83,538,90,594,99,649,112,697,132,736,154,733,159,694,137,647,117,593,104,537,96,436,88"/>
+<area shape="rect" id="Node000005" title=" " alt="" coords="335,122,386,147"/>
+<area shape="poly" id="edge4_Node000001_Node000005" title=" " alt="" coords="400,135,672,159,672,165,400,141"/>
+<area shape="rect" id="Node000006" title=" " alt="" coords="279,172,443,212"/>
+<area shape="poly" id="edge5_Node000001_Node000006" title=" " alt="" coords="456,193,549,192,648,187,696,179,697,185,648,192,549,198,456,198"/>
+<area shape="rect" id="Node000007" title=" " alt="" coords="45,179,105,205"/>
+<area shape="poly" id="edge6_Node000006_Node000007" title=" " alt="" coords="119,189,278,189,278,195,119,195"/>
+<area shape="rect" id="Node000008" title=" " alt="" coords="257,237,464,262"/>
+<area shape="poly" id="edge7_Node000001_Node000008" title=" " alt="" coords="478,241,562,231,647,213,691,198,729,180,731,185,693,203,649,219,562,236,478,246"/>
+<area shape="rect" id="Node000009" title=" " alt="" coords="321,286,400,311"/>
+<area shape="poly" id="edge8_Node000001_Node000009" title=" " alt="" coords="414,298,465,298,524,292,587,281,647,260,677,243,703,221,742,180,746,184,707,225,680,247,649,265,588,286,525,298,465,303,414,304"/>
+</map>

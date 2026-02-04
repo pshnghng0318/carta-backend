@@ -1,0 +1,14 @@
+<map id="carta::RegionHandler::FillRegionHistogramData" name="carta::RegionHandler::FillRegionHistogramData">
+<area shape="rect" id="Node000001" title=" " alt="" coords="5,55,199,95"/>
+<area shape="rect" id="Node000002" href="$namespacecarta.html#ae5bfb75401cfd7c9a7ff703988e6e4b7" title="Apply Region to image in Frame in image coordinates." alt="" coords="247,5,419,31"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="182,53,267,31,268,37,184,58"/>
+<area shape="rect" id="Node000003" href="$classcarta_1_1RegionHandler.html#a4d3eaa8da979a4b0640aa3b598a9415b" title=" " alt="" coords="253,55,412,95"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="199,73,240,73,240,78,199,78"/>
+<area shape="rect" id="Node000005" href="$classcarta_1_1RegionHandler.html#a8c787facbcb265d7fa434e05324f2c9e" title=" " alt="" coords="253,119,412,159"/>
+<area shape="poly" id="edge4_Node000001_Node000005" title=" " alt="" coords="176,93,248,113,246,118,174,98"/>
+<area shape="rect" id="Node000004" href="$classcarta_1_1RegionHandler.html#a9e8b41c9fe29c95b66a44f78490bbcae" title=" " alt="" coords="467,55,625,95"/>
+<area shape="poly" id="edge3_Node000003_Node000004" title=" " alt="" coords="412,73,453,73,453,78,412,78"/>
+<area shape="poly" id="edge6_Node000005_Node000004" title=" " alt="" coords="399,117,465,97,466,102,401,122"/>
+<area shape="rect" id="Node000006" href="$classcarta_1_1RegionHandler.html#a16e8f0e73ba63be909517151bf11a450" title=" " alt="" coords="467,119,625,159"/>
+<area shape="poly" id="edge5_Node000005_Node000006" title=" " alt="" coords="412,137,453,137,453,142,412,142"/>
+</map>

@@ -1,0 +1,9 @@
+<map id="carta::Session::CalculateAnimationFlowWindow" name="carta::Session::CalculateAnimationFlowWindow">
+<area shape="rect" id="Node000001" title=" " alt="" coords="563,37,745,77"/>
+<area shape="rect" id="Node000002" href="$classcarta_1_1AnimationTask.html#a7196ee6f67508506515bf8ffe5571033" title=" " alt="" coords="318,5,477,45"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="549,47,477,38,477,33,549,42"/>
+<area shape="rect" id="Node000003" href="$classcarta_1_1Session.html#a5738e575acc2761f8fa66254811b38e4" title=" " alt="" coords="280,69,515,109"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="549,73,515,77,515,72,549,68"/>
+<area shape="rect" id="Node000004" href="$classcarta_1_1SessionManager.html#a642ecdf35f6781582ee5bcc7843b3d73" title=" " alt="" coords="5,69,232,109"/>
+<area shape="poly" id="edge3_Node000003_Node000004" title=" " alt="" coords="266,92,232,92,232,87,266,87"/>
+</map>

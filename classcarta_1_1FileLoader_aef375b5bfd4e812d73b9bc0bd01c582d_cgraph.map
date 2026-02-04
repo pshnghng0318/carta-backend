@@ -1,0 +1,17 @@
+<map id="carta::FileLoader::GetSubImage" name="carta::FileLoader::GetSubImage">
+<area shape="rect" id="Node000001" title=" " alt="" coords="5,37,144,77"/>
+<area shape="rect" id="Node000002" href="$classcarta_1_1FileLoader.html#ad006f05ccd020be05834212598e3a38b" title=" " alt="" coords="192,37,331,77"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="145,55,178,55,178,60,145,60"/>
+<area shape="rect" id="Node000003" href="$classcarta_1_1FileLoader.html#a1ec9887a1de28cd550d9ebe22f016976" title=" " alt="" coords="379,5,531,45"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="331,43,365,38,366,43,331,49"/>
+<area shape="rect" id="Node000004" href="$classcarta_1_1FileLoader.html#a5d91045ea868fea755a7be026806cea0" title=" " alt="" coords="385,69,524,109"/>
+<area shape="poly" id="edge3_Node000002_Node000004" title=" " alt="" coords="331,66,372,73,371,78,331,71"/>
+<area shape="rect" id="Node000005" href="$classcarta_1_1FileLoader.html#ad372c5af25778bf6f0621b587e1f9c78" title=" " alt="" coords="579,40,717,80"/>
+<area shape="poly" id="edge4_Node000004_Node000005" title=" " alt="" coords="524,76,564,70,565,75,525,81"/>
+<area shape="rect" id="Node000006" href="$Casacore_8cc.html#a8733accb41db0f83703779c667ae852e" title="Normalizes a given unit string to conform to standard Casacore unit conventions (case&#45;sensitive)." alt="" coords="590,105,706,130"/>
+<area shape="poly" id="edge5_Node000004_Node000006" title=" " alt="" coords="525,97,577,104,576,110,524,102"/>
+<area shape="rect" id="Node000007" href="$Casacore_8cc.html#af1417964e00800b515ec0913adaa1957" title="Check if input unit string is in the format used by the GILDAS CLASS software." alt="" coords="765,105,867,130"/>
+<area shape="poly" id="edge6_Node000006_Node000007" title=" " alt="" coords="706,115,751,115,751,120,706,120"/>
+<area shape="rect" id="Node000008" href="$Casacore_8cc.html#a8bd36af5b1f82b7ccee35f089787ec99" title=" " alt="" coords="915,105,1036,130"/>
+<area shape="poly" id="edge7_Node000007_Node000008" title=" " alt="" coords="867,115,901,115,901,120,867,120"/>
+</map>

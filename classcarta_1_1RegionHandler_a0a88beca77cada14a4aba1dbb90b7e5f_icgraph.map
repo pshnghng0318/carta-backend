@@ -1,0 +1,8 @@
+<map id="carta::RegionHandler::IsLineRegion" name="carta::RegionHandler::IsLineRegion">
+<area shape="rect" id="Node000001" title=" " alt="" coords="240,61,399,101"/>
+<area shape="rect" id="Node000002" href="$classcarta_1_1RegionHandler.html#a572070177a99ad38ff8703936776a08b" title=" " alt="" coords="19,29,178,69"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="226,71,178,63,179,58,227,65"/>
+<area shape="rect" id="Node000003" href="$classcarta_1_1RegionHandler.html#afa21461846d5952411c6e6284d962e83" title=" " alt="" coords="5,93,192,133"/>
+<area shape="poly" id="edge3_Node000001_Node000003" title=" " alt="" coords="227,97,192,102,192,97,226,92"/>
+<area shape="poly" id="edge2_Node000002_Node000002" title=" " alt="" coords="136,18,123,11,99,8,78,10,65,15,60,21,63,28,58,30,55,20,62,10,76,5,99,3,124,6,138,13"/>
+</map>

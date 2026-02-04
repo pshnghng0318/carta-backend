@@ -1,0 +1,17 @@
+<map id="carta::LineBoxRegions::GetPolygonRegionState" name="carta::LineBoxRegions::GetPolygonRegionState">
+<area shape="rect" id="Node000001" title=" " alt="" coords="948,69,1132,109"/>
+<area shape="rect" id="Node000002" href="$classcarta_1_1LineBoxRegions.html#a72a143302eecd02b957b4115727684aa" title=" " alt="" coords="711,69,900,109"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="934,92,900,92,900,87,934,87"/>
+<area shape="rect" id="Node000003" href="$classcarta_1_1LineBoxRegions.html#aae7e0083e6c7541ed0121160bb1c8266" title=" " alt="" coords="496,69,663,109"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="697,92,663,92,663,87,697,87"/>
+<area shape="rect" id="Node000004" href="$classcarta_1_1RegionHandler.html#a7d419cae3ba9a6b3f2435cde1d6838ee" title=" " alt="" coords="248,5,448,45"/>
+<area shape="poly" id="edge3_Node000003_Node000004" title=" " alt="" coords="493,68,420,48,422,43,494,63"/>
+<area shape="rect" id="Node000005" href="$classcarta_1_1RegionSpatialProfile.html#a1c06cf53dfa7012cd6ab593c05d5bbb8" title="Calculate profile for line region by approximating as a box region for each pixel." alt="" coords="251,69,445,109"/>
+<area shape="poly" id="edge4_Node000003_Node000005" title=" " alt="" coords="482,92,445,92,445,87,482,87"/>
+<area shape="rect" id="Node000007" href="$classcarta_1_1RegionHandler.html#a1154ddc668a4a9205dfd08ccc00cf4f1" title=" " alt="" coords="269,133,427,173"/>
+<area shape="poly" id="edge6_Node000003_Node000007" title=" " alt="" coords="494,116,422,136,420,131,493,110"/>
+<area shape="rect" id="Node000006" href="$classcarta_1_1RegionSpatialProfile.html#a2f833cec5c4b1a03243d007f84efb7fb" title="Add calculated spatial profile for line region to message." alt="" coords="5,69,200,109"/>
+<area shape="poly" id="edge5_Node000005_Node000006" title=" " alt="" coords="237,92,200,92,200,87,237,87"/>
+<area shape="rect" id="Node000008" href="$classcarta_1_1RegionHandler.html#a981ef720799967df543e0b272a17f6cb" title=" " alt="" coords="23,133,182,173"/>
+<area shape="poly" id="edge7_Node000007_Node000008" title=" " alt="" coords="255,156,182,156,182,151,255,151"/>
+</map>

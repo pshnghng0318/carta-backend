@@ -1,0 +1,13 @@
+<map id="carta::TileCache::UnsafePeek" name="carta::TileCache::UnsafePeek">
+<area shape="rect" id="Node000001" title="Retrieve a tile from the cache." alt="" coords="721,67,935,93"/>
+<area shape="rect" id="Node000002" href="$classcarta_1_1TileCache.html#a4eda64cc5324f96a16c6b877ab4ce7cc" title="Retrieve a tile from the cache." alt="" coords="511,42,669,67"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="707,70,669,66,670,60,708,65"/>
+<area shape="rect" id="Node000006" href="$classcarta_1_1TileCache.html#a9e0945f80607eeea5c15df193b44befa" title="Retrieve a tile from the cache without modifying its access time." alt="" coords="507,91,673,117"/>
+<area shape="poly" id="edge5_Node000001_Node000006" title=" " alt="" coords="708,95,674,98,673,93,707,89"/>
+<area shape="rect" id="Node000003" href="$classcarta_1_1Frame.html#ab10e1fa7c331dabd9047c515ad1a7f65" title=" " alt="" coords="255,5,431,45"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="497,46,430,38,431,33,498,41"/>
+<area shape="rect" id="Node000004" href="$classcarta_1_1Frame.html#a99d23a98a6fb7dfa96b52347bc8828f7" title=" " alt="" coords="227,70,459,95"/>
+<area shape="poly" id="edge3_Node000002_Node000004" title=" " alt="" coords="497,68,455,73,454,67,497,63"/>
+<area shape="rect" id="Node000005" href="$classcarta_1_1Frame.html#ac85b1453501c53e497a6a28dfa1eb4ec" title=" " alt="" coords="5,63,179,103"/>
+<area shape="poly" id="edge4_Node000004_Node000005" title=" " alt="" coords="213,85,179,85,179,80,213,80"/>
+</map>

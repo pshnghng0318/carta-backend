@@ -1,0 +1,17 @@
+<map id="carta::RegionHandler::IsClosedRegion" name="carta::RegionHandler::IsClosedRegion">
+<area shape="rect" id="Node000001" title=" " alt="" coords="499,157,657,197"/>
+<area shape="rect" id="Node000002" href="$classcarta_1_1RegionHandler.html#a9fc8e855f922f23cc072d0706f53c805" title=" " alt="" coords="245,61,445,101"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="528,153,450,116,417,104,419,99,452,111,530,148"/>
+<area shape="rect" id="Node000005" href="$classcarta_1_1RegionHandler.html#ac080cc297d2d25110faca808755a7467" title=" " alt="" coords="240,125,451,165"/>
+<area shape="poly" id="edge6_Node000001_Node000005" title=" " alt="" coords="484,167,450,162,451,157,485,162"/>
+<area shape="rect" id="Node000006" href="$classcarta_1_1RegionHandler.html#ae05f9bc832b30378281c5897edee7339" title=" " alt="" coords="248,189,443,229"/>
+<area shape="poly" id="edge7_Node000001_Node000006" title=" " alt="" coords="485,193,443,199,442,193,484,188"/>
+<area shape="rect" id="Node000007" href="$classcarta_1_1RegionHandler.html#a0917d5f2e048be320f6998267fe808a1" title=" " alt="" coords="258,253,433,293"/>
+<area shape="poly" id="edge8_Node000001_Node000007" title=" " alt="" coords="530,207,452,244,419,256,417,251,450,239,528,202"/>
+<area shape="poly" id="edge4_Node000002_Node000002" title=" " alt="" coords="385,50,371,43,345,40,323,42,310,47,305,53,307,60,302,62,299,52,306,42,322,37,345,35,372,38,387,45"/>
+<area shape="rect" id="Node000003" href="$classcarta_1_1RegionHandler.html#a572070177a99ad38ff8703936776a08b" title=" " alt="" coords="19,29,178,69"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="231,69,178,62,178,57,232,64"/>
+<area shape="rect" id="Node000004" href="$classcarta_1_1RegionHandler.html#ab556b1d44e6a4ca48fba195023769038" title=" " alt="" coords="5,93,192,133"/>
+<area shape="poly" id="edge5_Node000002_Node000004" title=" " alt="" coords="232,99,193,104,192,99,231,93"/>
+<area shape="poly" id="edge3_Node000003_Node000003" title=" " alt="" coords="140,18,126,11,99,8,75,10,61,15,55,21,58,28,53,30,50,20,58,10,74,5,99,3,127,6,143,13"/>
+</map>

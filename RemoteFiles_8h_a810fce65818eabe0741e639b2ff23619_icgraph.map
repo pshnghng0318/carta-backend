@@ -1,0 +1,7 @@
+<map id="GenerateUrlFromRequest" name="GenerateUrlFromRequest">
+<area shape="rect" id="Node000001" title="Generates a URL for a remote file request based on provided parameters." alt="" coords="500,13,687,38"/>
+<area shape="rect" id="Node000002" href="$classcarta_1_1Session.html#a45b9623e5dd0c0d54307ab148e8745aa" title=" " alt="" coords="261,5,452,45"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="486,28,452,28,452,23,486,23"/>
+<area shape="rect" id="Node000003" href="$classcarta_1_1SessionManager.html#aef52053a9088af0c0663a8053c49e9e2" title=" " alt="" coords="5,5,213,45"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="247,28,213,28,213,23,247,23"/>
+</map>

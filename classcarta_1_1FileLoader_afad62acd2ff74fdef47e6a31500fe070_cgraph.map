@@ -1,0 +1,21 @@
+<map id="carta::FileLoader::CalculateBeamArea" name="carta::FileLoader::CalculateBeamArea">
+<area shape="rect" id="Node000001" title=" " alt="" coords="5,37,156,77"/>
+<area shape="rect" id="Node000002" href="$classcarta_1_1FileLoader.html#a5101515d2dff6f6621b23699c5c7b3bf" title=" " alt="" coords="204,5,367,45"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="156,43,190,38,191,43,156,48"/>
+<area shape="rect" id="Node000004" href="$classcarta_1_1FileLoader.html#ad006f05ccd020be05834212598e3a38b" title=" " alt="" coords="216,69,355,109"/>
+<area shape="poly" id="edge3_Node000001_Node000004" title=" " alt="" coords="156,66,203,74,202,79,156,72"/>
+<area shape="rect" id="Node000003" href="$classcarta_1_1FileLoader.html#ab555e1d6ee27d451b910faeff3cf9796" title=" " alt="" coords="421,5,560,45"/>
+<area shape="poly" id="edge2_Node000002_Node000003" title=" " alt="" coords="367,23,407,23,407,28,367,28"/>
+<area shape="rect" id="Node000005" href="$classcarta_1_1FileLoader.html#a1ec9887a1de28cd550d9ebe22f016976" title=" " alt="" coords="415,69,567,109"/>
+<area shape="poly" id="edge4_Node000004_Node000005" title=" " alt="" coords="355,87,401,87,401,92,355,92"/>
+<area shape="rect" id="Node000006" href="$classcarta_1_1FileLoader.html#a5d91045ea868fea755a7be026806cea0" title=" " alt="" coords="421,133,560,173"/>
+<area shape="poly" id="edge5_Node000004_Node000006" title=" " alt="" coords="351,107,414,127,412,132,349,112"/>
+<area shape="rect" id="Node000007" href="$classcarta_1_1FileLoader.html#ad372c5af25778bf6f0621b587e1f9c78" title=" " alt="" coords="615,104,753,144"/>
+<area shape="poly" id="edge6_Node000006_Node000007" title=" " alt="" coords="560,140,600,134,601,139,561,145"/>
+<area shape="rect" id="Node000008" href="$Casacore_8cc.html#a8733accb41db0f83703779c667ae852e" title="Normalizes a given unit string to conform to standard Casacore unit conventions (case&#45;sensitive)." alt="" coords="626,169,742,194"/>
+<area shape="poly" id="edge7_Node000006_Node000008" title=" " alt="" coords="561,161,613,168,612,174,560,166"/>
+<area shape="rect" id="Node000009" href="$Casacore_8cc.html#af1417964e00800b515ec0913adaa1957" title="Check if input unit string is in the format used by the GILDAS CLASS software." alt="" coords="801,169,903,194"/>
+<area shape="poly" id="edge8_Node000008_Node000009" title=" " alt="" coords="742,179,787,179,787,184,742,184"/>
+<area shape="rect" id="Node000010" href="$Casacore_8cc.html#a8bd36af5b1f82b7ccee35f089787ec99" title=" " alt="" coords="951,169,1072,194"/>
+<area shape="poly" id="edge9_Node000009_Node000010" title=" " alt="" coords="903,179,937,179,937,184,903,184"/>
+</map>

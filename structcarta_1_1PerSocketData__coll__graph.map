@@ -1,0 +1,7 @@
+<map id="carta::PerSocketData" name="carta::PerSocketData">
+<area shape="rect" id="Node000001" title=" " alt="" coords="15,93,174,119"/>
+<area shape="rect" id="Node000002" title=" " alt="" coords="5,5,80,31"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="42,44,46,68,57,81,71,91,67,95,53,85,42,70,36,45"/>
+<area shape="rect" id="Node000003" title=" " alt="" coords="117,5,176,31"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="135,44,120,71,105,94,100,92,115,68,131,42"/>
+</map>

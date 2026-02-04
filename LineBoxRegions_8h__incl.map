@@ -1,0 +1,13 @@
+<map id="LineBoxRegions.h" name="LineBoxRegions.h">
+<area shape="rect" id="Node000001" title=" " alt="" coords="168,5,307,31"/>
+<area shape="rect" id="Node000002" title=" " alt="" coords="5,79,245,119"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="222,33,165,73,162,69,219,29"/>
+<area shape="rect" id="Node000003" href="$RegionState_8h.html" title=" " alt="" coords="269,86,432,111"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="256,29,324,76,321,80,253,33"/>
+<area shape="rect" id="Node000004" title=" " alt="" coords="73,167,233,207"/>
+<area shape="poly" id="edge3_Node000003_Node000004" title=" " alt="" coords="325,114,210,164,208,159,323,109"/>
+<area shape="rect" id="Node000005" title=" " alt="" coords="257,174,444,199"/>
+<area shape="poly" id="edge4_Node000003_Node000005" title=" " alt="" coords="353,112,353,160,348,160,348,112"/>
+<area shape="rect" id="Node000006" title=" " alt="" coords="468,174,647,199"/>
+<area shape="poly" id="edge5_Node000003_Node000006" title=" " alt="" coords="380,109,518,166,516,171,378,114"/>
+</map>

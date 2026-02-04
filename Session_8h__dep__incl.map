@@ -1,0 +1,26 @@
+<map id="Session.h" name="Session.h">
+<area shape="rect" id="Node000001" title=" " alt="" coords="319,5,403,31"/>
+<area shape="rect" id="Node000002" href="$CursorSettings_8cc.html" title=" " alt="" coords="79,79,214,104"/>
+<area shape="poly" id="edge1_Node000001_Node000002" title=" " alt="" coords="315,37,182,81,181,76,313,32"/>
+<area shape="rect" id="Node000003" href="$OnMessageTask_8h.html" title=" " alt="" coords="345,152,484,177"/>
+<area shape="poly" id="edge2_Node000001_Node000003" title=" " alt="" coords="376,42,392,78,414,151,409,152,387,80,371,44"/>
+<area shape="rect" id="Node000006" href="$Session_8cc.html" title=" " alt="" coords="576,225,667,251"/>
+<area shape="poly" id="edge7_Node000001_Node000006" title=" " alt="" coords="387,37,609,223,606,227,384,42"/>
+<area shape="rect" id="Node000008" href="$SessionManager_8h.html" title=" " alt="" coords="238,79,378,104"/>
+<area shape="poly" id="edge8_Node000001_Node000008" title=" " alt="" coords="347,43,319,80,315,77,342,40"/>
+<area shape="rect" id="Node000004" href="$Main_8cc.html" title=" " alt="" coords="139,225,211,251"/>
+<area shape="poly" id="edge3_Node000003_Node000004" title=" " alt="" coords="364,184,212,229,210,223,362,179"/>
+<area shape="rect" id="Node000005" href="$OnMessageTask_8cc.html" title=" " alt="" coords="406,225,551,251"/>
+<area shape="poly" id="edge4_Node000003_Node000005" title=" " alt="" coords="436,186,470,223,466,227,432,189"/>
+<area shape="poly" id="edge5_Node000003_Node000006" title=" " alt="" coords="462,179,589,223,587,228,460,184"/>
+<area shape="rect" id="Node000007" href="$SessionManager_8cc.html" title=" " alt="" coords="235,225,381,251"/>
+<area shape="poly" id="edge6_Node000003_Node000007" title=" " alt="" coords="388,187,327,227,324,223,385,183"/>
+<area shape="poly" id="edge13_Node000008_Node000003" title=" " alt="" coords="338,109,399,150,396,154,335,114"/>
+<area shape="poly" id="edge12_Node000008_Node000004" title=" " alt="" coords="290,116,233,179,188,227,184,223,229,176,286,113"/>
+<area shape="poly" id="edge14_Node000008_Node000007" title=" " alt="" coords="311,118,311,225,305,225,305,118"/>
+<area shape="rect" id="Node000009" href="$HttpServer_8h.html" title=" " alt="" coords="117,152,219,177"/>
+<area shape="poly" id="edge9_Node000008_Node000009" title=" " alt="" coords="275,113,192,154,190,149,272,108"/>
+<area shape="poly" id="edge11_Node000009_Node000004" title=" " alt="" coords="173,191,176,225,171,225,168,191"/>
+<area shape="rect" id="Node000010" href="$HttpServer_8cc.html" title=" " alt="" coords="5,225,115,251"/>
+<area shape="poly" id="edge10_Node000009_Node000010" title=" " alt="" coords="141,187,79,227,76,223,138,183"/>
+</map>
