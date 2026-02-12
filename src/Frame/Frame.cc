@@ -396,7 +396,7 @@ bool Frame::FillImageCache() {
     StokesSlicer stokes_slicer = GetImageSlicer(AxisRange(_z_index), _stokes_index);
     size_t new_cache_size = stokes_slicer.slicer.length().product();
     if (!_image_cache || _image_cache_size != new_cache_size) {
-        _image_cache = std::make_unique<float[]>(new_cache_size);
+        _image_cache = MakeUniqueAlignedDataPtr<float>(new_cache_size);
         _image_cache_size = new_cache_size;
     }
     if (!GetSlicerData(stokes_slicer, _image_cache.get())) {
