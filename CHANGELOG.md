@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 * Fixed linker error during unit test build on some platforms ([#1481](https://github.com/CARTAvis/carta-backend/issues/1481)).
 
+## [5.1.0]
+
+### Fixed
+* Fixed bug causing channel map crash ([#1541](https://github.com/CARTAvis/carta-backend/issues/1541)).
+* Fixed fetching of region data for other Stokes ([#1551](https://github.com/CARTAvis/carta-backend/issues/1551)).
+* Fixed deletion of resumed session from message task threads ([#1537](https://github.com/CARTAvis/carta-backend/issues/1537)).
+* Don't reallocate memory for image cache unnecessarily ([#1508](https://github.com/CARTAvis/carta-backend/pull/1508)).
+
+### Changed
+* Excluded image cache data from core dumps on supported platforms ([#1506](https://github.com/CARTAvis/carta-backend/pull/1506)).
+
 ## [5.0.2]
 
 ### Fixed
