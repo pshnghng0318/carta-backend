@@ -13,7 +13,7 @@
 #include <cxxopts/cxxopts.hpp>
 
 #include <casacore/images/Images/ImageOpener.h>
-
+#include "Util/Casacore.h"
 #include "Util/App.h"
 #include "Util/Json.h"
 
@@ -312,7 +312,7 @@ global configuration files, respectively.
                 auto image_type = casacore::ImageOpener::imageType(p.string());
                 if (image_type == casacore::ImageOpener::AIPSPP || image_type == casacore::ImageOpener::MIRIAD ||
                     image_type == casacore::ImageOpener::IMAGECONCAT || image_type == casacore::ImageOpener::IMAGEEXPR ||
-                    image_type == casacore::ImageOpener::COMPLISTIMAGE) {
+                    image_type == casacore::ImageOpener::COMPLISTIMAGE || IsZarrFile(p.string())) {
                     file_paths.push_back(p);
                 } else {
                     starting_folder = p.string();

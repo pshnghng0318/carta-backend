@@ -31,6 +31,7 @@ class ThreadManager {
     static volatile bool _has_exited;
 
 public:
+    static bool HasExited();
     static void ApplyThreadLimit();
     static void SetThreadLimit(int count);
     static void StartEventHandlingThreads(int num_threads);

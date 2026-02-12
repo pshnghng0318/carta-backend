@@ -207,6 +207,7 @@ set(TENSORSTORE_BUILD_ROOT "${TENSORSTORE_ROOT}/build")
 # TensorStore include directories  
 include_directories("${TENSORSTORE_ROOT}")
 include_directories("${TENSORSTORE_BUILD_ROOT}")
+include_directories("${TENSORSTORE_ROOT}/tensorstore")
 
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     # macOS: Use old paths for CMake build
@@ -301,6 +302,13 @@ link_directories("${TENSORSTORE_BUILD_ROOT}/_deps/grpc-build")
 file(GLOB_RECURSE TENSORSTORE_ALL_LIBS_FILES "${TENSORSTORE_BUILD_ROOT}/libtensorstore_*.a")
 # Filter out the main library (it's in TENSORSTORE_MAIN_LIB) to avoid duplicate linking
 list(FILTER TENSORSTORE_ALL_LIBS_FILES EXCLUDE REGEX "libtensorstore_tensorstore\\.a$")
+# Filter out test libraries
+list(FILTER TENSORSTORE_ALL_LIBS_FILES EXCLUDE REGEX "test")
+list(FILTER TENSORSTORE_ALL_LIBS_FILES EXCLUDE REGEX "gtest")
+list(FILTER TENSORSTORE_ALL_LIBS_FILES EXCLUDE REGEX "gmock")
+# Exclude mock libraries, but keep aws_http_mocking which is required
+list(FILTER TENSORSTORE_ALL_LIBS_FILES EXCLUDE REGEX "mock_")
+list(FILTER TENSORSTORE_ALL_LIBS_FILES EXCLUDE REGEX "benchmark")
 
 # Collect dependencies from TensorStore CMake build _deps
 file(GLOB TENSORSTORE_CMAKE_DEPS_RIEGELI 
@@ -476,6 +484,7 @@ set(SOURCE_FILES
         src/ImageData/StokesFilesConnector.cc
         src/ImageData/CartaZarrImage.cc
         src/ImageData/ZarrLoader.cc
+        src/ImageData/ZarrDataReader.cc
         # TensorStore zarr driver sources are already compiled in TensorStore libraries
         # tensorstore/tensorstore/driver/zarr/driver.cc
         # tensorstore/tensorstore/driver/zarr/metadata.cc

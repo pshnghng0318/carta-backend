@@ -37,9 +37,11 @@ int main(int argc, char* argv[]) {
 
         sig_handler.sa_handler = [](int s) {
             spdlog::info("Exiting backend.");
-            ThreadManager::ExitEventHandlingThreads();
+            // Don't join threads here as it's not signal safe and can cause deadlocks
+            // Instead, we just exit, which will trigger cleanup
             carta::logger::FlushLogFile();
-            exit(0);
+            // Force exit immediately to avoid waiting for stuck threads or signal-unsafe joins
+            _exit(0);
         };
 
         sigemptyset(&sig_handler.sa_mask);
