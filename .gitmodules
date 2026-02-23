@@ -1,6 +1,6 @@
 [submodule "carta-protobuf"]
 	path = carta-protobuf
-	url = https://github.com/CARTAvis/carta-protobuf.git
+	url = git@github.com:pshnghng0318/protobuf.git
 [submodule "cxxopts"]
 	path = third-party/cxxopts
 	url = https://github.com/jarro2783/cxxopts
