@@ -77,7 +77,7 @@ struct ZarrDataReader::Impl {
             }();
 
             nlohmann::json context_spec = {{"cache_pool", {{"total_bytes_limit", kDefaultCacheSizeMB * 1024 * 1024}}},
-                {"data_copy_concurrency", {{"limit", num_cpus}}}, {"file_io_concurrency", {{"limit", num_cpus}}}};
+                {"data_copy_concurrency", {{"limit", 8}}}, {"file_io_concurrency", {{"limit", num_cpus}}}};
 
             auto context_result = tensorstore::Context::FromJson(context_spec);
             if (context_result.ok()) {
