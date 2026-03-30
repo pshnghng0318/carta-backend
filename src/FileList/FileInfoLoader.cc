@@ -71,6 +71,11 @@ CARTA::FileType FileInfoLoader::GetCartaFileType(const string& filename) {
         return CARTA::FileType::FITS;
     }
 
+    // Check for Zarr format first
+    if (IsZarrFile(filename)) {
+        return CARTA::FileType::ZARR;
+    }
+
     switch (CasacoreImageType(filename)) {
         case casacore::ImageOpener::AIPSPP:
         case casacore::ImageOpener::IMAGECONCAT:

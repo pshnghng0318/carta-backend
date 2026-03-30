@@ -14,6 +14,10 @@ std::condition_variable ThreadManager::_task_queue_cv;
 volatile bool ThreadManager::_has_exited = false;
 std::list<std::thread*> ThreadManager::_workers;
 
+bool ThreadManager::HasExited() {
+    return _has_exited;
+}
+
 void ThreadManager::ApplyThreadLimit() {
     // Skip application if we are already inside an OpenMP parallel block
     if (omp_get_num_threads() > 1) {

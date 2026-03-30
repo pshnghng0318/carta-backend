@@ -13,7 +13,7 @@
 #include <cxxopts/cxxopts.hpp>
 
 #include <casacore/images/Images/ImageOpener.h>
-
+#include "Util/Casacore.h"
 #include "Util/App.h"
 #include "Util/Json.h"
 
@@ -146,6 +146,7 @@ void ProgramSettings::ApplyCommandLineSettings(int argc, char** argv) {
         ("host", "only listen on the specified interface (IP address or hostname)", cxxopts::value<string>(), "<interface>")
         ("p,port", fmt::format("manually set the HTTP and WebSocket port (default: {} or nearest available port)", DEFAULT_SOCKET_PORT), cxxopts::value<std::vector<int>>(), "<port>")
         ("t,omp_threads", "manually set OpenMP thread pool count", cxxopts::value<int>(), "<threads>")
+        ("cpu_ch", "set number of channels per CPU thread for ZARR region spectral (default: 8)", cxxopts::value<int>(), "<channels>")
         ("top_level_folder", "set top-level folder for data files", cxxopts::value<string>(), "<dir>")
         ("frontend_folder", "set folder from which frontend files are served", cxxopts::value<string>(), "<dir>")
         ("exit_timeout", "number of seconds to stay alive after last session exits", cxxopts::value<int>(), "<sec>")
@@ -254,6 +255,17 @@ global configuration files, respectively.
     }
 
     verbosity = result["verbosity"].as<int>();
+
+    if (result.count("cpu_ch")) {
+        cpu_ch = result["cpu_ch"].as<int>();
+        if (cpu_ch < 1) {
+            warning_msgs.push_back("cpu_ch must be at least 1; using default value 8");
+            cpu_ch = 8;
+        }
+    } else {
+        // Ensure default value is 8 when flag is not provided
+        cpu_ch = 8;
+    }
     no_log = result["no_log"].as<bool>();
     log_performance = result["log_performance"].as<bool>();
     log_protocol_messages = result["log_protocol_messages"].as<bool>();
@@ -300,7 +312,7 @@ global configuration files, respectively.
                 auto image_type = casacore::ImageOpener::imageType(p.string());
                 if (image_type == casacore::ImageOpener::AIPSPP || image_type == casacore::ImageOpener::MIRIAD ||
                     image_type == casacore::ImageOpener::IMAGECONCAT || image_type == casacore::ImageOpener::IMAGEEXPR ||
-                    image_type == casacore::ImageOpener::COMPLISTIMAGE) {
+                    image_type == casacore::ImageOpener::COMPLISTIMAGE || IsZarrFile(p.string())) {
                     file_paths.push_back(p);
                 } else {
                     starting_folder = p.string();

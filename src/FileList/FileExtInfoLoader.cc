@@ -24,8 +24,10 @@
 
 #include "../ImageData/CartaFitsImage.h"
 #include "../ImageData/CartaHdf5Image.h"
+#include "../ImageData/CartaZarrImage.h"
 #include "FileList/FitsHduList.h"
 #include "Logger/Logger.h"
+#include "Timer/Timer.h"
 #include "Util/Casacore.h"
 #include "Util/File.h"
 #include "Util/FileSystem.h"
@@ -33,6 +35,33 @@
 #include "Util/Message.h"
 
 using namespace carta;
+
+// Helper function to convert casacore MFrequency::Types to FITS standard 8-character names
+static std::string GetFitsSpectralFrameName(casacore::MFrequency::Types freq_type) {
+    switch (freq_type) {
+        case casacore::MFrequency::TOPO:
+            return "TOPOCENT";
+        case casacore::MFrequency::GEO:
+            return "GEOCENTR";
+        case casacore::MFrequency::BARY:
+            return "BARYCENT";
+        case casacore::MFrequency::GALACTO:
+            return "GALACTOC";
+        case casacore::MFrequency::LGROUP:
+            return "LOCALGRP";
+        case casacore::MFrequency::CMB:
+            return "CMBDIPOL";
+        case casacore::MFrequency::REST:
+            return "SOURCE";
+        case casacore::MFrequency::LSRK:
+            return "LSRK";
+        case casacore::MFrequency::LSRD:
+            return "LSRD";
+        default:
+            // For unknown types, fall back to casacore name
+            return casacore::MFrequency::showType(freq_type);
+    }
+}
 
 FileExtInfoLoader::FileExtInfoLoader(std::shared_ptr<FileLoader> loader) : _loader(loader) {}
 
@@ -123,6 +152,8 @@ void FileExtInfoLoader::StripHduName(std::string& hdu) {
 }
 
 bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_info, const std::string& hdu, std::string& message) {
+    Timer t;
+    
     // add header_entries in FITS format (issue #13) using ImageInterface from FileLoader
     bool info_ok(false);
     if (_loader) {
@@ -138,8 +169,8 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                 casacore::IPosition image_shape(image->shape());
                 unsigned int num_dim = image_shape.size();
 
-                if (num_dim < 2 || num_dim > 4) {
-                    message = "Image must be 2D, 3D or 4D.";
+                if (num_dim < 2 || num_dim > 5) {
+                    message = "Image must be 2D, 3D, 4D or 5D.";
                     return info_ok;
                 }
 
@@ -147,6 +178,8 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                 auto data_type = _loader->GetDataType();
                 auto equivalent_type = data_type; // for FITS only, for rescaled data
                 casacore::String image_type(image->imageType());
+                spdlog::debug("Image type: {}, Data type: {}, Equivalent type: {}", image_type, data_type, equivalent_type);
+                
                 bool use_image_for_entries(false);
                 if (image_type == "FITSImage") {
                     // casacore FitsKeywordList has incomplete header names (no n on CRVALn, CDELTn, CROTA, etc.) so read with fitsio
@@ -183,21 +216,29 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
                     CartaHdf5Image* hdf5_image = dynamic_cast<CartaHdf5Image*>(image.get());
                     casacore::Vector<casacore::String> headers = hdf5_image->FitsHeaderStrings();
                     AddEntriesFromHeaderStrings(headers, hdu, extended_info);
+                } else if (image_type == "CartaZarrImage") {
+                    CartaZarrImage* zarr_image = dynamic_cast<CartaZarrImage*>(image.get());
+                    casacore::Vector<casacore::String> headers = zarr_image->FitsHeaderStrings();
+                    AddEntriesFromHeaderStrings(headers, hdu, extended_info);
                 } else {
                     // Get image headers in FITS format using casacore ImageHeaderToFITS
+                    spdlog::debug("Using GetFITSHeader fallback for image type: {}", image_type);
                     casacore::ImageFITSHeaderInfo fhi;
                     casacore::String error_string;
                     if (GetFITSHeader(image, hdu, fhi, error_string)) {
                         // Set header entries from ImageFITSHeaderInfo
                         FitsHeaderInfoToHeaderEntries(fhi, extended_info);
                         use_image_for_entries = true;
+                        spdlog::debug("Successfully generated FITS header for image type: {}", image_type);
                     } else {
                         message = error_string;
+                        spdlog::error("Failed to get FITS header for image type: {}, error: {}", image_type, error_string);
                         return false;
                     }
                 }
 
                 AddDataTypeEntry(extended_info, data_type, equivalent_type);
+                spdlog::debug("Added data type entry - data_type: {}, equivalent_type: {}", data_type, equivalent_type);
 
                 if (_loader->FindCoordinateAxes(message)) {
                     auto image_shape = _loader->GetShape();
@@ -227,6 +268,8 @@ bool FileExtInfoLoader::FillFileInfoFromImage(CARTA::FileInfoExtended& extended_
     } else { // loader failed
         message = "Image type not supported.";
     }
+
+    spdlog::performance("Fill file info in {:.3f} ms", t.Elapsed().ms());
 
     return info_ok;
 }
@@ -832,8 +875,12 @@ void FileExtInfoLoader::AddComputedEntries(CARTA::FileInfoExtended& extended_inf
             Message::AddComputedEntry(extended_info, "Celestial frame", direction_frame);
         }
         if (coord_system.hasSpectralAxis()) {
-            casacore::String spectral_frame = casacore::MFrequency::showType(coord_system.spectralCoordinate().frequencySystem(true));
-            Message::AddComputedEntry(extended_info, "Spectral frame", spectral_frame);
+            casacore::MFrequency::Types freq_type = coord_system.spectralCoordinate().frequencySystem(true);
+            std::string spectral_frame = GetFitsSpectralFrameName(freq_type);
+            auto entry = extended_info.add_computed_entries();
+            entry->set_name("Spectral frame");
+            entry->set_value(spectral_frame);
+            entry->set_entry_type(CARTA::EntryType::STRING);
             casacore::String vel_doppler = casacore::MDoppler::showType(coord_system.spectralCoordinate().velocityDoppler());
             Message::AddComputedEntry(extended_info, "Velocity definition", vel_doppler);
         }

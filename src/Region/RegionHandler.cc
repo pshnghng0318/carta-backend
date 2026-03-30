@@ -15,6 +15,7 @@
 
 #include "ImageData/FileLoader.h"
 #include "ImageRegion.h"
+#include "ThreadManager/ThreadManager.h"
 #include "ImageStats/StatsCalculator.h"
 #include "Logger/Logger.h"
 #include "RegionAnalysis/LineBoxRegions.h"
@@ -672,6 +673,11 @@ void RegionHandler::ClearRegionCache(int region_id) {
 
     if (_region_statistics.find(region_id) != _region_statistics.end()) {
         _region_statistics[region_id]->ClearCache();
+    }
+    for (auto& frame : _frames) {
+        if (frame.second) {
+            frame.second->ClearRegionSpectralCache(region_id);
+        }
     }
 }
 
@@ -1585,7 +1591,7 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
     RegionState initial_region_state = region->GetRegionState();
 
     // Use loader swizzled data for efficiency
-    if (frame->UseLoaderSpectralData(lc_region->shape())) {
+    if (_frames.at(file_id)->UseLoaderSpectralData(lc_region->shape()) && !_frames.at(file_id)->IsZarrLoader()) {
         // Use cursor spectral profile for point region
         if (initial_region_state.type == CARTA::RegionType::POINT) {
             casacore::IPosition origin = lc_region->boundingBox().start();
@@ -1593,7 +1599,8 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
 
             auto get_stokes_profiles_data = [&](ProfilesMap& tmp_results, int tmp_stokes_index) {
                 std::vector<float> tmp_profile;
-                if (!frame->GetLoaderPointSpectralData(tmp_profile, tmp_stokes_index, point)) {
+                // z_range and progress do not work for Hdf5Loader
+                if (!_frames.at(file_id)->GetLoaderPointSpectralData(tmp_profile, z_range, tmp_stokes_index, point, progress)) {
                     return false;
                 }
                 // Set results; there is only one required stat for point
@@ -1652,10 +1659,37 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
                 }
 
                 // Get partial profile
+                // Cancellation check lambda
+                auto cancellation_check = [&]() -> bool {
+                    if (ThreadManager::HasExited()) {
+                        spdlog::info("Cancellation: ThreadManager HasExited");
+                        return true;
+                    }
+                    if (!RegionFileIdsValid(region_id, file_id)) {
+                        spdlog::info("Cancellation: RegionFileIdsValid returned false");
+                        return true;
+                    }
+                    if (region->GetRegionState() != initial_region_state) {
+                        spdlog::info("Cancellation: Region state changed");
+                        return true;
+                    }
+                    if (use_current_stokes && (stokes_index != _frames.at(file_id)->CurrentStokes())) {
+                        spdlog::info("Cancellation: Stokes changed");
+                        return true;
+                    }
+                    if (!HasSpectralRequirements(region_id, file_id, coordinate, required_stats)) {
+                        spdlog::info("Cancellation: Spectral requirements changed");
+                        return true;
+                    }
+                    return false;
+                };
+
+                // Get partial profile
                 auto get_profiles_data = [&](ProfilesMap& tmp_results, std::string tmp_coordinate) {
-                    int tmp_stokes_index;
-                    return (frame->GetStokesTypeIndex(tmp_coordinate, tmp_stokes_index) &&
-                            frame->GetLoaderSpectralData(region_id, z_range, tmp_stokes_index, mask, xy_origin, tmp_results, progress));
+                    int tmp_stokes;
+                    return (
+                        _frames.at(file_id)->GetStokesTypeIndex(tmp_coordinate, tmp_stokes) &&
+                        _frames.at(file_id)->GetLoaderSpectralData(region_id, z_range, tmp_stokes, mask, xy_origin, tmp_results, progress, cancellation_check));
                 };
 
                 ProfilesMap partial_profiles;
@@ -1664,7 +1698,8 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
                         return false;
                     }
                 } else { // For regular stokes I, Q, U, or V
-                    if (!frame->GetLoaderSpectralData(region_id, z_range, stokes_index, mask, xy_origin, partial_profiles, progress)) {
+                    if (!_frames.at(file_id)->GetLoaderSpectralData(
+                            region_id, z_range, stokes_index, mask, xy_origin, partial_profiles, progress, cancellation_check)) {
                         return false;
                     }
                 }
@@ -1694,6 +1729,162 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
             return true;
         }
     } // end loader swizzled data
+
+    // Zarr
+    if (_frames.at(file_id)->UseLoaderSpectralData(lc_region->shape()) && _frames.at(file_id)->IsZarrLoader()) {
+        // Use cursor spectral profile for point region
+        if (initial_region_state.type == CARTA::RegionType::POINT) {
+            // start the timer
+            auto t_start = std::chrono::high_resolution_clock::now();
+            auto t_latest = t_start;
+
+            casacore::IPosition origin = lc_region->boundingBox().start();
+            auto point = Message::Point(origin(0), origin(1));
+
+            while (progress < 1.0) {
+                // Cancel if region or frame is closing
+                if (!RegionFileIdsValid(region_id, file_id)) {
+                    return false;
+                }
+
+                // Cancel if region, current stokes, or spectral requirements changed
+                if (region->GetRegionState() != initial_region_state) {
+                    return false;
+                }
+                if (use_current_stokes && (stokes_index != _frames.at(file_id)->CurrentStokes())) {
+                    return false;
+                }
+                if (!HasSpectralRequirements(region_id, file_id, coordinate, required_stats)) {
+                    return false;
+                }
+
+                auto get_stokes_profiles_data = [&](ProfilesMap& tmp_results, int tmp_stokes) {
+                    std::vector<float> tmp_profile;
+                    if (!_frames.at(file_id)->GetLoaderPointSpectralData(tmp_profile, z_range, tmp_stokes, point, progress)) {
+                        return false;
+                    }
+                    // Set results; there is only one required stat for point
+                    std::vector<double> tmp_data(tmp_profile.begin(), tmp_profile.end());
+                    tmp_results[required_stats[0]] = tmp_data;
+                    return true;
+                };
+
+                auto get_profiles_data = [&](ProfilesMap& tmp_results, std::string tmp_coordinate) {
+                    int tmp_stokes;
+                    return (_frames.at(file_id)->GetStokesTypeIndex(tmp_coordinate, tmp_stokes) &&
+                            get_stokes_profiles_data(tmp_results, tmp_stokes));
+                };
+
+                if (Stokes::IsComputed(stokes_index)) { // For computed stokes
+                    if (!GetComputedStokesProfiles(results, stokes_index, get_profiles_data)) {
+                        return false;
+                    }
+                } else { // For regular stokes I, Q, U, or V
+                    if (!get_stokes_profiles_data(results, stokes_index)) {
+                        return false;
+                    }
+                }
+
+                // get the time elapse for this step
+                auto t_end = std::chrono::high_resolution_clock::now();
+                auto dt = std::chrono::duration<double, std::milli>(t_end - t_latest).count();
+
+                if ((dt > TARGET_PARTIAL_REGION_TIME) || (progress >= 1.0)) {
+                    // restart timer
+                    t_latest = t_end;
+
+                    // send partial result
+                    partial_results_callback(results, progress);
+                }
+            }
+
+            spdlog::performance("Fill spectral profile in {:.3f} ms", t.Elapsed().ms());
+            return true;
+        }
+
+        // Get 2D origin and 2D mask for Hdf5Loader
+        casacore::IPosition origin = lc_region->boundingBox().start();
+        casacore::IPosition xy_origin = origin.keepAxes(casacore::IPosition(2, 0, 1)); // keep first two axes only
+
+        // Get mask; LCRegion for file id is cached
+        casacore::ArrayLattice<casacore::Bool> mask = region->GetImageRegionMask(file_id);
+        if (!mask.shape().empty()) {
+            // start the timer
+            auto t_start = std::chrono::high_resolution_clock::now();
+            auto t_latest = t_start;
+
+            // Get partial profiles until complete (do once if cached)
+            while (progress < 1.0) {
+               if (ThreadManager::HasExited()) {
+                    spdlog::info("Cancellation: ThreadManager HasExited");
+                    return false;
+                }
+                // Cancellation check lambda
+                auto cancellation_check = [&]() -> bool {
+                    if (ThreadManager::HasExited()) return true;
+                    // Cancel if region or frame is closing
+                    if (!RegionFileIdsValid(region_id, file_id)) {
+                        return true;
+                    }
+
+                    // Cancel if region, current stokes, or spectral requirements changed
+                    if (region->GetRegionState() != initial_region_state) {
+                        return true;
+                    }
+                    if (use_current_stokes && (stokes_index != _frames.at(file_id)->CurrentStokes())) {
+                        return true;
+                    }
+                    if (!HasSpectralRequirements(region_id, file_id, coordinate, required_stats)) {
+                        return true;
+                    }
+                    return false;
+                };
+
+                // Get partial profile
+                auto get_profiles_data = [&](ProfilesMap& tmp_results, std::string tmp_coordinate) {
+                    int tmp_stokes;
+                    return (
+                        _frames.at(file_id)->GetStokesTypeIndex(tmp_coordinate, tmp_stokes) &&
+                        _frames.at(file_id)->GetLoaderSpectralData(region_id, z_range, tmp_stokes, mask, xy_origin, tmp_results, progress, cancellation_check));
+                };
+
+                ProfilesMap partial_profiles;
+                if (Stokes::IsComputed(stokes_index)) { // For computed stokes
+                    if (!GetComputedStokesProfiles(partial_profiles, stokes_index, get_profiles_data)) {
+                        return false;
+                    }
+                } else { // For regular stokes I, Q, U, or V
+                    if (!_frames.at(file_id)->GetLoaderSpectralData(
+                            region_id, z_range, stokes_index, mask, xy_origin, partial_profiles, progress, cancellation_check)) {
+                        return false;
+                    }
+                }
+
+                // get the time elapse for this step
+                auto t_end = std::chrono::high_resolution_clock::now();
+                auto dt = std::chrono::duration<double, std::milli>(t_end - t_latest).count();
+
+                if ((dt > TARGET_PARTIAL_REGION_TIME) || (progress >= 1.0)) {
+                    // Copy partial profile to results
+                    for (const auto& profile : partial_profiles) {
+                        auto stats_type = profile.first;
+                        if (results.count(stats_type)) {
+                            results[stats_type] = profile.second;
+                        }
+                    }
+
+                    // restart timer
+                    t_latest = t_end;
+
+                    // send partial result
+                    partial_results_callback(results, progress);
+                }
+            }
+        }
+
+        spdlog::performance("Fill spectral profile in {:.3f} ms", t.Elapsed().ms());
+        return true;
+    } // end zarr data
 
     // Initialize cache results for *all* spectral stats
     std::map<CARTA::StatsType, std::vector<double>> cache_results;

@@ -23,6 +23,7 @@
 #include "DataStream/Compression.h"
 #include "DataStream/Contouring.h"
 #include "DataStream/Smoothing.h"
+#include "ImageData/ZarrLoader.h"
 #include "ImageStats/StatsCalculator.h"
 #include "Logger/Logger.h"
 #include "Timer/Timer.h"
@@ -394,7 +395,11 @@ bool Frame::FillImageCache() {
     }
 
     StokesSlicer stokes_slicer = GetImageSlicer(AxisRange(_z_index), _stokes_index);
-
+    size_t new_cache_size = stokes_slicer.slicer.length().product();
+    if (!_image_cache || _image_cache_size != new_cache_size) {
+        _image_cache = MakeUniqueAlignedDataPtr<float>(new_cache_size);
+        _image_cache_size = new_cache_size;
+    }
     if (!GetSlicerData(stokes_slicer, _image_cache.get())) {
         spdlog::error("Session {}: {}", _session_id, "Loading image cache failed.");
         return false;
@@ -451,30 +456,41 @@ bool Frame::GetRasterData(int z, std::vector<float>& image_data, CARTA::ImageBou
     size_t num_rows_region = std::ceil((float)req_height / mip);
     size_t row_length_region = std::ceil((float)req_width / mip);
     image_data.resize(num_rows_region * row_length_region);
-    int num_image_columns = _dims.width;
-    int num_image_rows = _dims.height;
-
     // read lock imageCache
     queuing_rw_mutex_scoped cache_lock(&_cache_mutex, false);
 
     Timer t;
     float* z_data;
-    std::vector<float> z_slice;
+    std::vector<float> region_data;
+    int src_width = _dims.width;
+    int src_height = _dims.height;
+    int x_offset = x;
+    int y_offset = y;
     if (z == _z_index) {
         // Use image cache for current z
         z_data = _image_cache.get();
     } else {
-        // Load data for requested z
-        GetZSlice(z_slice, z, _stokes_index);
-        z_data = z_slice.data();
+        // Load only the required region for requested z to avoid full-plane allocations
+        int end_x = bounds.x_max() - 1;
+        int end_y = bounds.y_max() - 1;
+        StokesSlicer stokes_slicer = GetImageSlicer(AxisRange(x, end_x), AxisRange(y, end_y), AxisRange(z), _stokes_index);
+        region_data.resize(stokes_slicer.slicer.length().product());
+        if (!GetSlicerData(stokes_slicer, region_data.data())) {
+            return false;
+        }
+        z_data = region_data.data();
+        src_width = req_width;
+        src_height = req_height;
+        x_offset = 0;
+        y_offset = 0;
     }
 
     if (mean_filter && mip > 1) {
         // Perform down-sampling by calculating the mean for each MIPxMIP block
-        BlockSmooth(z_data, image_data.data(), num_image_columns, num_image_rows, row_length_region, num_rows_region, x, y, mip);
+        BlockSmooth(z_data, image_data.data(), src_width, src_height, row_length_region, num_rows_region, x_offset, y_offset, mip);
     } else {
         // Nearest neighbour filtering
-        NearestNeighbor(z_data, image_data.data(), num_image_columns, row_length_region, num_rows_region, x, y, mip);
+        NearestNeighbor(z_data, image_data.data(), src_width, row_length_region, num_rows_region, x_offset, y_offset, mip);
     }
 
     auto dt = t.Elapsed();
@@ -1127,6 +1143,8 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
 
     float cursor_value_with_current_stokes(0.0);
 
+    spdlog::debug("FillSpatialProfileData: x={}, y={}", x, y);
+
     // Get the cursor value with current stokes
     if (_image_cache_valid) {
         bool write_lock(false);
@@ -1242,7 +1260,25 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
                 }
 
                 if (is_current_stokes) {
+                    // ZARR optimization: Use ZarrLoader direct read to bypass corrupted cache
+                    // auto zarr_loader = std::dynamic_pointer_cast<ZarrLoader>(_loader);
+                    // if (zarr_loader) {
+                        // Use direct TensorStore read for ZARR files
+                        // profile.resize(end - start);
+                        
+                        // if (config.coordinate().back() == 'x') {
+                        //     have_profile = zarr_loader->GetSpatialProfileX(profile, start, end - 1, y, CurrentZ(), stokes, _image_mutex);
+                        //     if (have_profile) {
+                        //         spdlog::debug("Frame: ZarrLoader GetSpatialProfileX succeeded for x=[{},{}] at y={}", start, end-1, y);
+                        //     }
+                        // } else if (config.coordinate().back() == 'y') {
+                        //     have_profile = zarr_loader->GetSpatialProfileY(profile, x, start, end - 1, CurrentZ(), stokes, _image_mutex);
+                        //     if (have_profile) {
+                        //         spdlog::debug("Frame: ZarrLoader GetSpatialProfileY succeeded for y=[{},{}] at x={}", start, end-1, x);
+                        //     }
+                        // }
                     if (_use_tile_cache) { // Use tile cache to return full resolution data or prepare data for decimation
+                        spdlog::debug("Frame: Using tile cache for spatial profile");
                         profile.resize(end - start);
 
                         if (is_x_profile) {
@@ -1295,6 +1331,7 @@ bool Frame::FillSpatialProfileData(PointXy point, std::vector<CARTA::SetSpatialR
                             have_profile = true;
                         }
                     } else { // Use image cache to return full resolution data or prepare data for decimation
+                        spdlog::debug("Frame: Using image cache for spatial profile");
                         profile.reserve(end - start);
                         if (is_x_profile) {
                             auto x_start = y * _dims.width;
@@ -1479,8 +1516,60 @@ bool Frame::FillSpectralProfileData(std::function<void(CARTA::SpectralProfileDat
 
             std::vector<float> spectral_data;
             int xy_count(1);
-            if (!Stokes::IsComputed(stokes) && _loader->GetCursorSpectralData(spectral_data, stokes, (start_cursor.x + 0.5), xy_count,
-                                                   (start_cursor.y + 0.5), xy_count, _image_mutex)) {
+            float tmp_progress(0.0);
+
+            if (IsZarrLoader() && !Stokes::IsComputed(stokes)) {
+                size_t profile_size = Depth();
+                spectral_data.resize(profile_size, NAN);
+                float progress(0.0);
+
+                size_t dt_partial_update = TARGET_PARTIAL_CURSOR_TIME;
+                auto t_start_profile = std::chrono::high_resolution_clock::now();
+
+                while (progress < 1.0) {
+                    // Check for cancel
+                    if (!(_cursor == start_cursor) || !IsConnected()) {
+                        return false;
+                    }
+                    if (!HasSpectralConfig(config)) {
+                        break;
+                    }
+
+                    if (!_loader->GetCursorSpectralData(spectral_data, _all_z, stokes, (start_cursor.x + 0.5), xy_count,
+                                                        (start_cursor.y + 0.5), xy_count, _image_mutex, progress)) {
+                        // Error or read failed
+                        break;
+                    }
+
+                    auto t_now = std::chrono::high_resolution_clock::now();
+                    auto dt_profile = std::chrono::duration<double, std::milli>(t_now - t_start_profile).count();
+
+                    if (progress >= 1.0) {
+                        spectral_profile->set_raw_values_fp32(spectral_data.data(), spectral_data.size() * sizeof(float));
+                        cb(profile_message);
+                    } else if (dt_profile > dt_partial_update) {
+                        t_start_profile = t_now;
+                        // Partial update
+                        auto partial_data = Message::SpectralProfileData(CurrentStokes(), progress);
+                        auto *partial_profile = partial_data.add_profiles();
+                        partial_profile->set_stats_type(config.all_stats[0]);
+                        partial_profile->set_coordinate(config.coordinate);
+                        partial_profile->set_raw_values_fp32(spectral_data.data(), spectral_data.size() * sizeof(float));
+                        // Check for cancel
+                        if (!(_cursor == start_cursor) || !IsConnected()) {
+                            return false;
+                        }
+                        if (!HasSpectralConfig(config)) {
+                            break;
+                        }
+                        cb(partial_data);
+                    }
+                }
+                continue;
+            }
+
+            if (!Stokes::IsComputed(stokes) && _loader->GetCursorSpectralData(spectral_data, _all_z, stokes, (start_cursor.x + 0.5), xy_count,
+                                                   (start_cursor.y + 0.5), xy_count, _image_mutex, tmp_progress)) {
                 // Use loader data
                 spectral_profile->set_raw_values_fp32(spectral_data.data(), spectral_data.size() * sizeof(float));
                 cb(profile_message);
@@ -1728,6 +1817,10 @@ bool Frame::GetSlicerData(const StokesSlicer& stokes_slicer, float* data) {
         auto slicer_start = stokes_slicer.slicer.start();
         auto slicer_end = stokes_slicer.slicer.end();
 
+        spdlog::debug("GetSlicerData: cache_shape: {}", cache_shape.toString());
+        spdlog::debug("GetSlicerData: slicer_start: {}", slicer_start.toString());
+        spdlog::debug("GetSlicerData: slicer_end: {}", slicer_end.toString());
+
         // Adjust cache shape and slicer for single channel and stokes
         if (_axes.z >= 0) {
             cache_shape(_axes.z) = 1;
@@ -1747,10 +1840,16 @@ bool Frame::GetSlicerData(const StokesSlicer& stokes_slicer, float* data) {
         data_ok = true;
     } else {
         // Use loader to slice image
+        spdlog::info("Frame::GetZMatrix - Requesting data slice from loader");
         std::unique_lock<std::mutex> ulock(_image_mutex);
+        auto slicer_start = stokes_slicer.slicer.start();
+        auto slicer_end = stokes_slicer.slicer.end();
+        spdlog::debug("GetSlicerData: slicer_start: {}", slicer_start.toString());
+        spdlog::debug("GetSlicerData: slicer_end: {}", slicer_end.toString());
         data_ok = _loader->GetSlice(tmp, stokes_slicer);
         _loader->CloseImageIfUpdated();
         ulock.unlock();
+        spdlog::info("Frame::GetZMatrix - Data slice received, data_ok={}", data_ok);
     }
     return data_ok;
 }
@@ -1789,14 +1888,26 @@ bool Frame::UseLoaderSpectralData(const casacore::IPosition& region_shape) {
     return _loader->UseRegionSpectralData(region_shape, _image_mutex);
 }
 
-bool Frame::GetLoaderPointSpectralData(std::vector<float>& profile, int stokes, CARTA::Point& point) {
-    return _loader->GetCursorSpectralData(profile, stokes, point.x(), 1, point.y(), 1, _image_mutex);
+bool Frame::GetLoaderPointSpectralData(std::vector<float>& profile, const AxisRange& z_range, int stokes, CARTA::Point& point, float& progress) {
+    return _loader->GetCursorSpectralData(profile, z_range, stokes, point.x(), 1, point.y(), 1, _image_mutex, progress);
 }
 
 bool Frame::GetLoaderSpectralData(int region_id, const AxisRange& z_range, int stokes, const casacore::ArrayLattice<casacore::Bool>& mask,
-    const casacore::IPosition& origin, std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) {
-    // Get spectral data from loader (add image mutex for swizzled data)
-    return _loader->GetRegionSpectralData(region_id, z_range, stokes, mask, origin, _image_mutex, results, progress);
+                                  const casacore::IPosition& origin, std::map<CARTA::StatsType, std::vector<double>>& results,
+                                  float& progress, std::function<bool()> cancellation_check) {
+    if (!_loader->UseRegionSpectralData(_image_shape, _image_mutex)) {
+        return false;
+    }
+    return _loader->GetRegionSpectralData(region_id, z_range, stokes, mask, origin, _image_mutex, results, progress, cancellation_check);
+}
+
+void Frame::ClearRegionSpectralCache(int region_id) {
+    std::lock_guard<std::mutex> lock(_image_mutex);
+    _loader->ClearRegionSpectralCache(region_id);
+}
+
+bool Frame::IsZarrLoader() const {
+    return dynamic_cast<ZarrLoader*>(_loader.get()) != nullptr;
 }
 
 bool Frame::CalculateMoments(int file_id, GeneratorProgressCallback progress_callback, const StokesRegion& stokes_region,

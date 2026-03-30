@@ -14,6 +14,7 @@
 #include "Logger/Logger.h"
 #include "Util/File.h"
 #include "Util/Nan.h"
+#include "Util/Casacore.h"
 
 #include "CasaLoader.h"
 #include "CompListLoader.h"
@@ -24,6 +25,7 @@
 #include "ImagePtrLoader.h"
 #include "MiriadLoader.h"
 #include "PolarizationCalculator.h"
+#include "ZarrLoader.h"
 
 using namespace carta;
 
@@ -35,6 +37,9 @@ FileLoader* FileLoader::GetLoader(const std::string& filename, const std::string
         return new FitsLoader(filename, true);
     } else if (IsRemoteHttpFile(filename)) {
         return new FitsLoader(filename, false, true);
+    } else if (IsZarrFile(filename)) {
+        // casacore::ImageOpener did not support zarr format
+        return new ZarrLoader(filename);
     }
 
     switch (CasacoreImageType(filename)) {
@@ -210,8 +215,8 @@ bool FileLoader::FindCoordinateAxes(std::string& message) {
     }
 
     // Dimension check
-    if (_num_dims < 2 || _num_dims > 4) {
-        message = "Image must be 2D, 3D, or 4D.";
+    if (_num_dims < 2 || _num_dims > 5) {
+        message = "Image must be 2D, 3D, 4D, or 5D.";
         return false;
     }
 
@@ -260,7 +265,7 @@ bool FileLoader::FindCoordinateAxes(std::string& message) {
         return true;
     }
 
-    // Cope with incomplete/invalid headers for 3D, 4D images
+    // Cope with incomplete/invalid headers for 3D, 4D, 5D images
     bool no_spectral(spectral_axis < 0), no_stokes(stokes_axis < 0);
     if ((no_spectral && no_stokes) && (_num_dims == 3)) {
         // assume third is spectral with no stokes
@@ -287,6 +292,21 @@ bool FileLoader::FindCoordinateAxes(std::string& message) {
                 spectral_axis = 2;
                 stokes_axis = 3;
             }
+        }
+    }
+
+    // Handle 5D images - ZARR specific axis assignment
+    if (_num_dims == 5) {
+        if (no_spectral && no_stokes) {
+            // Assign axes according to user specification
+            spectral_axis = 1;  // time_axis=1 maps to spectral in CARTA
+            stokes_axis = 2;    // spectral_axis=2 maps to stokes in CARTA  
+            // render axes are the spatial axes (last two: y=3, x=4)
+            render_axes.clear();
+            render_axes.push_back(4); // spatial_x (axis 4)
+            render_axes.push_back(3); // spatial_y (axis 3)
+            spatial_axes[0] = 4; // x = axis 4
+            spatial_axes[1] = 3; // y = axis 3
         }
     }
 
@@ -334,8 +354,9 @@ bool FileLoader::GetSlice(casacore::Array<float>& data, const StokesSlicer& stok
         }
 
         auto image_type = image->imageType();
-        if (image_type == "CartaFitsImage") {
-            // Use cfitsio for slice
+        spdlog::debug("FileLoader::GetSlice: Image type: {}", image_type);
+        if (image_type == "CartaFitsImage" || image_type == "CartaZarrImage") {
+            // Use cfitsio or tensorstore for slice
             return image->doGetSlice(data, slicer);
         } else if (image_type == "ImageExpr") {
             // Use ImageExpr for slice
@@ -854,8 +875,9 @@ FileInfo::ImageStats& FileLoader::GetImageStats(int current_stokes, int z) {
     return _empty_stats;
 }
 
-bool FileLoader::GetCursorSpectralData(
-    std::vector<float>& data, int stokes, int cursor_x, int count_x, int cursor_y, int count_y, std::mutex& image_mutex) {
+bool FileLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange& z_range, int stokes, int cursor_x, int count_x,
+                                       int cursor_y, int count_y, std::mutex& image_mutex, float& progress) {
+    progress = 1.0;
     // Must be implemented in subclasses
     return false;
 }
@@ -867,9 +889,20 @@ bool FileLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, 
 
 bool FileLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
     const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
+    std::map<CARTA::StatsType, std::vector<double>>& results, float& progress, std::function<bool()> cancellation_check) {
+    // Default implementation: delegate to the version without callback
+    return GetRegionSpectralData(region_id, z_range, stokes, mask, origin, image_mutex, results, progress);
+}
+
+bool FileLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
+    const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
     std::map<CARTA::StatsType, std::vector<double>>& results, float& progress) {
     // Must be implemented in subclasses
     return false;
+}
+
+void FileLoader::ClearRegionSpectralCache(int region_id) {
+    (void)region_id;
 }
 
 bool FileLoader::GetDownsampledRasterData(

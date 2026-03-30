@@ -17,5 +17,8 @@ cmake-build-*/
 build/
 coverage/
 
+# TensorStore
+tensorstore
+
 # Doxygen
 docs/html
