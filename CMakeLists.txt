@@ -188,7 +188,7 @@ add_subdirectory(third-party/nlohmann_json)
 
 # Use TensorStore's nlohmann_json for json-schema-validator to ensure ABI compatibility
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-    set(TENSORSTORE_BUILD_ROOT "${CMAKE_SOURCE_DIR}/tensorstore/build")
+    set(TENSORSTORE_BUILD_ROOT "${CMAKE_SOURCE_DIR}/third-party/tensorstore/build")
     include_directories(BEFORE "${TENSORSTORE_BUILD_ROOT}/_deps/nlohmann_json-src/include")
 endif()
 
@@ -201,8 +201,116 @@ include_directories("${CMAKE_SOURCE_DIR}/third-party/xtl/include")
 include_directories("${CMAKE_SOURCE_DIR}/third-party/xtensor/include")
 
 # TensorStore configuration
-set(TENSORSTORE_ROOT "${CMAKE_SOURCE_DIR}/tensorstore")
+set(TENSORSTORE_ROOT "${CMAKE_SOURCE_DIR}/third-party/tensorstore")
 set(TENSORSTORE_BUILD_ROOT "${TENSORSTORE_ROOT}/build")
+set(TENSORSTORE_MAIN_LIB "${TENSORSTORE_BUILD_ROOT}/libtensorstore_tensorstore.a")
+
+option(REBUILD_TENSORSTORE "Force rebuild of TensorStore" OFF)
+
+# Build TensorStore automatically if not already built
+if(NOT EXISTS "${TENSORSTORE_MAIN_LIB}" OR REBUILD_TENSORSTORE)
+    message(STATUS "============================================")
+    message(STATUS "Building TensorStore from source...")
+    message(STATUS "============================================")
+
+    # Patch .bazelrc: comment out downloader_config
+    file(READ "${TENSORSTORE_ROOT}/.bazelrc" _bazelrc_content)
+    string(REPLACE "common  --downloader_config=bazel/rewrite.config"
+                   "# common  --downloader_config=bazel/rewrite.config"
+                   _bazelrc_content "${_bazelrc_content}")
+    file(WRITE "${TENSORSTORE_ROOT}/.bazelrc" "${_bazelrc_content}")
+    message(STATUS "Patched .bazelrc")
+
+    # Patch .bazelversion: downgrade to 7.6.1
+    file(WRITE "${TENSORSTORE_ROOT}/.bazelversion" "7.6.1\n")
+    message(STATUS "Patched .bazelversion to 7.6.1")
+
+    # Patch tensorstore/CMakeLists.txt: add include_directories before include(bazel_to_cmake)
+    file(READ "${TENSORSTORE_ROOT}/CMakeLists.txt" _ts_cmake_content)
+    string(FIND "${_ts_cmake_content}" "include_directories(\${CMAKE_BINARY_DIR})" _ts_patch_pos)
+    if(_ts_patch_pos EQUAL -1)
+        string(REPLACE "include(bazel_to_cmake)"
+                       "include_directories(\${CMAKE_BINARY_DIR})\n\ninclude(bazel_to_cmake)"
+                       _ts_cmake_content "${_ts_cmake_content}")
+        file(WRITE "${TENSORSTORE_ROOT}/CMakeLists.txt" "${_ts_cmake_content}")
+        message(STATUS "Patched tensorstore/CMakeLists.txt")
+    endif()
+
+    # Download half.hpp (IEEE 754-based half-precision floating-point library)
+    if(NOT EXISTS "${TENSORSTORE_ROOT}/half.hpp")
+        message(STATUS "Downloading half.hpp...")
+        set(_half_zip "${TENSORSTORE_ROOT}/half-2.2.1.zip")
+        file(DOWNLOAD
+            "https://sourceforge.net/projects/half/files/half/2.2.1/half-2.2.1.zip"
+            "${_half_zip}"
+            EXPECTED_HASH SHA256=76ddbf406e9d9b772ec73af2bf925b38b290b4390cc4064720a08d4b4bca0aa9
+            STATUS _half_dl_status)
+        list(GET _half_dl_status 0 _half_dl_code)
+        if(NOT _half_dl_code EQUAL 0)
+            message(FATAL_ERROR "Failed to download half.hpp: ${_half_dl_status}")
+        endif()
+        execute_process(
+            COMMAND ${CMAKE_COMMAND} -E tar xf "${_half_zip}"
+            WORKING_DIRECTORY "${TENSORSTORE_ROOT}")
+        if(EXISTS "${TENSORSTORE_ROOT}/include/half.hpp")
+            file(COPY "${TENSORSTORE_ROOT}/include/half.hpp" DESTINATION "${TENSORSTORE_ROOT}")
+        elseif(EXISTS "${TENSORSTORE_ROOT}/half-2.2.1/include/half.hpp")
+            file(COPY "${TENSORSTORE_ROOT}/half-2.2.1/include/half.hpp" DESTINATION "${TENSORSTORE_ROOT}")
+        endif()
+        file(REMOVE "${_half_zip}")
+        file(REMOVE_RECURSE "${TENSORSTORE_ROOT}/include" "${TENSORSTORE_ROOT}/half-2.2.1")
+        message(STATUS "Downloaded and installed half.hpp")
+    endif()
+
+    # Step 1: Bazel build
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    message(STATUS "Running bazelisk.py build //tensorstore:tensorstore (this may take a long time)...")
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} "${TENSORSTORE_ROOT}/bazelisk.py" build //tensorstore:tensorstore
+        WORKING_DIRECTORY "${TENSORSTORE_ROOT}"
+        RESULT_VARIABLE _bazel_result)
+    if(NOT _bazel_result EQUAL 0)
+        message(FATAL_ERROR "TensorStore bazel build failed (exit code: ${_bazel_result})")
+    endif()
+    message(STATUS "Bazelisk build complete")
+
+    # Step 2: CMake configure + build
+    file(MAKE_DIRECTORY "${TENSORSTORE_BUILD_ROOT}")
+    message(STATUS "Configuring TensorStore CMake build...")
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} "${TENSORSTORE_ROOT}"
+        WORKING_DIRECTORY "${TENSORSTORE_BUILD_ROOT}"
+        RESULT_VARIABLE _ts_cmake_result)
+    if(NOT _ts_cmake_result EQUAL 0)
+        message(FATAL_ERROR "TensorStore cmake configure failed (exit code: ${_ts_cmake_result})")
+    endif()
+
+    message(STATUS "Building TensorStore (make -j8)...")
+    # Create NASM output directories that CMake generates rules for but doesn't create
+    file(GLOB_RECURSE _nasm_build_rules "${TENSORSTORE_BUILD_ROOT}/_deps/jpeg-build/CMakeFiles/JPEG_simd_*.dir/build.make")
+    foreach(_rule_file ${_nasm_build_rules})
+        file(READ "${_rule_file}" _rule_content)
+        string(REGEX MATCHALL "_nasm/[a-zA-Z0-9_/]+" _nasm_dirs "${_rule_content}")
+        list(REMOVE_DUPLICATES _nasm_dirs)
+        foreach(_nasm_dir ${_nasm_dirs})
+            # Extract just the directory part (remove file name if present)
+            get_filename_component(_nasm_parent "${TENSORSTORE_BUILD_ROOT}/_deps/jpeg-build/${_nasm_dir}" DIRECTORY)
+            file(MAKE_DIRECTORY "${TENSORSTORE_BUILD_ROOT}/_deps/jpeg-build/${_nasm_dir}")
+        endforeach()
+    endforeach()
+    message(STATUS "Created NASM output directories")
+    execute_process(
+        COMMAND make -j8
+        WORKING_DIRECTORY "${TENSORSTORE_BUILD_ROOT}"
+        RESULT_VARIABLE _ts_make_result)
+    if(NOT _ts_make_result EQUAL 0)
+        message(FATAL_ERROR "TensorStore make failed (exit code: ${_ts_make_result})")
+    endif()
+
+    message(STATUS "============================================")
+    message(STATUS "TensorStore build complete!")
+    message(STATUS "============================================")
+endif()
 
 # TensorStore include directories  
 include_directories("${TENSORSTORE_ROOT}")
