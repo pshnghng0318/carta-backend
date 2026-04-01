@@ -186,7 +186,8 @@ set(JSON_BuildTests OFF CACHE INTERNAL "")
 set(JSON_Install OFF CACHE INTERNAL "")
 add_subdirectory(third-party/nlohmann_json)
 
-# Use TensorStore's nlohmann_json for json-schema-validator to ensure ABI compatibility
+# Use TensorStore's nlohmann_json for ABI compatibility (v3.12.0)
+# json-schema-validator will also use this version
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
     set(TENSORSTORE_BUILD_ROOT "${CMAKE_SOURCE_DIR}/third-party/tensorstore/build")
     include_directories(BEFORE "${TENSORSTORE_BUILD_ROOT}/_deps/nlohmann_json-src/include")

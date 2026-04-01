@@ -18,7 +18,7 @@ build/
 coverage/
 
 # TensorStore
-tensorstore
+/tensorstore
 
 # Doxygen
 docs/html

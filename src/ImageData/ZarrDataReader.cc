@@ -17,6 +17,9 @@
 #include <type_traits>
 #include <vector>
 
+#include <malloc.h>
+#include <omp.h>
+
 #include <spdlog/fmt/fmt.h>
 #include <spdlog/spdlog.h>
 #include <nlohmann/json.hpp>
@@ -43,11 +46,11 @@ namespace carta {
 constexpr int K_TILE_SIZE = 256;
 #endif
 
-// Reduced from 128MB to 16MB to lower memory footprint.
-// TensorStore still handles chunk caching internally, and 16MB is sufficient
-// for typical tile operations (256x256 float tiles = 256KB each).
-constexpr size_t kDefaultCacheSizeMB = 16;
+// Cache size for TensorStore shared context.
+constexpr size_t kDefaultCacheSizeMB = 64;
 constexpr size_t kDefaultCpuCount = 4;
+// Number of parallel read partitions for spatial splits
+constexpr int kParallelReadParts = 4;
 constexpr size_t kDimSize5D = 5;
 constexpr int kDefaultStripeHeight = 256;
 constexpr int kStripeChunkMultiplier = 8; // Read multiple chunks per stripe to reduce overhead
@@ -77,7 +80,7 @@ struct ZarrDataReader::Impl {
             }();
 
             nlohmann::json context_spec = {{"cache_pool", {{"total_bytes_limit", kDefaultCacheSizeMB * 1024 * 1024}}},
-                {"data_copy_concurrency", {{"limit", 8}}}, {"file_io_concurrency", {{"limit", num_cpus}}}};
+                {"data_copy_concurrency", {{"limit", 16}}}, {"file_io_concurrency", {{"limit", 8}}}};
 
             auto context_result = tensorstore::Context::FromJson(context_spec);
             if (context_result.ok()) {
@@ -345,7 +348,7 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(_read_mutex);
+    // No mutex needed: TensorStore reads are thread-safe and we write to disjoint buffer regions
 
     const auto& start = section.start();
     const auto& stop = section.end();
@@ -363,75 +366,163 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
     // Time index is always 0 for now.
     const tensorstore::Index time_idx = 0;
 
-    // Get L chunk size for batching
+    // Get chunk sizes for partitioning decisions
     const int chunk_shape_l = (_chunk_shape.size() == kDimSize5D) ? _chunk_shape[3] : 512;
+    const int chunk_shape_m = (_chunk_shape.size() == kDimSize5D) ? _chunk_shape[4] : 512;
+    const int num_chunks_l = (width_x + chunk_shape_l - 1) / chunk_shape_l;
+    const int num_chunks_m = (height_y + chunk_shape_m - 1) / chunk_shape_m;
 
-    // Calculate columns per batch
-    const size_t max_bytes = kColumnBatchMaxDataMiB * 1024 * 1024;
-    const size_t bytes_per_column = static_cast<size_t>(height_y) * num_freq * num_stokes * sizeof(float);
-    int cols_per_batch = static_cast<int>(max_bytes / bytes_per_column);
-    cols_per_batch = std::max(cols_per_batch, chunk_shape_l);
-    // Align to chunk boundary
-    cols_per_batch = (cols_per_batch / chunk_shape_l) * chunk_shape_l;
+    // Only partition along an axis if there are enough chunks to avoid redundant decompression.
+    // When a single chunk covers the full axis, splitting means all threads decompress the same
+    // chunk independently (cache can't hold it), wasting N× memory.
+    // Prefer partitioning along the axis with more chunks.
+    enum class PartitionAxis { NONE, L_AXIS, M_AXIS };
+    PartitionAxis partition_axis = PartitionAxis::NONE;
+    int effective_parts = 1;
 
-    float* dst_ptr = buffer.data();
-    int x_offset = 0;
+    if (num_chunks_l >= kParallelReadParts) {
+        partition_axis = PartitionAxis::L_AXIS;
+        effective_parts = kParallelReadParts;
+    } else if (num_chunks_m >= kParallelReadParts) {
+        partition_axis = PartitionAxis::M_AXIS;
+        effective_parts = kParallelReadParts;
+    } else if (num_chunks_l > 1) {
+        partition_axis = PartitionAxis::L_AXIS;
+        effective_parts = num_chunks_l;
+    } else if (num_chunks_m > 1) {
+        partition_axis = PartitionAxis::M_AXIS;
+        effective_parts = num_chunks_m;
+    }
+    // else: single chunk covers entire plane, use 1 thread + TensorStore internal parallelism
 
-    while (x_offset < width_x) {
-        int batch_width = std::min(cols_per_batch, width_x - x_offset);
+    spdlog::debug("ReadSlice: chunks_l={}, chunks_m={}, partition={}, parts={}", num_chunks_l, num_chunks_m,
+        partition_axis == PartitionAxis::L_AXIS ? "L" : (partition_axis == PartitionAxis::M_AXIS ? "M" : "NONE"), effective_parts);
 
-        // Align first batch to chunk boundary
-        if (x_offset == 0 && (start[0] % chunk_shape_l) != 0) {
-            int to_boundary = chunk_shape_l - (start[0] % chunk_shape_l);
-            batch_width = std::min(to_boundary, width_x);
+    // Build partitions: each is (offset, width) along the chosen axis
+    std::vector<std::pair<int, int>> partitions;
+    {
+        int axis_size = (partition_axis == PartitionAxis::M_AXIS) ? height_y : width_x;
+        int chunk_size = (partition_axis == PartitionAxis::M_AXIS) ? chunk_shape_m : chunk_shape_l;
+        int axis_start = (partition_axis == PartitionAxis::M_AXIS) ? start[1] : start[0];
+
+        if (effective_parts <= 1) {
+            partitions.emplace_back(0, axis_size);
+        } else {
+            int nominal_part = (axis_size + effective_parts - 1) / effective_parts;
+            if (nominal_part < chunk_size) {
+                nominal_part = chunk_size;
+            } else {
+                nominal_part = ((nominal_part + chunk_size - 1) / chunk_size) * chunk_size;
+            }
+
+            int off = 0;
+            while (off < axis_size) {
+                int pw = std::min(nominal_part, axis_size - off);
+                if (off == 0 && (axis_start % chunk_size) != 0) {
+                    int to_boundary = chunk_size - (axis_start % chunk_size);
+                    pw = std::min(to_boundary, axis_size);
+                }
+                partitions.emplace_back(off, pw);
+                off += pw;
+            }
         }
-
-        // Create slice: [T=0, F range, P range, L batch, M full]
-        // XRADIO 5D: [T, F, P, L, M] -> CARTA 4D: [X, Y, F, S]
-        auto slice_result = _impl->store | tensorstore::Dims(0).IndexSlice(time_idx) |
-                            tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F (now dim 0 after T slice)
-                            | tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) // P
-                            | tensorstore::Dims(2).ClosedInterval(start[0] + x_offset, start[0] + x_offset + batch_width - 1) // L
-                            | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);                                         // M
-
-        if (!slice_result.ok()) {
-            spdlog::error("ReadSlice batch slice failed: {}", slice_result.status().ToString());
-            return false;
-        }
-
-        // Transpose [F, P, L, M] -> [L, M, F, P]
-        auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
-        if (!reorder_result.ok()) {
-            spdlog::error("ReadSlice reorder failed: {}", reorder_result.status().ToString());
-            return false;
-        }
-
-        // Destination pointer: x_offset into Fortran-order buffer [X, Y, F, S]
-        float* batch_dst = dst_ptr + x_offset;
-
-        // Strides for Fortran order in 4D [X, Y, F, S]
-        std::array<tensorstore::Index, 4> batch_shape = {static_cast<tensorstore::Index>(batch_width),
-            static_cast<tensorstore::Index>(height_y), static_cast<tensorstore::Index>(num_freq),
-            static_cast<tensorstore::Index>(num_stokes)};
-
-        std::array<tensorstore::Index, 4> batch_byte_strides = {static_cast<tensorstore::Index>(sizeof(float)),
-            static_cast<tensorstore::Index>(width_x * sizeof(float)), static_cast<tensorstore::Index>(width_x * height_y * sizeof(float)),
-            static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(float))};
-
-        tensorstore::StridedLayout<4> batch_layout(batch_shape, batch_byte_strides);
-        tensorstore::ArrayView<float, 4> batch_view(batch_dst, batch_layout);
-        auto batch_array = tensorstore::UnownedToShared(batch_view);
-
-        auto read_status = tensorstore::Read(reorder_result.value(), batch_array).result();
-        if (!read_status.ok()) {
-            spdlog::error("ReadSlice batch read failed: {}", read_status.status().ToString());
-            return false;
-        }
-
-        x_offset += batch_width;
     }
 
-    return true;
+    float* dst_ptr = buffer.data();
+    bool read_ok = true;
+
+    #pragma omp parallel for num_threads(effective_parts) schedule(static) shared(read_ok)
+    for (int p = 0; p < static_cast<int>(partitions.size()); ++p) {
+        if (!read_ok) continue;
+
+        const int part_offset = partitions[p].first;
+        const int part_width = partitions[p].second;
+
+        // Compute L and M ranges for this partition
+        int l_start, l_end, m_start, m_end;
+        if (partition_axis == PartitionAxis::M_AXIS) {
+            l_start = start[0];
+            l_end = stop[0];
+            m_start = start[1] + part_offset;
+            m_end = start[1] + part_offset + part_width - 1;
+        } else {
+            l_start = start[0] + part_offset;
+            l_end = start[0] + part_offset + part_width - 1;
+            m_start = start[1];
+            m_end = stop[1];
+        }
+
+        auto slice_result = _impl->store | tensorstore::Dims(0).IndexSlice(time_idx) |
+                            tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F
+                            | tensorstore::Dims(1).ClosedInterval(start[3], stop[3]) // P
+                            | tensorstore::Dims(2).ClosedInterval(l_start, l_end)    // L
+                            | tensorstore::Dims(3).ClosedInterval(m_start, m_end);   // M
+
+        if (!slice_result.ok()) {
+            spdlog::error("ReadSlice partition {} slice failed: {}", p, slice_result.status().ToString());
+            read_ok = false;
+            continue;
+        }
+
+        auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+        if (!reorder_result.ok()) {
+            spdlog::error("ReadSlice partition {} reorder failed: {}", p, reorder_result.status().ToString());
+            read_ok = false;
+            continue;
+        }
+
+        // Compute destination pointer and strides based on partition axis
+        int part_l_width = (partition_axis == PartitionAxis::M_AXIS) ? width_x : part_width;
+        int part_m_height = (partition_axis == PartitionAxis::M_AXIS) ? part_width : height_y;
+
+        float* batch_dst;
+        if (partition_axis == PartitionAxis::M_AXIS) {
+            // Partitioned along M (Y): offset = part_offset * width_x (skip full rows)
+            batch_dst = dst_ptr + static_cast<size_t>(part_offset) * width_x;
+        } else {
+            // Partitioned along L (X): offset = part_offset (skip columns within a row)
+            batch_dst = dst_ptr + part_offset;
+        }
+
+        std::array<tensorstore::Index, 4> batch_shape = {static_cast<tensorstore::Index>(part_l_width),
+            static_cast<tensorstore::Index>(part_m_height), static_cast<tensorstore::Index>(num_freq),
+            static_cast<tensorstore::Index>(num_stokes)};
+
+        if (partition_axis == PartitionAxis::M_AXIS) {
+            // M-axis partition: data is contiguous in memory (full rows), use Fortran order directly
+            auto batch_array = tensorstore::SharedArray<float>(
+                tensorstore::internal::UnownedToShared(batch_dst), batch_shape, tensorstore::fortran_order);
+
+            auto read_status = tensorstore::Read(reorder_result.value(), batch_array).result();
+            if (!read_status.ok()) {
+                spdlog::error("ReadSlice partition {} read failed: {}", p, read_status.status().ToString());
+                read_ok = false;
+                continue;
+            }
+        } else {
+            // L-axis partition: rows are non-contiguous (stride = width_x, not part_l_width)
+            std::array<tensorstore::Index, 4> batch_byte_strides = {static_cast<tensorstore::Index>(sizeof(float)),
+                static_cast<tensorstore::Index>(width_x * sizeof(float)),
+                static_cast<tensorstore::Index>(width_x * height_y * sizeof(float)),
+                static_cast<tensorstore::Index>(width_x * height_y * num_freq * sizeof(float))};
+
+            tensorstore::StridedLayout<4> batch_layout(batch_shape, batch_byte_strides);
+            tensorstore::ArrayView<float, 4> batch_view(batch_dst, batch_layout);
+            auto batch_array = tensorstore::UnownedToShared(batch_view);
+
+            auto read_status = tensorstore::Read(reorder_result.value(), batch_array).result();
+            if (!read_status.ok()) {
+                spdlog::error("ReadSlice partition {} read failed: {}", p, read_status.status().ToString());
+                read_ok = false;
+                continue;
+            }
+        }
+    }
+
+    // Force glibc to return freed memory from per-thread arenas back to OS.
+    malloc_trim(0);
+
+    return read_ok;
 }
 
 bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& data_height, int min_x, int min_y, int channel, int stokes) {
@@ -440,7 +531,7 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(_read_mutex);
+    // No mutex needed: TensorStore reads are thread-safe and we write to disjoint buffer regions
 
     try {
         int width = _shape[0];
@@ -455,29 +546,7 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
         }
 
         size_t chunk_size = static_cast<size_t>(data_width) * data_height;
-
-        // XRADIO always 5D [T, F, S, L, M]
-        // L -> X (min_x, data_width), M -> Y (min_y, data_height)
-        std::vector<tensorstore::Index> zarr_start = {
-            0, static_cast<tensorstore::Index>(channel), static_cast<tensorstore::Index>(stokes),
-            static_cast<tensorstore::Index>(min_x), // L = X
-            static_cast<tensorstore::Index>(min_y)  // M = Y
-        };
-        std::vector<tensorstore::Index> zarr_shape = {
-            1, 1, 1,
-            static_cast<tensorstore::Index>(data_width), // L = X
-            static_cast<tensorstore::Index>(data_height) // M = Y
-        };
-
-        // Bounds validation
-        for (size_t dim = 0; dim < kDimSize5D; ++dim) {
-            tensorstore::Index end_idx = zarr_start[dim] + zarr_shape[dim] - 1;
-            if (zarr_start[dim] < 0 || end_idx >= _original_shape[dim]) {
-                spdlog::error(
-                    "GetChunk: Bounds error! dim={}, start={}, end={}, array_size={}", dim, zarr_start[dim], end_idx, _original_shape[dim]);
-                return false;
-            }
-        }
+        data.resize(chunk_size);
 
         auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<float>>(_impl->store);
         if (!typed_store_result.ok()) {
@@ -485,6 +554,7 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
             return false;
         }
 
+        // Slice T/F/S dimensions to get a 2D L×M plane
         std::array<tensorstore::Index, 3> slice_indices = {
             0, static_cast<tensorstore::Index>(channel), static_cast<tensorstore::Index>(stokes)};
         auto plane_result = typed_store_result.value() | tensorstore::Dims(0, 1, 2).IndexSlice(slice_indices);
@@ -493,38 +563,61 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
             return false;
         }
 
-        auto chunk_l_result = plane_result.value() | tensorstore::Dims(0).ClosedInterval(min_x, min_x + data_width - 1);
-        if (!chunk_l_result.ok()) {
-            spdlog::error("GetChunk: Error slicing L dimension: {}", chunk_l_result.status().ToString());
-            return false;
+        // Only split into parallel strips if there are enough chunks along M
+        // to avoid redundant decompression of the same chunk.
+        const int chunk_shape_m = (_chunk_shape.size() == kDimSize5D) ? _chunk_shape[4] : 512;
+        const int num_chunks_in_tile_m = (data_height + chunk_shape_m - 1) / chunk_shape_m;
+        const int num_parts = std::min(kParallelReadParts, std::max(1, num_chunks_in_tile_m));
+        bool read_ok = true;
+
+        spdlog::debug("GetChunk: tile={}x{}, chunk_m={}, chunks_in_tile={}, parts={}",
+            data_width, data_height, chunk_shape_m, num_chunks_in_tile_m, num_parts);
+
+        #pragma omp parallel for num_threads(num_parts) schedule(static) shared(read_ok)
+        for (int p = 0; p < num_parts; ++p) {
+            if (!read_ok) continue;
+
+            int strip_y_start = min_y + (data_height * p) / num_parts;
+            int strip_y_end = min_y + (data_height * (p + 1)) / num_parts - 1;
+            int strip_height = strip_y_end - strip_y_start + 1;
+
+            if (strip_height <= 0) continue;
+
+            auto chunk_l_result = plane_result.value() | tensorstore::Dims(0).ClosedInterval(min_x, min_x + data_width - 1);
+            if (!chunk_l_result.ok()) {
+                spdlog::error("GetChunk: Error slicing L dimension in partition {}: {}", p, chunk_l_result.status().ToString());
+                read_ok = false;
+                continue;
+            }
+
+            auto chunk_store_result = chunk_l_result.value() | tensorstore::Dims(1).ClosedInterval(strip_y_start, strip_y_end);
+            if (!chunk_store_result.ok()) {
+                spdlog::error("GetChunk: Error slicing M dimension in partition {}: {}", p, chunk_store_result.status().ToString());
+                read_ok = false;
+                continue;
+            }
+
+            int y_offset = strip_y_start - min_y;
+            float* strip_dst = data.data() + static_cast<size_t>(y_offset) * data_width;
+
+            std::array<tensorstore::Index, 2> output_shape = {
+                static_cast<tensorstore::Index>(data_width), static_cast<tensorstore::Index>(strip_height)};
+
+            auto output_array =
+                tensorstore::SharedArray<float>(tensorstore::internal::UnownedToShared(strip_dst), output_shape, tensorstore::fortran_order);
+
+            auto read_status = tensorstore::Read(chunk_store_result.value(), output_array).result();
+            if (!read_status.ok()) {
+                spdlog::error("TensorStore GetChunk partition {} failed: {}", p, read_status.status().ToString());
+                read_ok = false;
+                continue;
+            }
         }
 
-        auto chunk_store_result = chunk_l_result.value() | tensorstore::Dims(1).ClosedInterval(min_y, min_y + data_height - 1);
-        if (!chunk_store_result.ok()) {
-            spdlog::error("GetChunk: Error slicing M dimension: {}", chunk_store_result.status().ToString());
-            return false;
-        }
+        // Force glibc to return freed memory from per-thread arenas back to OS.
+        malloc_trim(0);
 
-        data.resize(chunk_size);
-        float* dst_ptr = data.data();
-        if (!dst_ptr) {
-            spdlog::error("GetChunk: data pointer is null after resize");
-            return false;
-        }
-
-        std::array<tensorstore::Index, 2> output_shape = {
-            static_cast<tensorstore::Index>(data_width), static_cast<tensorstore::Index>(data_height)};
-
-        auto output_array =
-            tensorstore::SharedArray<float>(tensorstore::internal::UnownedToShared(dst_ptr), output_shape, tensorstore::fortran_order);
-
-        auto read_status = tensorstore::Read(chunk_store_result.value(), output_array).result();
-        if (!read_status.ok()) {
-            spdlog::error("TensorStore GetChunk failed: {}", read_status.status().ToString());
-            return false;
-        }
-
-        return true;
+        return read_ok;
 
     } catch (const std::exception& ex) {
         spdlog::error("Exception in GetChunk: {}", ex.what());
@@ -538,7 +631,7 @@ bool ZarrDataReader::ReadSpectralProfile(int x, int y, int stokes, std::vector<f
         return false;
     }
 
-    std::lock_guard<std::mutex> lock(_read_mutex);
+    // No mutex needed: TensorStore reads are thread-safe
 
     try {
         int num_channels = _shape[2]; // Frequency axis in CARTA shape [X, Y, F, S]
