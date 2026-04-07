@@ -26,6 +26,7 @@
 
 // TensorStore includes - isolated to implementation file
 #include "contiguous_layout.h"
+#include "Main/ProgramSettings.h"
 #include "tensorstore/array.h"
 #include "tensorstore/chunk_layout.h"
 #include "tensorstore/context.h"
@@ -73,18 +74,28 @@ struct ZarrDataReader::Impl {
     // This saves memory (single cache pool) and reduces initialization overhead
     static tensorstore::Context GetSharedContext() {
         static tensorstore::Context shared_context = []() {
-            static const unsigned int num_cpus = []() {
-                // auto cpu_count = std::thread::hardware_concurrency();
-                auto cpu_count = 4;
-                return cpu_count ? cpu_count : kDefaultCpuCount;
-            }();
+            int omp_threads = 4;
+            try {
+                omp_threads = carta::ProgramSettings::GetInstance().omp_thread_count;
+            } catch (...) {
+                omp_threads = 4;
+            }
+            if (omp_threads <= 0) omp_threads = std::thread::hardware_concurrency();
+            if (omp_threads <= 0) omp_threads = kDefaultCpuCount;
 
-            nlohmann::json context_spec = {{"cache_pool", {{"total_bytes_limit", kDefaultCacheSizeMB * 1024 * 1024}}},
-                {"data_copy_concurrency", {{"limit", 16}}}, {"file_io_concurrency", {{"limit", 8}}}};
+            int data_copy_conc = omp_threads - 2;
+            if (data_copy_conc < 1) data_copy_conc = 1;
+            int file_io_conc = 2;
+
+            nlohmann::json context_spec = {
+                {"cache_pool", {{"total_bytes_limit", kDefaultCacheSizeMB * 1024 * 1024}}},
+                {"data_copy_concurrency", {{"limit", data_copy_conc}}},
+                {"file_io_concurrency", {{"limit", file_io_conc}}}
+            };
 
             auto context_result = tensorstore::Context::FromJson(context_spec);
             if (context_result.ok()) {
-                spdlog::info("Created shared TensorStore context with {} CPU cores, {}MB cache", num_cpus, kDefaultCacheSizeMB);
+                spdlog::info("Created shared TensorStore context with omp_threads={}, data_copy_concurrency={}, file_io_concurrency={}, cache={}MB", omp_threads, data_copy_conc, file_io_conc, kDefaultCacheSizeMB);
                 return context_result.value();
             }
             spdlog::warn("Failed to create custom context, using default");
@@ -714,7 +725,6 @@ std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
     if (!_initialized) {
         return {};
     }
-    std::lock_guard<std::mutex> lock(_read_mutex);
 
     try {
         std::filesystem::path base_path(_filename);
@@ -779,7 +789,6 @@ std::vector<std::string> ZarrDataReader::ReadStringVector(const std::string& arr
     if (!_initialized) {
         return {};
     }
-    std::lock_guard<std::mutex> lock(_read_mutex);
 
     try {
         std::filesystem::path base_path(_filename);
@@ -846,7 +855,6 @@ std::vector<double> ZarrDataReader::ReadFlattenedVector(const std::string& array
     if (!_initialized) {
         return {};
     }
-    std::lock_guard<std::mutex> lock(_read_mutex);
 
     try {
         std::filesystem::path base_path(_filename);

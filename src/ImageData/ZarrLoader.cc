@@ -68,7 +68,6 @@ CartaZarrImage* ZarrLoader::GetZarrImage() {
 bool ZarrLoader::GetChunk(std::vector<float>& data, int& data_width, int& data_height,
                           int min_x, int min_y, int channel, int stokes, 
                           std::mutex& image_mutex) {
-    std::lock_guard<std::mutex> lock(image_mutex);
     
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
@@ -232,7 +231,6 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
     casacore::Array<float> batch_data;
     auto t_batch_start = std::chrono::high_resolution_clock::now();
     {
-        std::lock_guard<std::mutex> lock(image_mutex);
         if (!reader->ReadSlice(batch_data, casacore::Slicer(start, length))) {
             spdlog::error("ZarrLoader::GetCursorSpectralData: ReadSlice failed");
             return false;
@@ -482,7 +480,6 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
 
     casacore::Array<float> batch_data;
     {
-        std::lock_guard<std::mutex> lock(image_mutex);
         if (!reader->ReadSlice(batch_data, casacore::Slicer(start, length))) {
             spdlog::error("ZarrLoader::GetRegionSpectralData: ReadSlice failed");
             return false;
@@ -623,8 +620,6 @@ void ZarrLoader::ClearRegionSpectralCache(int region_id) {
 bool ZarrLoader::GetSpatialProfileX(std::vector<float>& profile, int start_x, int end_x, 
                                      int cursor_y, int channel, int stokes, 
                                      std::mutex& image_mutex) {
-    std::lock_guard<std::mutex> lock(image_mutex);
-    
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
         spdlog::error("ZarrLoader::GetSpatialProfileX: No valid ZARR image");
@@ -665,8 +660,6 @@ bool ZarrLoader::GetSpatialProfileX(std::vector<float>& profile, int start_x, in
 bool ZarrLoader::GetSpatialProfileY(std::vector<float>& profile, int cursor_x, 
                                      int start_y, int end_y, int channel, int stokes, 
                                      std::mutex& image_mutex) {
-    std::lock_guard<std::mutex> lock(image_mutex);
-    
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
         spdlog::error("ZarrLoader::GetSpatialProfileY: No valid ZARR image");
