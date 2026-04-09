@@ -67,7 +67,7 @@ CartaZarrImage* ZarrLoader::GetZarrImage() {
 
 bool ZarrLoader::GetChunk(std::vector<float>& data, int& data_width, int& data_height,
                           int min_x, int min_y, int channel, int stokes, 
-                          std::mutex& image_mutex) {
+                          std::mutex& /*image_mutex*/) {
     
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
@@ -85,21 +85,17 @@ bool ZarrLoader::GetChunk(std::vector<float>& data, int& data_width, int& data_h
 }
 
 bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange& z_range, int stokes, int cursor_x, int count_x,
-                                       int cursor_y, int count_y, std::mutex& image_mutex, float& progress) {
+                                       int cursor_y, int count_y, std::mutex& /*image_mutex*/, float& progress) {
     if (count_x <= 0 || count_y <= 0) {
         return false;
     }
 
-    std::shared_ptr<ZarrDataReader> reader;
-    {
-        std::lock_guard<std::mutex> lock(image_mutex);
-        auto* zarr_image = GetZarrImage();
-        if (!zarr_image) {
-            spdlog::error("ZarrLoader::GetCursorSpectralData: No valid ZARR image");
-            return false;
-        }
-        reader = zarr_image->GetReader();
+    auto* zarr_image_cursor = GetZarrImage();
+    if (!zarr_image_cursor) {
+        spdlog::error("ZarrLoader::GetCursorSpectralData: No valid ZARR image");
+        return false;
     }
+    std::shared_ptr<ZarrDataReader> reader = zarr_image_cursor->GetReader();
 
     if (!reader || !reader->IsInitialized()) {
         spdlog::error("ZarrLoader::GetCursorSpectralData: Reader not initialized");
@@ -291,7 +287,7 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
     return true;
 }
 
-bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, std::mutex& image_mutex) {
+bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, std::mutex& /*image_mutex*/) {
     if (region_shape.size() < 2) {
         return false;
     }
@@ -300,7 +296,6 @@ bool ZarrLoader::UseRegionSpectralData(const casacore::IPosition& region_shape, 
     }
     // Allow point regions to use loader path for progress-aware reads.
 
-    std::lock_guard<std::mutex> lock(image_mutex);
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
         return false;
@@ -317,19 +312,15 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
 }
 
 bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, int stokes,
-    const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& image_mutex,
+    const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& /*image_mutex*/,
     std::map<CARTA::StatsType, std::vector<double>>& results, float& progress,
     std::function<bool()> cancellation_check) {
-    std::shared_ptr<ZarrDataReader> reader;
-    {
-        std::lock_guard<std::mutex> lock(image_mutex);
-        auto* zarr_image = GetZarrImage();
-        if (!zarr_image) {
-            spdlog::error("ZarrLoader::GetRegionSpectralData: No valid ZARR image");
-            return false;
-        }
-        reader = zarr_image->GetReader();
+    auto* zarr_image = GetZarrImage();
+    if (!zarr_image) {
+        spdlog::error("ZarrLoader::GetRegionSpectralData: No valid ZARR image");
+        return false;
     }
+    std::shared_ptr<ZarrDataReader> reader = zarr_image->GetReader();
 
     if (!reader || !reader->IsInitialized()) {
         spdlog::error("ZarrLoader::GetRegionSpectralData: Reader not initialized");
@@ -349,11 +340,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     auto region_stats_id = FileInfo::RegionStatsId(region_id, stokes);
     casacore::IPosition mask_shape(mask.shape());
     std::shared_ptr<FileInfo::RegionSpectralStats> existing_stats_ptr;
-    {
-        std::lock_guard<std::mutex> lock(image_mutex);
-        if (_region_stats.count(region_stats_id)) {
-            existing_stats_ptr = _region_stats[region_stats_id];
-        }
+    if (_region_stats.count(region_stats_id)) {
+        existing_stats_ptr = _region_stats[region_stats_id];
     }
 
     if (existing_stats_ptr && existing_stats_ptr->IsValid(origin, mask_shape) && all_z &&
@@ -374,17 +362,14 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     bool has_flux = !std::isnan(beam_area);
 
     std::shared_ptr<FileInfo::RegionSpectralStats> stats_ptr;
-    {
-        std::lock_guard<std::mutex> lock(image_mutex);
-        if (_region_stats.find(region_stats_id) == _region_stats.end()) {
+    if (_region_stats.find(region_stats_id) == _region_stats.end()) {
+        stats_ptr = std::make_shared<FileInfo::RegionSpectralStats>(origin, mask_shape, depth, has_flux);
+        _region_stats.emplace(region_stats_id, stats_ptr);
+    } else {
+        stats_ptr = _region_stats[region_stats_id];
+        if (!stats_ptr->IsValid(origin, mask_shape)) {
             stats_ptr = std::make_shared<FileInfo::RegionSpectralStats>(origin, mask_shape, depth, has_flux);
-            _region_stats.emplace(region_stats_id, stats_ptr);
-        } else {
-            stats_ptr = _region_stats[region_stats_id];
-            if (!stats_ptr->IsValid(origin, mask_shape)) {
-                stats_ptr = std::make_shared<FileInfo::RegionSpectralStats>(origin, mask_shape, depth, has_flux);
-                _region_stats[region_stats_id] = stats_ptr;
-            }
+            _region_stats[region_stats_id] = stats_ptr;
         }
     }
 
@@ -619,7 +604,7 @@ void ZarrLoader::ClearRegionSpectralCache(int region_id) {
 
 bool ZarrLoader::GetSpatialProfileX(std::vector<float>& profile, int start_x, int end_x, 
                                      int cursor_y, int channel, int stokes, 
-                                     std::mutex& image_mutex) {
+                                     std::mutex& /*image_mutex*/) {
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
         spdlog::error("ZarrLoader::GetSpatialProfileX: No valid ZARR image");
@@ -659,7 +644,7 @@ bool ZarrLoader::GetSpatialProfileX(std::vector<float>& profile, int start_x, in
 
 bool ZarrLoader::GetSpatialProfileY(std::vector<float>& profile, int cursor_x, 
                                      int start_y, int end_y, int channel, int stokes, 
-                                     std::mutex& image_mutex) {
+                                     std::mutex& /*image_mutex*/) {
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
         spdlog::error("ZarrLoader::GetSpatialProfileY: No valid ZARR image");

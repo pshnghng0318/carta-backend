@@ -83,9 +83,10 @@ struct ZarrDataReader::Impl {
             if (omp_threads <= 0) omp_threads = std::thread::hardware_concurrency();
             if (omp_threads <= 0) omp_threads = kDefaultCpuCount;
 
-            int data_copy_conc = omp_threads - 2;
+            int file_io_conc = int(omp_threads / 4.0);
+            if (file_io_conc < 1) file_io_conc = 1;
+            int data_copy_conc = omp_threads - file_io_conc;
             if (data_copy_conc < 1) data_copy_conc = 1;
-            int file_io_conc = 2;
 
             nlohmann::json context_spec = {
                 {"cache_pool", {{"total_bytes_limit", kDefaultCacheSizeMB * 1024 * 1024}}},
@@ -359,11 +360,11 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
         return false;
     }
 
-    // No mutex needed: TensorStore reads are thread-safe and we write to disjoint buffer regions
-
     const auto& start = section.start();
     const auto& stop = section.end();
     const auto& length = section.length();
+
+    spdlog::debug("length = {}", length[0], length[1], length[2], length[3]);
 
     spdlog::debug("ZarrDataReader::ReadSlice: start={}, stop={}, length={}", start.toString(), stop.toString(), length.toString());
 
@@ -542,8 +543,6 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
         return false;
     }
 
-    // No mutex needed: TensorStore reads are thread-safe and we write to disjoint buffer regions
-
     try {
         int width = _shape[0];
         int height = _shape[1];
@@ -641,8 +640,6 @@ bool ZarrDataReader::ReadSpectralProfile(int x, int y, int stokes, std::vector<f
         spdlog::error("ZarrDataReader not initialized");
         return false;
     }
-
-    // No mutex needed: TensorStore reads are thread-safe
 
     try {
         int num_channels = _shape[2]; // Frequency axis in CARTA shape [X, Y, F, S]
