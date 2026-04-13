@@ -396,7 +396,7 @@ std::string_view HttpServer::UpdatePreferencesFromString(const std::string& buff
                 auto& settings = ProgramSettings::GetInstance();
                 if (update_data.contains("file_io")) {
                     int new_file_io = update_data["file_io"];
-                    if (new_file_io >= 1 && new_file_io <= 64) {
+                    if (new_file_io >= 1 && new_file_io <= 8) {
                         settings.file_io = new_file_io;
                         spdlog::info("Updated runtime file_io to {}", settings.file_io);
                     }

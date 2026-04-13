@@ -297,18 +297,10 @@ global configuration files, respectively.
     if (result.count("file_io")) {
         file_io = result["file_io"].as<int>();
         if (file_io < 1) {
-            // default file_io to omp_threads / 2
-            file_io = omp_thread_count / 2;
-            if (file_io < 1) {
-                file_io = 1;
-            }
-
+            file_io = 2;
         }
     } else {
-        file_io = omp_thread_count / 2;
-        if (file_io < 1) {
-            file_io = 1;
-        }
+        file_io = 2;
     }
 
     for (const auto& arg : positional_arguments) {
