@@ -392,22 +392,16 @@ std::string_view HttpServer::UpdatePreferencesFromString(const std::string& buff
             if (WritePreferencesFile(existing_data)) {
                 spdlog::debug("Updated {} preferences", modified_key_count);
                 
-                // Apply runtime cpu_ch updates for batch processing
+                // Apply runtime file_io_concurrency updates for batch processing
                 auto& settings = ProgramSettings::GetInstance();
-                if (update_data.contains("cpu_ch")) {
-                    int new_cpu_ch = update_data["cpu_ch"];
-                    if (new_cpu_ch >= 1 && new_cpu_ch <= 64) {
-                        settings.cpu_ch = new_cpu_ch;
-                        spdlog::info("Updated runtime cpu_ch to {}", settings.cpu_ch);
-                    }
-                } else if (update_data.contains("channelsPerThread")) {
-                    int new_cpu_ch = update_data["channelsPerThread"];
-                    if (new_cpu_ch >= 1 && new_cpu_ch <= 64) {
-                        settings.cpu_ch = new_cpu_ch;
-                        spdlog::info("Updated runtime cpu_ch to {}", settings.cpu_ch);
+                if (update_data.contains("file_io")) {
+                    int new_file_io = update_data["file_io"];
+                    if (new_file_io >= 1 && new_file_io <= 64) {
+                        settings.file_io = new_file_io;
+                        spdlog::info("Updated runtime file_io to {}", settings.file_io);
                     }
                 }
-                
+
                 return HTTP_200;
             } else {
                 return HTTP_400;

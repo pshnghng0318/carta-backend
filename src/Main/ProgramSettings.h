@@ -65,7 +65,7 @@ struct ProgramSettings {
     int wait_time = -1;
     int init_wait_time = -1;
     int idle_session_wait_time = -1;
-    int cpu_ch = 8;  // Number of channels per CPU thread for ZARR region spectral
+    int file_io = 2;
     bool read_only_mode = false;
     bool enable_scripting = false;
     bool controller_deployment = false;
@@ -89,7 +89,7 @@ struct ProgramSettings {
         {"exit_timeout", &wait_time},
         {"initial_timeout", &init_wait_time},
         {"idle_timeout", &idle_session_wait_time},
-        {"cpu_ch", &cpu_ch}
+        {"file_io_concurrency", &file_io},
     };
 
     std::unordered_map<std::string, bool*> bool_keys_map{

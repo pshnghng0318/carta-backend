@@ -84,13 +84,19 @@ struct ZarrDataReader::Impl {
             if (omp_threads <= 0) omp_threads = std::thread::hardware_concurrency();
             if (omp_threads <= 0) omp_threads = kDefaultCpuCount;
 
-            // int file_io_conc = int(omp_threads / 4.0);
-            // if (file_io_conc < 1) file_io_conc = 1;
+            int file_io_conc = omp_threads / 2;
+            if (file_io_conc < 1) file_io_conc = 1;
 
-            // int data_copy_conc = omp_threads - file_io_conc;
-            // if (data_copy_conc < 1) data_copy_conc = 1;
-            int data_copy_conc = std::thread::hardware_concurrency() / 2;
-            int file_io_conc = std::thread::hardware_concurrency() - data_copy_conc;
+            // Runtime changes from Program Settings
+            try {
+                file_io_conc = carta::ProgramSettings::GetInstance().file_io;
+                if (file_io_conc < 1) file_io_conc = 1;
+            } catch (...) {
+                file_io_conc = omp_threads / 2;
+                if (file_io_conc < 1) file_io_conc = 1;
+            }
+            int data_copy_conc = omp_threads - file_io_conc;
+            if (data_copy_conc < 1) data_copy_conc = 1;
 
             nlohmann::json context_spec = {
                 {"cache_pool", {{"total_bytes_limit", kDefaultCacheSizeMB * 1024 * 1024}}},
