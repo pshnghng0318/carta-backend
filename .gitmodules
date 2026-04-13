@@ -23,7 +23,7 @@
 	shallow = true
 [submodule "schemas"]
 	path = schemas
-	url = https://github.com/pshnghng0318/schemas.git
+	url = git@github.com:pshnghng0318/schemas.git
 [submodule "third-party/json-schema-validator"]
 	path = third-party/json-schema-validator
 	url = https://github.com/pshnghng0318/json-schema-validator
