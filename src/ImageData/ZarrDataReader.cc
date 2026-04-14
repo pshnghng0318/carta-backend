@@ -89,10 +89,11 @@ struct ZarrDataReader::Impl {
             // Runtime changes from Program Settings
             try {
                 file_io_conc = carta::ProgramSettings::GetInstance().file_io;
+                if (file_io_conc >= std::thread::hardware_concurrency()) {
+                    file_io_conc = std::thread::hardware_concurrency() - omp_threads;
+                }
                 if (file_io_conc < 1) {
                     file_io_conc = 1;
-                } else if (file_io_conc > std::thread::hardware_concurrency()) {
-                    file_io_conc = 2;
                 }
             } catch (...) {
                 file_io_conc = 2;
