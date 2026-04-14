@@ -296,7 +296,9 @@ global configuration files, respectively.
 
     if (result.count("file_io")) {
         file_io = result["file_io"].as<int>();
-        if (file_io < 1) {
+        int data_copy = omp_thread_count > 0 ? omp_thread_count : std::thread::hardware_concurrency();
+        if (file_io < 1 || file_io > 8 || file_io + data_copy > std::thread::hardware_concurrency()) {
+            spdlog::warn("file_io value {} reduced to 2", file_io);
             file_io = 2;
         }
     } else {
@@ -354,6 +356,12 @@ global configuration files, respectively.
         if (result.count(key)) {
             command_line_settings[key] = result[key].as<std::vector<int>>();
         }
+    }
+
+    // file_io uses a different CLI name ("file_io") than the preferences key ("file_io_concurrency"),
+    // so it's not picked up by the int_keys_map loop above. Add it explicitly after validation.
+    if (result.count("file_io")) {
+        command_line_settings["file_io_concurrency"] = file_io;
     }
 }
 
