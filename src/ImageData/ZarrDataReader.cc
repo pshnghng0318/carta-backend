@@ -51,10 +51,10 @@ constexpr int K_TILE_SIZE = 256;
 constexpr size_t kDefaultCacheSizeMB = 64;
 constexpr size_t kDefaultCpuCount = 4;
 // Number of parallel read partitions for spatial splits
-constexpr int kParallelReadParts = 4;
+// constexpr int kParallelReadParts = 1;
 constexpr size_t kDimSize5D = 5;
-constexpr int kDefaultStripeHeight = 256;
-constexpr int kStripeChunkMultiplier = 8; // Read multiple chunks per stripe to reduce overhead
+// constexpr int kDefaultStripeHeight = 256;
+// constexpr int kStripeChunkMultiplier = 8; // Read multiple chunks per stripe to reduce overhead
 
 // Maximum data size per column batch in MiB for ReadChannelSliceV2
 // Single chunk size is taken as minimum to avoid reading same chunk multiple times
@@ -70,19 +70,23 @@ struct ZarrDataReader::Impl {
     nlohmann::json zmetadata;
     bool has_zmetadata = false;
 
+    // Returns the configured OMP thread count from ProgramSettings (or a safe default)
+    static int GetOmpThreadCount() {
+        int omp_threads = 4;
+        try {
+            omp_threads = carta::ProgramSettings::GetInstance().omp_thread_count;
+        } catch (...) {
+            omp_threads = 4;
+        }
+        if (omp_threads <= 0) omp_threads = std::thread::hardware_concurrency() > 0 ? std::thread::hardware_concurrency() : kDefaultCpuCount;
+        return omp_threads;
+    }
+
     // Get shared TensorStore context (created once, reused by all instances)
     // This saves memory (single cache pool) and reduces initialization overhead
     static tensorstore::Context GetSharedContext() {
         static tensorstore::Context shared_context = []() {
-            int omp_threads = 4;
-            
-            try {
-                omp_threads = carta::ProgramSettings::GetInstance().omp_thread_count;
-            } catch (...) {
-                omp_threads = 4;
-            }
-            if (omp_threads <= 0) omp_threads = std::thread::hardware_concurrency();
-            if (omp_threads <= 0) omp_threads = kDefaultCpuCount;
+            int omp_threads = GetOmpThreadCount();
 
             int file_io_conc = 2;
 
@@ -410,12 +414,26 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
     PartitionAxis partition_axis = PartitionAxis::NONE;
     int effective_parts = 1;
 
-    if (num_chunks_l >= kParallelReadParts) {
+    // if (num_chunks_l >= kParallelReadParts) {
+    //     partition_axis = PartitionAxis::L_AXIS;
+    //     effective_parts = kParallelReadParts;
+    // } else if (num_chunks_m >= kParallelReadParts) {
+    //     partition_axis = PartitionAxis::M_AXIS;
+    //     effective_parts = kParallelReadParts;
+    // } else if (num_chunks_l > 1) {
+    //     partition_axis = PartitionAxis::L_AXIS;
+    //     effective_parts = num_chunks_l;
+    // } else if (num_chunks_m > 1) {
+    //     partition_axis = PartitionAxis::M_AXIS;
+    //     effective_parts = num_chunks_m;
+    // }
+    const int omp_threads = Impl::GetOmpThreadCount();
+    if (num_chunks_l >= omp_threads) {
         partition_axis = PartitionAxis::L_AXIS;
-        effective_parts = kParallelReadParts;
-    } else if (num_chunks_m >= kParallelReadParts) {
+        effective_parts = omp_threads;
+    } else if (num_chunks_m >= omp_threads) {
         partition_axis = PartitionAxis::M_AXIS;
-        effective_parts = kParallelReadParts;
+        effective_parts = omp_threads;
     } else if (num_chunks_l > 1) {
         partition_axis = PartitionAxis::L_AXIS;
         effective_parts = num_chunks_l;
@@ -595,7 +613,8 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
         // to avoid redundant decompression of the same chunk.
         const int chunk_shape_m = (_chunk_shape.size() == kDimSize5D) ? _chunk_shape[4] : 512;
         const int num_chunks_in_tile_m = (data_height + chunk_shape_m - 1) / chunk_shape_m;
-        const int num_parts = std::min(kParallelReadParts, std::max(1, num_chunks_in_tile_m));
+        // const int num_parts = std::min(kParallelReadParts, std::max(1, num_chunks_in_tile_m));
+        const int num_parts = std::min(Impl::GetOmpThreadCount(), std::max(1, num_chunks_in_tile_m));
         bool read_ok = true;
 
         spdlog::debug("GetChunk: tile={}x{}, chunk_m={}, chunks_in_tile={}, parts={}",
