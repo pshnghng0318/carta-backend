@@ -287,16 +287,6 @@ json HttpServer::GetExistingPreferences() {
         return {};
     }
 
-    // If file_io was set on the command line, persist the validated value into preferences as file_io_concurrency
-    const auto& settings = ProgramSettings::GetInstance();
-    if (settings.command_line_settings.contains("file_io_concurrency")) {
-        int validated_value = settings.file_io;
-        if (!obj.contains("file_io_concurrency") || obj["file_io_concurrency"] != validated_value) {
-            obj["file_io_concurrency"] = validated_value;
-            WritePreferencesFile(obj);
-        }
-    }
-
     return obj;
 }
 
@@ -401,18 +391,6 @@ std::string_view HttpServer::UpdatePreferencesFromString(const std::string& buff
             }
             if (WritePreferencesFile(existing_data)) {
                 spdlog::debug("Updated {} preferences", modified_key_count);
-                
-                // Apply runtime file_io_concurrency updates for batch processing
-                auto& settings = ProgramSettings::GetInstance();
-                if (update_data.contains("file_io")) {
-                    int new_file_io = update_data["file_io"];
-                    int omp_threads = settings.omp_thread_count > 0 ? settings.omp_thread_count : std::thread::hardware_concurrency();
-                    if (new_file_io >= 1 && new_file_io <= 8 && new_file_io < std::thread::hardware_concurrency()) {
-                        settings.file_io = new_file_io;
-                        spdlog::info("Updated runtime file_io to {}", settings.file_io);
-                    }
-                }
-
                 return HTTP_200;
             } else {
                 return HTTP_400;

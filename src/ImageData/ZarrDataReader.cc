@@ -110,15 +110,20 @@ struct ZarrDataReader::Impl {
             }
             if (data_copy_conc < 1) data_copy_conc = 1;
 
+            int cache_pool_MB = kDefaultCacheSizeMB;
+            if (carta::ProgramSettings::GetInstance().cache_pool > 0) {
+                cache_pool_MB = carta::ProgramSettings::GetInstance().cache_pool;
+            }
+
             nlohmann::json context_spec = {
-                {"cache_pool", {{"total_bytes_limit", kDefaultCacheSizeMB * 1024 * 1024}}},
+                {"cache_pool", {{"total_bytes_limit", cache_pool_MB * 1024 * 1024}}}},
                 {"data_copy_concurrency", {{"limit", data_copy_conc}}},
                 {"file_io_concurrency", {{"limit", file_io_conc}}}
             };
 
             auto context_result = tensorstore::Context::FromJson(context_spec);
             if (context_result.ok()) {
-                spdlog::info("Created shared TensorStore context with omp_threads={}, data_copy_concurrency={}, file_io_concurrency={}, cache={}MB", omp_threads, data_copy_conc, file_io_conc, kDefaultCacheSizeMB);
+                spdlog::info("Created shared TensorStore context with omp_threads={}, data_copy_concurrency={}, file_io_concurrency={}, cache={}MB", omp_threads, data_copy_conc, file_io_conc, cache_pool_MB);
                 return context_result.value();
             }
             spdlog::warn("Failed to create custom context, using default");

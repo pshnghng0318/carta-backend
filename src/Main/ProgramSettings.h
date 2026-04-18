@@ -66,6 +66,7 @@ struct ProgramSettings {
     int init_wait_time = -1;
     int idle_session_wait_time = -1;
     int file_io = 2;
+    int cache_pool = 64;
     bool read_only_mode = false;
     bool enable_scripting = false;
     bool controller_deployment = false;
@@ -90,6 +91,7 @@ struct ProgramSettings {
         {"initial_timeout", &init_wait_time},
         {"idle_timeout", &idle_session_wait_time},
         {"file_io_concurrency", &file_io},
+        {"cache_pool", &cache_pool}
     };
 
     std::unordered_map<std::string, bool*> bool_keys_map{

@@ -147,6 +147,7 @@ void ProgramSettings::ApplyCommandLineSettings(int argc, char** argv) {
         ("p,port", fmt::format("manually set the HTTP and WebSocket port (default: {} or nearest available port)", DEFAULT_SOCKET_PORT), cxxopts::value<std::vector<int>>(), "<port>")
         ("t,omp_threads", "manually set OpenMP thread pool count", cxxopts::value<int>(), "<threads>")
         ("file_io", "manually set file I/O concurrency", cxxopts::value<int>(), "<concurrency>")
+        ("cache_pool", "set TensorStore cache pool size in MB (default: 64)", cxxopts::value<int>(), "<MB>")
         ("top_level_folder", "set top-level folder for data files", cxxopts::value<string>(), "<dir>")
         ("frontend_folder", "set folder from which frontend files are served", cxxopts::value<string>(), "<dir>")
         ("exit_timeout", "number of seconds to stay alive after last session exits", cxxopts::value<int>(), "<sec>")
@@ -284,6 +285,7 @@ global configuration files, respectively.
 
     applyOptionalArgument(omp_thread_count, "omp_threads", result);
     applyOptionalArgument(file_io, "file_io", result);
+    applyOptionalArgument(cache_pool, "cache_pool", result);
     applyOptionalArgument(wait_time, "exit_timeout", result);
     applyOptionalArgument(init_wait_time, "initial_timeout", result);
 
@@ -303,6 +305,12 @@ global configuration files, respectively.
         }
     } else {
         file_io = 2;
+    }
+
+    if (result.count("cache_pool")) {
+        cache_pool = result["cache_pool"].as<int>() > 0 ? result["cache_pool"].as<int>() : 64;
+    } else {
+        cache_pool = 64;
     }
 
     for (const auto& arg : positional_arguments) {
@@ -362,6 +370,9 @@ global configuration files, respectively.
     // so it's not picked up by the int_keys_map loop above. Add it explicitly after validation.
     if (result.count("file_io")) {
         command_line_settings["file_io_concurrency"] = file_io;
+    }
+    if (result.count("cache_pool")) {
+        command_line_settings["cache_pool"] = cache_pool;
     }
 }
 
