@@ -47,19 +47,19 @@ bool FileInfoLoader::FillFileInfo(CARTA::FileInfo& file_info) {
     if (IsZarrFile(_filename)) {
         // Compute logical bytes from SKY/.zarray metadata
         file_size = 0;
-        // try {
-        //     std::filesystem::path zarray_path = std::filesystem::path(_filename) / "SKY" / ".zarray";
-        //     std::ifstream f(zarray_path);
-        //     nlohmann::json meta;
-        //     f >> meta;
-        //     if (meta.contains("shape") && meta.contains("dtype")) {
-        //         int64_t nbytes = 1;
-        //         for (auto& s : meta["shape"]) nbytes *= s.get<int64_t>();
-        //         std::string dtype = meta["dtype"].get<std::string>();
-        //         int itemsize = std::stoi(dtype.substr(2));
-        //         file_size = nbytes * itemsize;
-        //     }
-        // } catch (...) {}
+        try {
+            std::filesystem::path zarray_path = std::filesystem::path(_filename) / "SKY" / ".zarray";
+            std::ifstream f(zarray_path);
+            nlohmann::json meta;
+            f >> meta;
+            if (meta.contains("shape") && meta.contains("dtype")) {
+                int64_t nbytes = 1;
+                for (auto& s : meta["shape"]) nbytes *= s.get<int64_t>();
+                std::string dtype = meta["dtype"].get<std::string>();
+                int itemsize = std::stoi(dtype.substr(2));
+                file_size = nbytes * itemsize;
+            }
+        } catch (...) {}
     } else if (cc_file.isDirectory()) { // symlinked dirs are dirs
         casacore::Directory cc_dir(cc_file);
         file_size = cc_dir.size();
