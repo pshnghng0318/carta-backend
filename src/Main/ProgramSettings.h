@@ -66,7 +66,7 @@ struct ProgramSettings {
     int init_wait_time = -1;
     int idle_session_wait_time = -1;
     int file_io = 2;
-    int cache_pool = 64;
+    int cache_pool = 1;
     bool read_only_mode = false;
     bool enable_scripting = false;
     bool controller_deployment = false;

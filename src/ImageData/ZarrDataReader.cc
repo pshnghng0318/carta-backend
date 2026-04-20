@@ -48,7 +48,7 @@ constexpr int K_TILE_SIZE = 256;
 #endif
 
 // Cache size for TensorStore shared context.
-constexpr size_t kDefaultCacheSizeMB = 64;
+constexpr size_t kDefaultCacheSizeMB = 1;
 constexpr size_t kDefaultCpuCount = 4;
 // Number of parallel read partitions for spatial splits
 // constexpr int kParallelReadParts = 1;
@@ -110,10 +110,8 @@ struct ZarrDataReader::Impl {
             }
             if (data_copy_conc < 1) data_copy_conc = 1;
 
-            int cache_pool_MB = kDefaultCacheSizeMB;
-            if (carta::ProgramSettings::GetInstance().cache_pool > 0) {
-                cache_pool_MB = carta::ProgramSettings::GetInstance().cache_pool;
-            }
+            size_t cache_pool_MB = static_cast<size_t>(carta::ProgramSettings::GetInstance().cache_pool);
+            if (cache_pool_MB < 0) cache_pool_MB = kDefaultCacheSizeMB;
 
             nlohmann::json context_spec = {
                 {"cache_pool", {{"total_bytes_limit", cache_pool_MB * 1024 * 1024}}},
