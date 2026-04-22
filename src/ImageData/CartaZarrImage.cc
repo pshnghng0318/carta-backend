@@ -170,9 +170,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
     static constexpr int kBitpixFloat32 = -32;
     static constexpr int kBitpixFloat64 = -64;
     int bitpix = kBitpixFloat32;
+    nlohmann::json zarray = nlohmann::json::parse(_reader->GetZarrayString("SKY"));
     safe_exec([&]() {
         // TODO: currently XRADIO only supports float32 and float64
-        nlohmann::json zarray = nlohmann::json::parse(_reader->GetZarrayString("SKY"));
         const auto* dtype = get_ptr(zarray, "/dtype");
         if (dtype && dtype->is_string()) {
             std::string dtype_str = dtype->get<std::string>();
@@ -186,6 +186,31 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
 
     add_string_header("SIMPLE", "T");
     add_int_header("BITPIX", bitpix);
+
+    // chunks
+    safe_exec([&]() {
+        const auto* chunks = get_ptr(zarray, "/chunks");
+        if (chunks && chunks->is_array()) {
+            for (size_t i = 0; i < chunks->size(); ++i) {
+                add_int_header("CHUNK" + std::to_string(i + 1), (*chunks)[i].get<int>());
+            }
+        }
+    }, "CHUNKS");
+
+    // Compressor
+    const auto* compressor = get_ptr(zarray, "/compressor");
+    safe_exec([&]() {
+        if (compressor && compressor->is_object() && compressor->contains("cname") && (*compressor)["cname"].is_string()) {
+            add_string_header("COMPRESSOR", (*compressor)["cname"].get<std::string>());
+        }
+    }, "COMPRESSOR");
+
+    // clevel
+    safe_exec([&]() {
+        if (compressor && compressor->is_object() && compressor->contains("clevel") && (*compressor)["clevel"].is_number_integer()) {
+            add_int_header("CLEVEL", (*compressor)["clevel"].get<int>());
+        }
+    }, "CLEVEL");
 
     // 2. NAXIS
     int ndim = _shape.size();

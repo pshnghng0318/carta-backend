@@ -286,6 +286,8 @@ void FileExtInfoLoader::AddEntriesFromHeaderStrings(
         {"H5SCHEMA", "SCHEMA_VERSION"}, {"H5CNVRTR", "HDF5_CONVERTER"}, {"H5CONVSN", "HDF5_CONVERTER_VERSION"}, {"H5DATE", "HDF5_DATE"}};
     bool has_specsys(false);
 
+    // 收集 chunk1~chunk5
+    std::map<int, std::string> chunk_map;
     for (auto& header : headers) {
         // Parse header into name, value, comment
         casacore::String name(header);
@@ -392,6 +394,16 @@ void FileExtInfoLoader::AddEntriesFromHeaderStrings(
                 entry = AddNumericHeaderEntry(extended_info, name, value);
             }
 
+            if (name.startsWith("CHUNK")) {
+                int idx = 0;
+                try {
+                    idx = std::stoi(name.substr(5));
+                } catch (...) {}
+                if (idx > 0 && idx <= 5) {
+                    chunk_map[idx] = value;
+                }
+            }
+
             // Set numeric values for stokes axis in loader
             if (name == ("CRVAL" + stokes_ctype_num)) {
                 _loader->SetStokesCrval((float)entry->numeric_value());
@@ -400,9 +412,25 @@ void FileExtInfoLoader::AddEntriesFromHeaderStrings(
             } else if (name == ("CDELT" + stokes_ctype_num)) {
                 _loader->SetStokesCdelt((int)entry->numeric_value());
             }
+
+            // Set Zarr entries for compressor/clevel
+            if (name == "COMPRESSOR") {
+                Message::AddComputedEntry(extended_info, "Compressor", value);
+            } else if (name == "CLEVEL") {
+                Message::AddComputedEntry(extended_info, "Clevel", value);
+            }
         } else {
             entry = Message::AddHeaderEntry(extended_info, name, "");
         }
+    
+    if (chunk_map.size() == 5 && name == "CHUNK5") {
+        std::vector<std::string> chunk_shape;
+        for (int i = 1; i <= 5; ++i) {
+            chunk_shape.push_back(chunk_map[i]);
+        }
+        std::string shape_str = "[" + fmt::format("{}", fmt::join(chunk_shape, ", ")) + "] (TIME, FREQ, STOKES, RA, DEC)";
+        Message::AddComputedEntry(extended_info, "Chunk shape", shape_str);
+    }
 
         if (!comment.empty()) {
             // Set comment

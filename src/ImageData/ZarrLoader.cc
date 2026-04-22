@@ -194,7 +194,8 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
         } else if (_cursor_batch_state.batch_depth == 0) {
             // For single pixel profiles, 64MB is huge (16M channels). Use smaller batches to allow progress updates.
             constexpr size_t target_profile_batch_bytes = 1 * 1024 * 1024; // 1MB for profiles
-            constexpr size_t target_batch_bytes = 64 * 1024 * 1024;
+            // constexpr size_t target_batch_bytes = 64 * 1024 * 1024;
+            constexpr size_t target_batch_bytes = 128 * 1024 * 1024;
             size_t target_bytes = (plane_size == 1) ? target_profile_batch_bytes : target_batch_bytes;
             z_batch = target_bytes / (plane_size * sizeof(float));
             z_batch = align_batch(z_batch);
@@ -413,7 +414,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         }
     }
 
-    constexpr size_t target_batch_bytes = 64 * 1024 * 1024;
+    // constexpr size_t target_batch_bytes = 64 * 1024 * 1024;
+    constexpr size_t target_batch_bytes = 128 * 1024 * 1024;
     size_t chunk_depth = 1;
     int freq_chunk = 0;
     auto chunk_shape = reader->GetChunkShape();
