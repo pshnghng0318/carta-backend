@@ -301,7 +301,7 @@ global configuration files, respectively.
     if (result.count("file_io")) {
         file_io = result["file_io"].as<int>();
         int data_copy = omp_thread_count > 0 ? omp_thread_count : std::thread::hardware_concurrency();
-        if (file_io < 1 || file_io > 8 || file_io + data_copy > std::thread::hardware_concurrency()) {
+        if (file_io < 1 || file_io + data_copy > std::thread::hardware_concurrency()) {
             spdlog::warn("file_io value {} reduced to 2", file_io);
             file_io = 2;
         }
