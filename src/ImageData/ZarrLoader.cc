@@ -416,6 +416,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
 
     // constexpr size_t target_batch_bytes = 64 * 1024 * 1024;
     size_t target_batch_bytes = carta::ProgramSettings::GetInstance().batch_MB * 1024 * 1024;
+    spdlog::info("ZarrLoader::GetRegionSpectralData: target_batch_bytes={} MB", target_batch_bytes / (1024 * 1024));
     size_t chunk_depth = 1;
     int freq_chunk = 0;
     auto chunk_shape = reader->GetChunkShape();

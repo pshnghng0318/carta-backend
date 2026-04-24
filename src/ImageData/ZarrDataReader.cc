@@ -106,6 +106,8 @@ struct ZarrDataReader::Impl {
             int data_copy_conc = omp_threads;
             
             if (file_io_conc + data_copy_conc > std::thread::hardware_concurrency()) {
+                spdlog::warn("file_io_concurrency ({}) + data_copy_concurrency ({}) exceeds hardware concurrency ({}), adjusting data_copy_concurrency",
+                    file_io_conc, data_copy_conc, std::thread::hardware_concurrency());
                 data_copy_conc = std::thread::hardware_concurrency() - file_io_conc;
             }
             if (data_copy_conc < 1) data_copy_conc = 1;
