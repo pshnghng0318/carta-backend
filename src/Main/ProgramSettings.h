@@ -67,6 +67,7 @@ struct ProgramSettings {
     int idle_session_wait_time = -1;
     int file_io = 2;
     int cache_pool = 1;
+    int batch_MB = 128;
     bool read_only_mode = false;
     bool enable_scripting = false;
     bool controller_deployment = false;
@@ -90,8 +91,9 @@ struct ProgramSettings {
         {"exit_timeout", &wait_time},
         {"initial_timeout", &init_wait_time},
         {"idle_timeout", &idle_session_wait_time},
-        {"file_io_concurrency", &file_io},
-        {"cache_pool", &cache_pool}
+        {"file_io", &file_io},
+        {"cache_pool", &cache_pool},
+        {"batch_MB", &batch_MB}
     };
 
     std::unordered_map<std::string, bool*> bool_keys_map{

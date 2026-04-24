@@ -148,6 +148,7 @@ void ProgramSettings::ApplyCommandLineSettings(int argc, char** argv) {
         ("t,omp_threads", "manually set OpenMP thread pool count", cxxopts::value<int>(), "<threads>")
         ("file_io", "manually set file I/O concurrency", cxxopts::value<int>(), "<concurrency>")
         ("cache_pool", "set TensorStore cache pool size in MB (default: 1)", cxxopts::value<int>(), "<MB>")
+        ("batch_MB", "set batch size in MB for Zarr", cxxopts::value<int>(), "<MB>")
         ("top_level_folder", "set top-level folder for data files", cxxopts::value<string>(), "<dir>")
         ("frontend_folder", "set folder from which frontend files are served", cxxopts::value<string>(), "<dir>")
         ("exit_timeout", "number of seconds to stay alive after last session exits", cxxopts::value<int>(), "<sec>")
@@ -286,6 +287,7 @@ global configuration files, respectively.
     applyOptionalArgument(omp_thread_count, "omp_threads", result);
     applyOptionalArgument(file_io, "file_io", result);
     applyOptionalArgument(cache_pool, "cache_pool", result);
+    applyOptionalArgument(batch_MB, "batch_MB", result);
     applyOptionalArgument(wait_time, "exit_timeout", result);
     applyOptionalArgument(init_wait_time, "initial_timeout", result);
 
@@ -311,6 +313,12 @@ global configuration files, respectively.
         cache_pool = result["cache_pool"].as<int>() > 0 ? result["cache_pool"].as<int>() : 1;
     } else {
         cache_pool = 1;
+    }
+
+    if (result.count("batch_MB")) {
+        batch_MB = result["batch_MB"].as<int>() > 0 ? result["batch_MB"].as<int>() : 1;
+    } else {
+        batch_MB = 128;
     }
 
     for (const auto& arg : positional_arguments) {
@@ -366,13 +374,14 @@ global configuration files, respectively.
         }
     }
 
-    // file_io uses a different CLI name ("file_io") than the preferences key ("file_io_concurrency"),
-    // so it's not picked up by the int_keys_map loop above. Add it explicitly after validation.
     if (result.count("file_io")) {
-        command_line_settings["file_io_concurrency"] = file_io;
+        command_line_settings["file_io"] = file_io;
     }
     if (result.count("cache_pool")) {
         command_line_settings["cache_pool"] = cache_pool;
+    }
+    if (result.count("batch_MB")) {
+        command_line_settings["batch_MB"] = batch_MB;
     }
 }
 
