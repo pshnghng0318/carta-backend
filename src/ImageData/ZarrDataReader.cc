@@ -394,7 +394,10 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
 
     spdlog::debug("ZarrDataReader::ReadSlice: start={}, stop={}, length={}", start.toString(), stop.toString(), length.toString());
 
+    auto t_rs_0 = std::chrono::high_resolution_clock::now();
     buffer.resize(length);
+    spdlog::debug("ZarrDataReader::ReadSlice [1/5] buffer.resize took {:.3f} ms",
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_0).count());
 
     const int width_x = length[0];
     const int height_y = length[1];
@@ -407,14 +410,17 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
     // Let TensorStore manage its own internal parallelism (data_copy_concurrency,
     // file_io_concurrency). Issue a single read for the whole slice.
     float* dst_ptr = buffer.data();
-    auto t_rs_start = std::chrono::high_resolution_clock::now();
 
+    auto t_rs_1 = std::chrono::high_resolution_clock::now();
     auto slice_result = _impl->store
         | tensorstore::Dims(0).IndexSlice(time_idx)
         | tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F
         | tensorstore::Dims(1).ClosedInterval(start[3], stop[3])   // P
         | tensorstore::Dims(2).ClosedInterval(start[0], stop[0])   // L
         | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);  // M
+    spdlog::debug("ZarrDataReader::ReadSlice [2/5] store slicing (F={}-{}, L={}-{}, M={}-{}) took {:.3f} ms",
+        start[2], stop[2], start[0], stop[0], start[1], stop[1],
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_1).count());
 
     if (!slice_result.ok()) {
         spdlog::error("ReadSlice slice failed: {}", slice_result.status().ToString());
@@ -422,25 +428,33 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
     }
 
     // Reorder [F, P, L, M] → [L, M, F, P] to match CARTA Fortran-order layout [x, y, z, stokes]
+    auto t_rs_2 = std::chrono::high_resolution_clock::now();
     auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+    spdlog::debug("ZarrDataReader::ReadSlice [3/5] Dims Transpose took {:.3f} ms",
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_2).count());
+
     if (!reorder_result.ok()) {
         spdlog::error("ReadSlice reorder failed: {}", reorder_result.status().ToString());
         return false;
     }
 
+    auto t_rs_3 = std::chrono::high_resolution_clock::now();
     std::array<tensorstore::Index, 4> out_shape = {
         static_cast<tensorstore::Index>(width_x),
         static_cast<tensorstore::Index>(height_y),
         static_cast<tensorstore::Index>(num_freq),
         static_cast<tensorstore::Index>(num_stokes)};
-
     auto batch_array = tensorstore::SharedArray<float>(
         tensorstore::internal::UnownedToShared(dst_ptr), out_shape, tensorstore::fortran_order);
-
-    auto read_status = tensorstore::Read(reorder_result.value(), batch_array).result();
-    spdlog::debug("ZarrDataReader::ReadSlice: tensorstore::Read [{}x{}x{}x{}] took {:.3f} ms",
+    spdlog::debug("ZarrDataReader::ReadSlice [4/5] SharedArray [{}x{}x{}x{}] construction took {:.3f} ms",
         width_x, height_y, num_freq, num_stokes,
-        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_start).count());
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_3).count());
+
+    auto t_rs_4 = std::chrono::high_resolution_clock::now();
+    auto read_status = tensorstore::Read(reorder_result.value(), batch_array).result();
+    spdlog::debug("ZarrDataReader::ReadSlice [5/5] tensorstore::Read [{}x{}x{}x{}] took {:.3f} ms",
+        width_x, height_y, num_freq, num_stokes,
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_4).count());
     if (!read_status.ok()) {
         spdlog::error("ReadSlice read failed: {}", read_status.status().ToString());
         return false;

@@ -7,6 +7,7 @@
 #include "ZarrLoader.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <limits>
@@ -460,46 +461,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     size_t max_z = std::min(static_cast<size_t>(depth), z_start + batch_depth);
     batch_depth = max_z - z_start;
 
-    casacore::IPosition start(_num_dims, 0);
-    casacore::IPosition length(_num_dims, 1);
-    start(0) = origin(0);
-    start(1) = origin(1);
-    start(2) = spec_range.from + z_start;
-    length(0) = width;
-    length(1) = height;
-    length(2) = batch_depth;
-    if (_num_dims > 3) {
-        start(3) = stokes;
-        length(3) = 1;
-    }
-
-    casacore::Array<float> batch_data;
-    {
-        auto t_read = std::chrono::high_resolution_clock::now();
-        bool slice_ok = reader->ReadSlice(batch_data, casacore::Slicer(start, length));
-        spdlog::debug("ZarrLoader::GetRegionSpectralData: ReadSlice [{}x{}x{}] took {:.3f} ms",
-            width, height, batch_depth,
-            std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_read).count());
-        if (!slice_ok) {
-            spdlog::error("ZarrLoader::GetRegionSpectralData: ReadSlice failed");
-            return false;
-        }
-    }
-
-    if (cancellation_check && cancellation_check()) {
-        spdlog::info("ZarrLoader::GetRegionSpectralData: Cancelled by callback");
-        return false;
-    }
-
-    bool delete_data_ptr(false);
-    const float* data_ptr = batch_data.getStorage(delete_data_ptr);
-    if (!data_ptr) {
-        spdlog::error("ZarrLoader::GetRegionSpectralData: batch_data storage is null");
-        return false;
-    }
-
-    // Pre-cache mask to avoid repeated casacore::IPosition creation per pixel in hot loop
-    // Use char instead of bool for faster access (no bit packing overhead)
+    // Pre-cache mask before the parallel section (casacore API is not thread-safe)
     size_t w = static_cast<size_t>(width);
     size_t h = static_cast<size_t>(height);
     auto& mask_cache = region_stats.mask_cache;
@@ -516,75 +478,144 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
             }
         }
     }
-
     size_t plane_stride = w * h;
 
-    // Parallelize over z-axis: each channel's stats are independent
+    // Split the batch across OMP threads: each thread does ReadSlice + stats for its sub-batch.
+    // e.g. batch_depth=100, omp_threads=8 → ~13 channels per thread, all threads run concurrently.
+    const int omp_threads = carta::ProgramSettings::GetInstance().omp_thread_count;
+    const size_t sub_depth =
+        std::max<size_t>(1, (batch_depth + static_cast<size_t>(omp_threads) - 1) / static_cast<size_t>(omp_threads));
+    const int actual_parts = static_cast<int>((batch_depth + sub_depth - 1) / sub_depth);
+    spdlog::debug("ZarrLoader::GetRegionSpectralData: batch_depth={}, omp_threads={}, sub_depth={}, actual_parts={}",
+        batch_depth, omp_threads, sub_depth, actual_parts);
+
+    std::atomic<bool> read_ok{true};
+    std::atomic<bool> cancelled{false};
     auto t_stats = std::chrono::high_resolution_clock::now();
-#pragma omp parallel for schedule(dynamic)
-    for (size_t z = 0; z < batch_depth; ++z) {
-        size_t z_index = z_start + z;
-        size_t z_offset = z * plane_stride;
 
-        double local_sum = 0.0;
-        double local_sum_sq = 0.0;
-        double local_min = std::numeric_limits<double>::max();
-        double local_max = std::numeric_limits<double>::lowest();
-        uint64_t local_count = 0;
-        uint64_t local_nan = 0;
+#pragma omp parallel for schedule(static) num_threads(actual_parts)
+    for (int part = 0; part < actual_parts; ++part) {
+        if (!read_ok.load() || cancelled.load()) continue;
 
-        for (size_t y = 0; y < h; ++y) {
-            size_t row_offset = z_offset + (y * w);
-            size_t mask_row = y * w;
-            for (size_t x = 0; x < w; ++x) {
-                if (!mask_cache[mask_row + x]) {
-                    continue;
+        size_t z_thread_start = static_cast<size_t>(part) * sub_depth;
+        size_t z_thread_end   = std::min(z_thread_start + sub_depth, batch_depth);
+        size_t thread_depth   = z_thread_end - z_thread_start;
+        if (thread_depth == 0) continue;
+
+        casacore::IPosition t_start(_num_dims, 0);
+        casacore::IPosition t_length(_num_dims, 1);
+        t_start(0)  = origin(0);
+        t_start(1)  = origin(1);
+        t_start(2)  = static_cast<int>(spec_range.from + z_start + z_thread_start);
+        t_length(0) = width;
+        t_length(1) = height;
+        t_length(2) = static_cast<int>(thread_depth);
+        if (_num_dims > 3) {
+            t_start(3)  = stokes;
+            t_length(3) = 1;
+        }
+
+        casacore::Array<float> thread_data;
+        {
+            auto t_read = std::chrono::high_resolution_clock::now();
+            bool slice_ok = reader->ReadSlice(thread_data, casacore::Slicer(t_start, t_length));
+            spdlog::debug("ZarrLoader::GetRegionSpectralData [part {}/{}]: ReadSlice [{}x{}x{}] took {:.3f} ms",
+                part, actual_parts, width, height, thread_depth,
+                std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_read).count());
+            if (!slice_ok) {
+                spdlog::error("ZarrLoader::GetRegionSpectralData [part {}]: ReadSlice failed", part);
+                read_ok.store(false);
+                continue;
+            }
+        }
+
+        if (cancellation_check && cancellation_check()) {
+            cancelled.store(true);
+            continue;
+        }
+
+        bool delete_thread_ptr = false;
+        const float* data_ptr = thread_data.getStorage(delete_thread_ptr);
+        if (!data_ptr) {
+            spdlog::error("ZarrLoader::GetRegionSpectralData [part {}]: data storage is null", part);
+            read_ok.store(false);
+            continue;
+        }
+
+        for (size_t z = 0; z < thread_depth; ++z) {
+            size_t z_index = z_start + z_thread_start + z;
+            size_t z_offset = z * plane_stride;
+
+            double local_sum = 0.0;
+            double local_sum_sq = 0.0;
+            double local_min = std::numeric_limits<double>::max();
+            double local_max = std::numeric_limits<double>::lowest();
+            uint64_t local_count = 0;
+            uint64_t local_nan = 0;
+
+            for (size_t y = 0; y < h; ++y) {
+                size_t row_offset = z_offset + (y * w);
+                size_t mask_row = y * w;
+                for (size_t x = 0; x < w; ++x) {
+                    if (!mask_cache[mask_row + x]) {
+                        continue;
+                    }
+                    double v = static_cast<double>(data_ptr[row_offset + x]);
+                    if (std::isfinite(v)) {
+                        local_count++;
+                        local_sum += v;
+                        local_sum_sq += v * v;
+                        local_min = std::min(v, local_min);
+                        local_max = std::max(v, local_max);
+                    } else {
+                        local_nan++;
+                    }
                 }
-                double v = static_cast<double>(data_ptr[row_offset + x]);
-                if (std::isfinite(v)) {
-                    local_count++;
-                    local_sum += v;
-                    local_sum_sq += v * v;
-                    local_min = std::min(v, local_min);
-                    local_max = std::max(v, local_max);
-                } else {
-                    local_nan++;
+            }
+
+            // Each z_index is unique across threads — no race condition on these writes
+            num_pixels[z_index] = local_count;
+            nan_count[z_index]  = local_nan;
+            sum[z_index]        = local_sum;
+            sum_sq[z_index]     = local_sum_sq;
+
+            if (local_count > 0) {
+                min[z_index]    = local_min;
+                max[z_index]    = local_max;
+                mean[z_index]   = local_sum / local_count;
+                rms[z_index]    = sqrt(local_sum_sq / local_count);
+                sigma[z_index]  = local_count > 1
+                    ? sqrt((local_sum_sq - (local_sum * local_sum / local_count)) / (local_count - 1)) : 0;
+                extrema[z_index] = (std::abs(local_min) > std::abs(local_max) ? local_min : local_max);
+                if (has_flux) {
+                    flux[z_index] = local_sum / beam_area;
+                }
+            } else {
+                min[z_index]     = NAN;
+                max[z_index]     = NAN;
+                mean[z_index]    = NAN;
+                rms[z_index]     = NAN;
+                sigma[z_index]   = NAN;
+                extrema[z_index] = NAN;
+                if (has_flux) {
+                    flux[z_index] = NAN;
                 }
             }
         }
 
-        // Write results and compute derived stats (each z_index is unique, no race condition)
-        num_pixels[z_index] = local_count;
-        nan_count[z_index] = local_nan;
-        sum[z_index] = local_sum;
-        sum_sq[z_index] = local_sum_sq;
-
-        if (local_count > 0) {
-            min[z_index] = local_min;
-            max[z_index] = local_max;
-            mean[z_index] = local_sum / local_count;
-            rms[z_index] = sqrt(local_sum_sq / local_count);
-            sigma[z_index] = local_count > 1 ? sqrt((local_sum_sq - (local_sum * local_sum / local_count)) / (local_count - 1)) : 0;
-            extrema[z_index] = (std::abs(local_min) > std::abs(local_max) ? local_min : local_max);
-            if (has_flux) {
-                flux[z_index] = local_sum / beam_area;
-            }
-        } else {
-            min[z_index] = NAN;
-            max[z_index] = NAN;
-            mean[z_index] = NAN;
-            rms[z_index] = NAN;
-            sigma[z_index] = NAN;
-            extrema[z_index] = NAN;
-            if (has_flux) {
-                flux[z_index] = NAN;
-            }
-        }
+        thread_data.freeStorage(data_ptr, delete_thread_ptr);
     }
-    spdlog::debug("ZarrLoader::GetRegionSpectralData: stats calc for {} channels took {:.3f} ms",
-        batch_depth,
+
+    if (cancelled.load()) {
+        spdlog::info("ZarrLoader::GetRegionSpectralData: Cancelled during parallel processing");
+        return false;
+    }
+    if (!read_ok.load()) {
+        return false;
+    }
+    spdlog::debug("ZarrLoader::GetRegionSpectralData: parallel ReadSlice+stats for {} channels ({} parts) took {:.3f} ms",
+        batch_depth, actual_parts,
         std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_stats).count());
-    batch_data.freeStorage(data_ptr, delete_data_ptr);
 
     results = stats;
     if (max_z == static_cast<size_t>(depth)) {
