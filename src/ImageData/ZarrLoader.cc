@@ -316,6 +316,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     const casacore::ArrayLattice<casacore::Bool>& mask, const casacore::IPosition& origin, std::mutex& /*image_mutex*/,
     std::map<CARTA::StatsType, std::vector<double>>& results, float& progress,
     std::function<bool()> cancellation_check) {
+    auto t_grsd_start = std::chrono::high_resolution_clock::now();
+    spdlog::debug("ZarrLoader::GetRegionSpectralData: region_id={}, z=[{},{}], stokes={}, progress={:.3f}",
+        region_id, z_range.from, z_range.to, stokes, progress);
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
         spdlog::error("ZarrLoader::GetRegionSpectralData: No valid ZARR image");
@@ -416,10 +419,14 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
 
     // constexpr size_t target_batch_bytes = 64 * 1024 * 1024;
     size_t target_batch_bytes = carta::ProgramSettings::GetInstance().batch_MB * 1024 * 1024;
-    spdlog::info("ZarrLoader::GetRegionSpectralData: target_batch_bytes={} MB", target_batch_bytes / (1024 * 1024));
+    spdlog::debug("ZarrLoader::GetRegionSpectralData: target_batch_bytes={} MB", target_batch_bytes / (1024 * 1024));
     size_t chunk_depth = 1;
     int freq_chunk = 0;
+    auto t_chunk_shape = std::chrono::high_resolution_clock::now();
     auto chunk_shape = reader->GetChunkShape();
+    spdlog::debug("ZarrLoader::GetRegionSpectralData: GetChunkShape={} took {:.3f} ms",
+        chunk_shape.toString(),
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_chunk_shape).count());
     if (chunk_shape.size() > 1) {
         freq_chunk = chunk_shape[1];
         if (freq_chunk < 0) {
@@ -468,7 +475,12 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
 
     casacore::Array<float> batch_data;
     {
-        if (!reader->ReadSlice(batch_data, casacore::Slicer(start, length))) {
+        auto t_read = std::chrono::high_resolution_clock::now();
+        bool slice_ok = reader->ReadSlice(batch_data, casacore::Slicer(start, length));
+        spdlog::debug("ZarrLoader::GetRegionSpectralData: ReadSlice [{}x{}x{}] took {:.3f} ms",
+            width, height, batch_depth,
+            std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_read).count());
+        if (!slice_ok) {
             spdlog::error("ZarrLoader::GetRegionSpectralData: ReadSlice failed");
             return false;
         }
@@ -508,6 +520,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     size_t plane_stride = w * h;
 
     // Parallelize over z-axis: each channel's stats are independent
+    auto t_stats = std::chrono::high_resolution_clock::now();
 #pragma omp parallel for schedule(dynamic)
     for (size_t z = 0; z < batch_depth; ++z) {
         size_t z_index = z_start + z;
@@ -568,6 +581,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
             }
         }
     }
+    spdlog::debug("ZarrLoader::GetRegionSpectralData: stats calc for {} channels took {:.3f} ms",
+        batch_depth,
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_stats).count());
     batch_data.freeStorage(data_ptr, delete_data_ptr);
 
     results = stats;
@@ -587,12 +603,16 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         }
     }
 
+    spdlog::debug("ZarrLoader::GetRegionSpectralData: batch complete in {:.3f} ms total, progress={:.3f}",
+        std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_grsd_start).count(), progress);
     return true;
 }
 
 void ZarrLoader::ClearRegionSpectralCache(int region_id) {
+    spdlog::debug("ZarrLoader::ClearRegionSpectralCache: region_id={}, cache_size={}", region_id, _region_stats.size());
     if (region_id == ALL_REGIONS) {
         _region_stats.clear();
+        spdlog::debug("ZarrLoader::ClearRegionSpectralCache: cleared all {} entries", _region_stats.size());
         return;
     }
 
