@@ -519,9 +519,11 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         {
             auto t_read = std::chrono::high_resolution_clock::now();
             bool slice_ok = reader->ReadSlice(thread_data, casacore::Slicer(t_start, t_length));
-            spdlog::debug("ZarrLoader::GetRegionSpectralData [part {}/{}]: ReadSlice [{}x{}x{}] took {:.3f} ms",
-                part, actual_parts, width, height, thread_depth,
-                std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_read).count());
+            if (part == 0) {
+                spdlog::debug("ZarrLoader::GetRegionSpectralData [part 0/{}]: ReadSlice [{}x{}x{}] took {:.3f} ms",
+                    actual_parts, width, height, thread_depth,
+                    std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_read).count());
+            }
             if (!slice_ok) {
                 spdlog::error("ZarrLoader::GetRegionSpectralData [part {}]: ReadSlice failed", part);
                 read_ok.store(false);
