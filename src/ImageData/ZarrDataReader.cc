@@ -478,6 +478,87 @@ bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::S
     return true;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// SubmitRead: non-blocking async read — mirrors Python test_tensorstore.py:
+//   read_future = dataset[0, z:z+d, 0, y0:y1, x0:x1].read()   # non-blocking
+//   queue.put(read_future)                                       # store future
+//   data = queue.get().result()                                  # wait in consumer
+//
+// The buffer is passed as shared_ptr so TensorStore's internally captured raw
+// pointer is never invalidated by a move or copy of the Array object.
+// ─────────────────────────────────────────────────────────────────────────────
+std::function<bool()> ZarrDataReader::SubmitRead(
+        std::shared_ptr<casacore::Array<float>> buffer, const casacore::Slicer& section) {
+    if (!_initialized) {
+        spdlog::error("ZDR::SubmitRead: not initialized");
+        return [] { return false; };
+    }
+
+    const auto& start  = section.start();
+    const auto& stop   = section.end();
+    const auto& length = section.length();
+
+    // Pre-allocate output buffer — must happen NOW (before TensorStore captures dst_ptr).
+    buffer->resize(length);
+    float* dst_ptr = buffer->data();
+
+    const int width_x    = length[0];
+    const int height_y   = length[1];
+    const int num_freq   = length[2];
+    const int num_stokes = length[3];
+    const tensorstore::Index time_idx = 0;
+
+    // Build TensorStore view [T,F,P,L,M] → select region.
+    auto slice_result = _impl->store
+        | tensorstore::Dims(0).IndexSlice(time_idx)
+        | tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F
+        | tensorstore::Dims(1).ClosedInterval(start[3], stop[3])   // P
+        | tensorstore::Dims(2).ClosedInterval(start[0], stop[0])   // L
+        | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);  // M
+    if (!slice_result.ok()) {
+        spdlog::error("ZDR::SubmitRead: slice failed: {}", slice_result.status().ToString());
+        return [] { return false; };
+    }
+
+    // Reorder [F,P,L,M] → [L,M,F,P] to match CARTA Fortran layout.
+    auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
+    if (!reorder_result.ok()) {
+        spdlog::error("ZDR::SubmitRead: reorder failed: {}", reorder_result.status().ToString());
+        return [] { return false; };
+    }
+
+    std::array<tensorstore::Index, 4> out_shape = {
+        static_cast<tensorstore::Index>(width_x),
+        static_cast<tensorstore::Index>(height_y),
+        static_cast<tensorstore::Index>(num_freq),
+        static_cast<tensorstore::Index>(num_stokes)};
+
+    // UnownedToShared wraps dst_ptr with a no-op deleter — buffer owns the memory.
+    auto batch_array = tensorstore::SharedArray<float>(
+        tensorstore::internal::UnownedToShared(dst_ptr), out_shape, tensorstore::fortran_order);
+
+    // Issue the read immediately — TensorStore enqueues I/O in its thread pool.
+    // Does NOT block; returns a Future<void>.
+    auto future = tensorstore::Read(reorder_result.value(), std::move(batch_array));
+    spdlog::debug("ZDR::SubmitRead issued [{}x{}x{}x{}]", width_x, height_y, num_freq, num_stokes);
+
+    // Return a waiter that:
+    //   1. Captures the future by move (keeps it alive)
+    //   2. Captures buffer shared_ptr (prevents deallocation before future completes)
+    //   3. Blocks when called until TensorStore finishes the read
+    return [f = std::move(future), buf = std::move(buffer),
+            width_x, height_y, num_freq, num_stokes]() mutable -> bool {
+        auto status = f.result();
+        if (!status.ok()) {
+            spdlog::error("ZDR::SubmitRead: read failed: {}", status.status().ToString());
+            return false;
+        }
+        spdlog::debug("ZDR::SubmitRead completed [{}x{}x{}x{}]", width_x, height_y, num_freq, num_stokes);
+        malloc_trim(0);
+        return true;
+    };
+}
+
 bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& data_height, int min_x, int min_y, int channel, int stokes) {
     if (!_initialized) {
         spdlog::error("ZarrDataReader not initialized");

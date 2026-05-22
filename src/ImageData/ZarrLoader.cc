@@ -464,6 +464,56 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     size_t max_z = std::min(static_cast<size_t>(depth), z_start + batch_depth);
     batch_depth = max_z - z_start;
 
+    // Prefetch depth declared here so read_depth formula can reference it.
+    // Four independent parameters (mirrors Python v3 CLI args):
+    //   file_io   → TensorStore file_io_concurrency   (set in ZarrDataReader context)
+    //   data_copy → TensorStore data_copy_concurrency (set in ZarrDataReader context)
+    //   queue_size  → BoundedQueue capacity (--queue-size in Python v3)
+    //   num_threads → stats computation threads (--num-threads in Python v3)
+    // TODO: expose queue_size and num_threads as ProgramSettings parameters.
+    const size_t queue_size  = 8;   // --queue-size
+    const int    num_threads = 16;  // --num-threads (stats parallelism)
+
+    // ── Per-future read granularity (read_depth) ─────────────────────────────
+    // Mirrors test_tensorstore.py calc_batch_depth logic:
+    //   covered_chunks_spatial = spatial chunks touched by region (y * x directions)
+    //   chunk_mb = uncompressed size of one full 5D chunk
+    //   z_chunks_per_read = batch_mb / (chunk_mb * covered_chunks_spatial) / queue_size
+    //   read_depth = z_chunks_per_read * chunk_depth   (≥ chunk_depth)
+    //
+    // With queue_size futures in-flight each covering read_depth channels, TensorStore's
+    // file_io threads always have queue_size * covered_chunks_spatial chunks queued →
+    // disk I/O is fully saturated even during decompression of earlier batches.
+    //
+    // Note: chunk_shape is [T, F, S, L, M] in XRADIO 5D layout.
+    size_t read_depth = chunk_depth; // fallback: one z-chunk per future
+    if (chunk_shape.size() >= 5 && chunk_depth > 0 && bytes_per_chunk_depth > 0) {
+        // Spatial chunk sizes (L=chunk_shape[3], M=chunk_shape[4])
+        size_t chunk_l = static_cast<size_t>(chunk_shape[3]);
+        size_t chunk_m = static_cast<size_t>(chunk_shape[4]);
+        if (chunk_l > 0 && chunk_m > 0) {
+            // How many spatial chunks does the region span in each direction?
+            size_t covered_l = (static_cast<size_t>(width)  + chunk_l - 1) / chunk_l;
+            size_t covered_m = (static_cast<size_t>(height) + chunk_m - 1) / chunk_m;
+            size_t covered_spatial = std::max<size_t>(1, covered_l * covered_m);
+
+            // Uncompressed bytes per full 5D chunk (T=1 slice, S=1 slice assumed)
+            size_t chunk_bytes_5d = chunk_depth * chunk_l * chunk_m * sizeof(float);
+            // Bytes read per z-chunk step across the region
+            size_t bytes_per_z_step = chunk_bytes_5d * covered_spatial;
+
+            // Target: each future reads target_batch_bytes / queue_size bytes.
+            // queue_size futures × read_depth channels ≈ batch_depth channels total.
+            size_t target_per_future = target_batch_bytes / std::max<size_t>(1, queue_size);
+            size_t z_chunks_per_future = target_per_future / std::max<size_t>(1, bytes_per_z_step);
+            z_chunks_per_future = std::max<size_t>(1, z_chunks_per_future);
+            read_depth = z_chunks_per_future * chunk_depth;
+        }
+    }
+    read_depth = std::min(read_depth, batch_depth); // never exceed batch boundary
+    spdlog::debug("ZL:: read granularity: read_depth={} ch (chunk_depth={} ch, queue_size={})",
+        read_depth, chunk_depth, queue_size);
+
     // Pre-cache mask before the parallel section (casacore API is not thread-safe)
     size_t w = static_cast<size_t>(width);
     size_t h = static_cast<size_t>(height);
@@ -483,65 +533,56 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     }
     size_t plane_stride = w * h;
 
-    // ── Producer-Consumer pipeline ─────────────────────────────────────────────
-    // Motivation: TensorStore's ReadSlice = disk I/O phase + decompression phase.
-    // With a SINGLE producer thread those two phases are strictly serial:
-    //   [RS0_IO][RS0_Decomp][RS1_IO][RS1_Decomp]...
-    // Disk I/O is idle during decompression → CPU underutilised.
+    // ── Async prefetch producer-consumer pipeline (v3) ────────────────────────
+    // Mirrors test_tensorstore_all_stats_v3.py:
     //
-    // Fix: N_PRODUCERS concurrent threads each calling ReadSlice independently.
-    // TensorStore's internal scheduler sees multiple requests simultaneously and
-    // can start chunk k+1 disk I/O while chunk k is still being decompressed:
+    //   producer_thread:
+    //     buf = make_shared<Array>()
+    //     waiter = reader->SubmitRead(buf, slicer)   // non-blocking: issues I/O immediately
+    //     queue.put({buf, waiter, z_local, z_depth}) // blocks only if queue full (back-pressure)
     //
-    //   Producer1: [RS0_IO][RS0_Decomp████][RS2_IO][RS2_Decomp████]...
-    //   Producer2:     [RS1_IO][RS1_Decomp████][RS3_IO]...
-    //   Consumer:               [Stats0####][Stats1####][Stats2####]...
+    //   consumer_threads[0..N-1]  (v3: N threads = numba prange(N) equivalent)
+    //     {buf, waiter, z_local, z_depth} = queue.get()
+    //     waiter()                                    // blocks until TensorStore completes
+    //     serial stats(*buf, z_local, z_depth)        // each thread handles its own Z range
     //
-    // Bounded queue with capacity n_producers+1 provides back-pressure so
-    // producers don't race too far ahead and waste memory.
+    // Each consumer thread independently pops one future, waits for it, then runs
+    // serial stats — exactly like each numba prange worker calling _numba_stats().
+    // Items cover non-overlapping z_local ranges → no write contention between threads.
     // ──────────────────────────────────────────────────────────────────────────
+    // queue_size / num_threads declared above (before read_depth formula).
 
-    const int omp_threads = carta::ProgramSettings::GetInstance().omp_thread_count;
-
-    // Number of concurrent producer threads (= simultaneous ReadSlice calls).
-    // Scale with omp_thread_count so TensorStore always has enough concurrent
-    // requests to keep disk I/O busy during decompression of other chunks.
-    const size_t n_producers = static_cast<size_t>(std::max(1, omp_threads));
-    // Queue capacity: allow all producers to have one chunk in-flight plus
-    // one already queued for the consumer → n_producers + 1.
-    const size_t n_io_ahead = n_producers;
-
-    struct ChunkPacket {
-        casacore::Array<float> data;
-        size_t z_local_start; // offset within this batch (0-based)
+    struct InFlightRead {
+        std::shared_ptr<casacore::Array<float>> buf;  // heap-stable buffer (never moves)
+        std::function<bool()>                   waiter;
+        size_t z_local_start;
         size_t z_depth;
     };
 
     // Bounded blocking queue ─────────────────────────────────────────────────
     struct BoundedQueue {
-        std::queue<ChunkPacket>   q;
+        std::queue<InFlightRead>  q;
         std::mutex                mtx;
-        std::condition_variable   cv_push; // space available
-        std::condition_variable   cv_pop;  // item available
+        std::condition_variable   cv_push;
+        std::condition_variable   cv_pop;
         size_t                    cap;
         bool                      done = false;
 
         explicit BoundedQueue(size_t capacity) : cap(capacity) {}
 
-        void push(ChunkPacket&& pkt) {
+        void push(InFlightRead&& item) {
             std::unique_lock<std::mutex> lk(mtx);
             cv_push.wait(lk, [&]{ return q.size() < cap || done; });
             if (done) return;
-            q.push(std::move(pkt));
+            q.push(std::move(item));
             cv_pop.notify_one();
         }
 
-        // Returns false when queue is closed and empty
-        bool pop(ChunkPacket& pkt) {
+        bool pop(InFlightRead& item) {
             std::unique_lock<std::mutex> lk(mtx);
             cv_pop.wait(lk, [&]{ return !q.empty() || done; });
             if (q.empty()) return false;
-            pkt = std::move(q.front());
+            item = std::move(q.front());
             q.pop();
             cv_push.notify_one();
             return true;
@@ -555,25 +596,19 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     };
     // ──────────────────────────────────────────────────────────────────────────
 
-    BoundedQueue pkt_queue(n_io_ahead + 1);
+    BoundedQueue pkt_queue(queue_size);
     std::atomic<bool> read_ok{true};
     std::atomic<bool> cancelled{false};
-    // Each producer atomically claims the next chunk_depth-aligned slice.
-    std::atomic<size_t> next_z_local{0};
 
-    spdlog::debug("ZL:: starting {}-producer pipeline (batch_depth={}, chunk_depth={})",
-        n_producers, batch_depth, chunk_depth);
+    spdlog::debug("ZL:: async prefetch pipeline (batch_depth={}, chunk_depth={}, read_depth={}, queue_size={})",
+        batch_depth, chunk_depth, read_depth, queue_size);
     auto t_stats = std::chrono::high_resolution_clock::now();
 
-    // ── Producer lambda: each thread grabs chunks atomically and calls ReadSlice ──
-    auto producer_fn = [&]() {
-        while (true) {
-            if (!read_ok.load() || cancelled.load()) break;
-
-            // Atomically claim the next chunk_depth-aligned slice; exit when exhausted.
-            size_t z_local = next_z_local.fetch_add(chunk_depth);
-            if (z_local >= batch_depth) break;
-            size_t this_depth = std::min(chunk_depth, batch_depth - z_local);
+    // ── Producer thread: issues SubmitRead (non-blocking) → puts future in queue ──
+    std::thread producer_thread([&]() {
+        size_t z_local = 0;
+        while (z_local < batch_depth && read_ok.load() && !cancelled.load()) {
+            size_t this_depth = std::min(read_depth, batch_depth - z_local);
 
             casacore::IPosition t_start(_num_dims, 0);
             casacore::IPosition t_length(_num_dims, 1);
@@ -585,126 +620,121 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
             t_length(2) = static_cast<int>(this_depth);
             if (_num_dims > 3) { t_start(3) = stokes; t_length(3) = 1; }
 
-            ChunkPacket pkt;
-            pkt.z_local_start = z_local;
-            pkt.z_depth       = this_depth;
-
-            if (!reader->ReadSlice(pkt.data, casacore::Slicer(t_start, t_length))) {
-                spdlog::error("ZL:: producer ReadSlice failed at z_local={}", z_local);
+            // Heap-stable buffer: shared_ptr ensures the raw pointer captured by
+            // TensorStore is never invalidated by a move or copy.
+            auto buf = std::make_shared<casacore::Array<float>>();
+            auto waiter = reader->SubmitRead(buf, casacore::Slicer(t_start, t_length));
+            if (!waiter) {
+                spdlog::error("ZL:: producer SubmitRead failed at z_local={}", z_local);
                 read_ok.store(false);
                 break;
             }
 
-            pkt_queue.push(std::move(pkt));
+            // Put future (not data) in queue; blocks if queue is full (back-pressure).
+            pkt_queue.push({std::move(buf), std::move(waiter), z_local, this_depth});
+            z_local += this_depth;
         }
-    };
-
-    // Launch n_producers concurrent producer threads.
-    std::vector<std::thread> producer_threads;
-    producer_threads.reserve(n_producers);
-    for (size_t i = 0; i < n_producers; ++i)
-        producer_threads.emplace_back(producer_fn);
-
-    // Closer thread: waits for ALL producers to finish, then seals the queue.
-    std::thread closer_thread([&]() {
-        for (auto& t : producer_threads) t.join();
         pkt_queue.close();
     });
 
-    // ── Consumer (main thread): pops chunks and computes stats with OMP ────────
-    while (true) {
-        ChunkPacket pkt;
-        if (!pkt_queue.pop(pkt)) break; // closed & empty
+    // ── Consumer threads (v3): N threads, each pops → waits → serial stats ────
+    // One consumer thread per prange worker in Python v3's numba_stats_2d.
+    // Each thread pops its own item from the queue, calls waiter() to block until
+    // TensorStore delivers the data, then runs serial stats over its Z range —
+    // identical to _numba_stats() iterating over a flat pixel array per slice.
+    // Items cover non-overlapping z_local ranges → no write contention.
+    auto consumer_fn = [&]() {
+        while (true) {
+            InFlightRead item;
+            if (!pkt_queue.pop(item)) break;
 
-        if (cancellation_check && cancellation_check()) {
-            cancelled.store(true);
-            break;
+            if (cancellation_check && cancellation_check()) {
+                cancelled.store(true);
+                pkt_queue.close();
+                break;
+            }
+
+            // Block until TensorStore completes this read (I/O + decompression).
+            if (!item.waiter()) {
+                spdlog::error("ZL:: consumer: waiter failed at z_local={}", item.z_local_start);
+                read_ok.store(false);
+                pkt_queue.close();
+                break;
+            }
+
+            bool del_ptr = false;
+            const float* data_ptr = item.buf->getStorage(del_ptr);
+            if (!data_ptr) {
+                spdlog::error("ZL:: consumer: data storage null");
+                read_ok.store(false);
+                pkt_queue.close();
+                break;
+            }
+
+            const size_t zdepth = item.z_depth;
+            const size_t z_off0 = item.z_local_start;
+
+            for (size_t z = 0; z < zdepth; ++z) {
+                size_t z_index  = z_start + z_off0 + z;
+                size_t z_offset = z * plane_stride;
+
+                double local_sum = 0.0, local_sum_sq = 0.0;
+                double local_min = std::numeric_limits<double>::max();
+                double local_max = std::numeric_limits<double>::lowest();
+                uint64_t local_count = 0, local_nan = 0;
+
+                for (size_t y = 0; y < h; ++y) {
+                    size_t row_offset = z_offset + y * w;
+                    size_t mask_row   = y * w;
+                    for (size_t x = 0; x < w; ++x) {
+                        if (!mask_cache[mask_row + x]) continue;
+                        double v = static_cast<double>(data_ptr[row_offset + x]);
+                        if (std::isfinite(v)) {
+                            ++local_count;
+                            local_sum    += v;
+                            local_sum_sq += v * v;
+                            local_min = std::min(v, local_min);
+                            local_max = std::max(v, local_max);
+                        } else {
+                            ++local_nan;
+                        }
+                    }
+                }
+
+                num_pixels[z_index] = local_count;
+                nan_count[z_index]  = local_nan;
+                sum[z_index]        = local_sum;
+                sum_sq[z_index]     = local_sum_sq;
+
+                if (local_count > 0) {
+                    min[z_index]     = local_min;
+                    max[z_index]     = local_max;
+                    mean[z_index]    = local_sum / local_count;
+                    rms[z_index]     = sqrt(local_sum_sq / local_count);
+                    sigma[z_index]   = local_count > 1
+                        ? sqrt((local_sum_sq - (local_sum * local_sum / local_count)) / (local_count - 1)) : 0.0;
+                    extrema[z_index] = (std::abs(local_min) > std::abs(local_max)) ? local_min : local_max;
+                    if (has_flux) flux[z_index] = local_sum / beam_area;
+                } else {
+                    min[z_index] = max[z_index] = mean[z_index] = rms[z_index] =
+                        sigma[z_index] = extrema[z_index] = NAN;
+                    if (has_flux) flux[z_index] = NAN;
+                }
+            }
+
+            item.buf->freeStorage(data_ptr, del_ptr);
         }
+    };
 
-        bool del_ptr = false;
-        const float* data_ptr = pkt.data.getStorage(del_ptr);
-        if (!data_ptr) {
-            spdlog::error("ZL:: consumer: data storage null");
-            read_ok.store(false);
-            break;
-        }
-
-        const size_t zdepth  = pkt.z_depth;
-        const size_t z_off0  = pkt.z_local_start; // offset into batch
-
-// #pragma omp parallel for schedule(static) num_threads(omp_threads)
-//         for (size_t z = 0; z < zdepth; ++z) {
-//             size_t z_index  = z_start + z_off0 + z;
-//             size_t z_offset = z * plane_stride;
-
-//             double local_sum = 0.0, local_sum_sq = 0.0;
-//             double local_min = std::numeric_limits<double>::max();
-//             double local_max = std::numeric_limits<double>::lowest();
-//             uint64_t local_count = 0, local_nan = 0;
-
-//             for (size_t y = 0; y < h; ++y) {
-//                 size_t row_offset = z_offset + y * w;
-//                 size_t mask_row   = y * w;
-//                 for (size_t x = 0; x < w; ++x) {
-//                     if (!mask_cache[mask_row + x]) continue;
-//                     double v = static_cast<double>(data_ptr[row_offset + x]);
-//                     if (std::isfinite(v)) {
-//                         ++local_count;
-//                         local_sum    += v;
-//                         local_sum_sq += v * v;
-//                         local_min = std::min(v, local_min);
-//                         local_max = std::max(v, local_max);
-//                     } else {
-//                         ++local_nan;
-//                     }
-//                 }
-//             }
-
-//             num_pixels[z_index] = local_count;
-//             nan_count[z_index]  = local_nan;
-//             sum[z_index]        = local_sum;
-//             sum_sq[z_index]     = local_sum_sq;
-
-//             if (local_count > 0) {
-//                 min[z_index]     = local_min;
-//                 max[z_index]     = local_max;
-//                 mean[z_index]    = local_sum / local_count;
-//                 rms[z_index]     = sqrt(local_sum_sq / local_count);
-//                 sigma[z_index]   = local_count > 1
-//                     ? sqrt((local_sum_sq - (local_sum * local_sum / local_count)) / (local_count - 1)) : 0.0;
-//                 extrema[z_index] = (std::abs(local_min) > std::abs(local_max)) ? local_min : local_max;
-//                 if (has_flux) flux[z_index] = local_sum / beam_area;
-//             } else {
-//                 min[z_index] = max[z_index] = mean[z_index] = rms[z_index] =
-//                     sigma[z_index] = extrema[z_index] = NAN;
-//                 if (has_flux) flux[z_index] = NAN;
-//             }
-//         }
-
-        // // 暫時用假定值1代替計算
-        // #pragma omp parallel for schedule(static) num_threads(omp_threads)
-        // for (size_t z = 0; z < zdepth; ++z) {
-        //     size_t z_index  = z_start + z_off0 + z;
-        //     num_pixels[z_index] = 1;
-        //     nan_count[z_index] = 0;
-        //     sum[z_index] = 1.0;
-        //     sum_sq[z_index] = 1.0;
-        //     min[z_index] = 1.0;
-        //     max[z_index] = 1.0;
-        //     mean[z_index] = 1.0;
-        //     rms[z_index] = 1.0;
-        //     sigma[z_index] = 0.0;
-        //     extrema[z_index] = 1.0;
-        //     if (has_flux) flux[z_index] = 1.0 / beam_area;
-        // }
-        // stats直接用預設值
-        // do nothing
-
-
-        pkt.data.freeStorage(data_ptr, del_ptr);
+    std::vector<std::thread> consumer_threads;
+    consumer_threads.reserve(num_threads);
+    for (int ci = 0; ci < num_threads; ++ci) {
+        consumer_threads.emplace_back(consumer_fn);
     }
 
-    closer_thread.join();
+    // ── Main thread: wait for producer and all consumers (v3) ─────────────────
+    producer_thread.join();
+    for (auto& ct : consumer_threads) ct.join();
 
     if (cancelled.load()) {
         spdlog::info("ZarrLoader::GetRegionSpectralData: Cancelled during processing");
@@ -713,8 +743,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     if (!read_ok.load()) {
         return false;
     }
-    spdlog::debug("ZL:: {}-producer pipeline read+stats for {} ch took {:.3f} ms",
-        n_producers, batch_depth,
+    spdlog::debug("ZL:: async prefetch pipeline read+stats for {} ch took {:.3f} ms",
+        batch_depth,
         std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_stats).count());
 
     results = stats;

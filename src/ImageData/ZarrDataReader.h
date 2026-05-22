@@ -7,6 +7,7 @@
 #ifndef CARTA_SRC_IMAGEDATA_ZARRDATAREADER_H_
 #define CARTA_SRC_IMAGEDATA_ZARRDATAREADER_H_
 
+#include <functional>
 #include <map> // Added for std::map
 #include <memory>
 #include <mutex>
@@ -49,6 +50,26 @@ public:
      * @return true if read succeeded
      */
     bool ReadSlice(casacore::Array<float>& buffer, const casacore::Slicer& section);
+
+    /**
+     * @brief Submit an async read of a slice; returns immediately with a waiter.
+     *
+     * Mirrors the Python design in test_tensorstore.py:
+     *   read_future = dataset[...].read()   # non-blocking
+     *   queue.put(read_future)              # store future, not data
+     *   data = queue.get().result()         # wait in consumer, then stats
+     *
+     * @param buffer  Heap-stable shared_ptr to pre-allocated output array.
+     *                MUST remain alive and unmodified until the returned
+     *                waiter is invoked.  Using shared_ptr prevents accidental
+     *                move/copy that would invalidate the raw pointer captured
+     *                by TensorStore.
+     * @param section The slicer defining the region to read (CARTA coordinates)
+     * @return Callable waiter: blocks until TensorStore read is complete,
+     *         returns true on success.
+     */
+    std::function<bool()> SubmitRead(
+        std::shared_ptr<casacore::Array<float>> buffer, const casacore::Slicer& section);
 
     /**
      * @brief Read an entire channel (2D spatial plane) from TensorStore.
