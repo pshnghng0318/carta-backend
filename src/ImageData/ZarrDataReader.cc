@@ -383,98 +383,13 @@ bool ZarrDataReader::Initialize() {
 }
 
 bool ZarrDataReader::ReadSlice(casacore::Array<float>& buffer, const casacore::Slicer& section) {
-    if (!_initialized) {
-        spdlog::error("ZarrDataReader not initialized");
-        return false;
-    }
-
-    const auto& start = section.start();
-    const auto& stop = section.end();
-    const auto& length = section.length();
-
-    if (omp_get_thread_num() == 0) {
-        spdlog::debug("ZarrDataReader::ReadSlice: start={}, stop={}, length={}", start.toString(), stop.toString(), length.toString());
-    }
-
-    auto t_rs_0 = std::chrono::high_resolution_clock::now();
-    buffer.resize(length);
-    if (omp_get_thread_num() == 0) {
-        spdlog::debug("ZarrDataReader::ReadSlice [1/5] buffer.resize took {:.3f} ms",
-            std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_0).count());
-    }
-
-    const int width_x = length[0];
-    const int height_y = length[1];
-    const int num_freq = length[2];
-    const int num_stokes = length[3];
-
-    // Time index is always 0 for now.
-    const tensorstore::Index time_idx = 0;
-
-    // Let TensorStore manage its own internal parallelism (data_copy_concurrency,
-    // file_io_concurrency). Issue a single read for the whole slice.
-    float* dst_ptr = buffer.data();
-
-    // auto t_rs_1 = std::chrono::high_resolution_clock::now();
-    auto slice_result = _impl->store
-        | tensorstore::Dims(0).IndexSlice(time_idx)
-        | tensorstore::Dims(0).ClosedInterval(start[2], stop[2])   // F
-        | tensorstore::Dims(1).ClosedInterval(start[3], stop[3])   // P
-        | tensorstore::Dims(2).ClosedInterval(start[0], stop[0])   // L
-        | tensorstore::Dims(3).ClosedInterval(start[1], stop[1]);  // M
-    // if (omp_get_thread_num() == 0) {
-    //     spdlog::debug("ZarrDataReader::ReadSlice [2/5] store slicing (F={}-{}, L={}-{}, M={}-{}) took {:.3f} ms",
-    //         start[2], stop[2], start[0], stop[0], start[1], stop[1],
-    //         std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_1).count());
-    // }
-
-    if (!slice_result.ok()) {
-        spdlog::error("ReadSlice slice failed: {}", slice_result.status().ToString());
-        return false;
-    }
-
-    // Reorder [F, P, L, M] → [L, M, F, P] to match CARTA Fortran-order layout [x, y, z, stokes]
-    // auto t_rs_2 = std::chrono::high_resolution_clock::now();
-    auto reorder_result = std::move(slice_result).value() | tensorstore::Dims(2, 3, 0, 1).Transpose();
-    // if (omp_get_thread_num() == 0) {
-    //     spdlog::debug("ZarrDataReader::ReadSlice [3/5] Dims Transpose took {:.3f} ms",
-    //         std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_2).count());
-    // }
-
-    if (!reorder_result.ok()) {
-        spdlog::error("ReadSlice reorder failed: {}", reorder_result.status().ToString());
-        return false;
-    }
-
-    // auto t_rs_3 = std::chrono::high_resolution_clock::now();
-    std::array<tensorstore::Index, 4> out_shape = {
-        static_cast<tensorstore::Index>(width_x),
-        static_cast<tensorstore::Index>(height_y),
-        static_cast<tensorstore::Index>(num_freq),
-        static_cast<tensorstore::Index>(num_stokes)};
-    auto batch_array = tensorstore::SharedArray<float>(
-        tensorstore::internal::UnownedToShared(dst_ptr), out_shape, tensorstore::fortran_order);
-    // if (omp_get_thread_num() == 0) {
-    //     spdlog::debug("ZarrDataReader::ReadSlice [4/5] SharedArray [{}x{}x{}x{}] construction took {:.3f} ms",
-    //         width_x, height_y, num_freq, num_stokes,
-    //         std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_3).count());
-    // }
-
-    auto t_rs_4 = std::chrono::high_resolution_clock::now();
-    auto read_status = tensorstore::Read(reorder_result.value(), batch_array).result();
-    if (omp_get_thread_num() == 0) {
-        spdlog::debug("ZarrDataReader::ReadSlice [5/5] tensorstore::Read [{}x{}x{}x{}] took {:.3f} ms",
-            width_x, height_y, num_freq, num_stokes,
-            std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_rs_4).count());
-    }
-    if (!read_status.ok()) {
-        spdlog::error("ReadSlice read failed: {}", read_status.status().ToString());
-        return false;
-    }
-
-    // Force glibc to return freed memory from per-thread arenas back to OS.
-    malloc_trim(0);
-
+    // Submit a non-blocking read, then immediately wait for the result.
+    // In the producer-consumer pipeline (GetRegionSpectralData), SubmitRead is
+    // called directly so the .result() call happens in the consumer thread instead.
+    auto buf = std::make_shared<casacore::Array<float>>();
+    auto result = SubmitRead(buf, section);
+    if (!result()) return false;
+    buffer = std::move(*buf);
     return true;
 }
 
@@ -582,7 +497,7 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
 
         auto typed_store_result = tensorstore::StaticCast<tensorstore::TensorStore<float>>(_impl->store);
         if (!typed_store_result.ok()) {
-            spdlog::error("ZarrDataReader: Error casting to float store: {}", typed_store_result.status().ToString());
+            spdlog::error("ZDR: Error casting to float store: {}", typed_store_result.status().ToString());
             return false;
         }
 
@@ -591,7 +506,7 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
             0, static_cast<tensorstore::Index>(channel), static_cast<tensorstore::Index>(stokes)};
         auto plane_result = typed_store_result.value() | tensorstore::Dims(0, 1, 2).IndexSlice(slice_indices);
         if (!plane_result.ok()) {
-            spdlog::error("GetChunk: Error slicing T/F/S dimensions: {}", plane_result.status().ToString());
+            spdlog::error("ZDR::GetChunk: Error slicing T/F/S dimensions: {}", plane_result.status().ToString());
             return false;
         }
 

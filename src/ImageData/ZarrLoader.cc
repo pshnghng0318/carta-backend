@@ -543,12 +543,12 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     //
     //   producer_thread:
     //     buf = make_shared<Array>()
-    //     waiter = reader->SubmitRead(buf, slicer)   // non-blocking: issues I/O immediately
-    //     queue.put({buf, waiter, z_local, z_depth}) // blocks only if queue full (back-pressure)
+    //     result = reader->SubmitRead(buf, slicer)   // non-blocking: issues I/O immediately
+    //     queue.put({buf, result, z_local, z_depth}) // blocks only if queue full (back-pressure)
     //
     //   consumer_threads[0..N-1]  (v3: N threads = numba prange(N) equivalent)
-    //     {buf, waiter, z_local, z_depth} = queue.get()
-    //     waiter()                                    // blocks until TensorStore completes
+    //     {buf, result, z_local, z_depth} = queue.get()
+    //     result()                                    // blocks until TensorStore completes
     //     serial stats(*buf, z_local, z_depth)        // each thread handles its own Z range
     //
     // Each consumer thread independently pops one future, waits for it, then runs
@@ -559,7 +559,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
 
     struct InFlightRead {
         std::shared_ptr<casacore::Array<float>> buf;  // heap-stable buffer (never moves)
-        std::function<bool()>                   waiter;
+        std::function<bool()>                   result;
         size_t z_local_start;
         size_t z_depth;
     };
@@ -628,15 +628,15 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
             // Heap-stable buffer: shared_ptr ensures the raw pointer captured by
             // TensorStore is never invalidated by a move or copy.
             auto buf = std::make_shared<casacore::Array<float>>();
-            auto waiter = reader->SubmitRead(buf, casacore::Slicer(t_start, t_length));
-            if (!waiter) {
+            auto result = reader->SubmitRead(buf, casacore::Slicer(t_start, t_length));
+            if (!result) {
                 spdlog::error("ZL:: producer SubmitRead failed at z_local={}", z_local);
                 read_ok.store(false);
                 break;
             }
 
             // Put future (not data) in queue; blocks if queue is full (back-pressure).
-            pkt_queue.push({std::move(buf), std::move(waiter), z_local, this_depth});
+            pkt_queue.push({std::move(buf), std::move(result), z_local, this_depth});
             z_local += this_depth;
         }
         pkt_queue.close();
@@ -644,7 +644,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
 
     // ── Consumer threads (v3): N threads, each pops → waits → serial stats ────
     // One consumer thread per prange worker in Python v3's numba_stats_2d.
-    // Each thread pops its own item from the queue, calls waiter() to block until
+    // Each thread pops its own item from the queue, calls result() to block until
     // TensorStore delivers the data, then runs serial stats over its Z range —
     // identical to _numba_stats() iterating over a flat pixel array per slice.
     // Items cover non-overlapping z_local ranges → no write contention.
@@ -660,8 +660,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
             }
 
             // Block until TensorStore completes this read (I/O + decompression).
-            if (!item.waiter()) {
-                spdlog::error("ZL:: consumer: waiter failed at z_local={}", item.z_local_start);
+            if (!item.result()) {
+                spdlog::error("ZL:: consumer: result() failed at z_local={}", item.z_local_start);
                 read_ok.store(false);
                 pkt_queue.close();
                 break;
