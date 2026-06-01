@@ -164,7 +164,8 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
     }
 
     // Cap batch to enable more frequent progress updates (aim for ~4-8 updates)
-    size_t max_batch_for_updates = std::max<size_t>(freq_chunk, requested_depth / 8);
+    // size_t max_batch_for_updates = std::max<size_t>(freq_chunk, requested_depth / 8);
+    size_t max_batch_for_updates = std::max<size_t>(freq_chunk, requested_depth);
     
     auto align_batch = [&](size_t batch_depth) {
         if (batch_depth == 0) {
@@ -321,17 +322,17 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     std::map<CARTA::StatsType, std::vector<double>>& results, float& progress,
     std::function<bool()> cancellation_check) {
     // auto t_grsd_start = std::chrono::high_resolution_clock::now();
-    spdlog::debug("ZarrLoader::GetRegionSpectralData: region_id={}, z=[{},{}], stokes={}, progress={:.3f}",
+    spdlog::debug("ZL::GetRegionSpectralData: region_id={}, z=[{},{}], stokes={}, progress={:.3f}",
         region_id, z_range.from, z_range.to, stokes, progress);
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
-        spdlog::error("ZarrLoader::GetRegionSpectralData: No valid ZARR image");
+        spdlog::error("ZL::GetRegionSpectralData: No valid ZARR image");
         return false;
     }
     std::shared_ptr<ZarrDataReader> reader = zarr_image->GetReader();
 
     if (!reader || !reader->IsInitialized()) {
-        spdlog::error("ZarrLoader::GetRegionSpectralData: Reader not initialized");
+        spdlog::error("ZL::GetRegionSpectralData: Reader not initialized");
         return false;
     }
 
@@ -339,12 +340,14 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         return false;
     }
 
+    // spec range = z range
     bool all_z = z_range.from == 0 && (z_range.to == ALL_Z || z_range.to == _dims.depth - 1);
     AxisRange spec_range(z_range.from, z_range.to);
     if (all_z) {
         spec_range.to = _dims.depth - 1;
     }
 
+    // check region stats cache
     auto region_stats_id = FileInfo::RegionStatsId(region_id, stokes);
     casacore::IPosition mask_shape(mask.shape());
     std::shared_ptr<FileInfo::RegionSpectralStats> existing_stats_ptr;
@@ -359,6 +362,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         return true;
     }
 
+    // set up region size and depth
     int width = mask_shape(0);
     int height = mask_shape(1);
     int depth = spec_range.to - spec_range.from + 1;
@@ -458,8 +462,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     }
     
     // Cap batch to enable more frequent progress updates (aim for ~4-8 updates)
-    size_t max_batch_for_updates = std::max<size_t>(chunk_depth, static_cast<size_t>(depth) / 8);
-    batch_depth = std::min(batch_depth, max_batch_for_updates);
+    // size_t max_batch_for_updates = std::max<size_t>(chunk_depth, static_cast<size_t>(depth) / 8);
+    // batch_depth = std::min(batch_depth, max_batch_for_updates);
+    size_t max_batch_for_updates = std::max<size_t>(chunk_depth, static_cast<size_t>(depth));
 
     size_t max_z = std::min(static_cast<size_t>(depth), z_start + batch_depth);
     batch_depth = max_z - z_start;
@@ -737,7 +742,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     for (auto& ct : consumer_threads) ct.join();
 
     if (cancelled.load()) {
-        spdlog::info("ZarrLoader::GetRegionSpectralData: Cancelled during processing");
+        spdlog::info("ZL::GetRegionSpectralData: Cancelled during processing");
         return false;
     }
     if (!read_ok.load()) {
