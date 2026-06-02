@@ -49,3 +49,4 @@
 [submodule "third-party/tensorstore"]
 	path = third-party/tensorstore
 	url = https://github.com/pshnghng0318/tensorstore.git
+	ignore = dirty
