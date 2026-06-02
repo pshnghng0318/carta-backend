@@ -18,7 +18,11 @@
 #include <type_traits>
 #include <vector>
 
+#ifdef __APPLE__
+#include <stdlib.h>
+#else
 #include <malloc.h>
+#endif
 #include <omp.h>
 
 #include <spdlog/fmt/fmt.h>
@@ -469,7 +473,9 @@ std::function<bool()> ZarrDataReader::SubmitRead(
             return false;
         }
         spdlog::debug("ZDR::SubmitRead completed [{}x{}x{}x{}]", width_x, height_y, num_freq, num_stokes);
+#ifndef __APPLE__
         malloc_trim(0);
+#endif
         return true;
     };
 }
@@ -544,7 +550,9 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
         }
 
         // Force glibc to return freed memory from per-thread arenas back to OS.
+#ifndef __APPLE__
         malloc_trim(0);
+#endif
 
         return true;
 

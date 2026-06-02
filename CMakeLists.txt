@@ -188,8 +188,9 @@ add_subdirectory(third-party/nlohmann_json)
 
 # Use TensorStore's nlohmann_json for ABI compatibility (v3.12.0)
 # json-schema-validator will also use this version
-if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
-    set(TENSORSTORE_BUILD_ROOT "${CMAKE_SOURCE_DIR}/third-party/tensorstore/build")
+# Both Linux and macOS need this so ZarrDataReader.cc uses the same json ABI as TensorStore
+set(TENSORSTORE_BUILD_ROOT "${CMAKE_SOURCE_DIR}/third-party/tensorstore/build")
+if (EXISTS "${TENSORSTORE_BUILD_ROOT}/_deps/nlohmann_json-src/include")
     include_directories(BEFORE "${TENSORSTORE_BUILD_ROOT}/_deps/nlohmann_json-src/include")
 endif()
 
@@ -677,21 +678,39 @@ add_dependencies(carta_backend carta-schemas)
 if (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
     list(REMOVE_ITEM LINK_LIBS uuid)
     
-    # Prepare force-load arguments for compression libraries
-    set(FORCE_LOAD_ARGS "")
-    foreach(lib ${TENSORSTORE_FORCE_LOAD_LIBS})
-        if(EXISTS ${lib})
-            list(APPEND FORCE_LOAD_ARGS "-Wl,-force_load,${lib}")
-        endif()
-    endforeach()
-    
+    # On macOS, use bundled absl from tensorstore _deps (ABI-compatible with the built tensorstore libs).
+    # Filter absl out of CMAKE_DEPS to avoid double-linking if system dylibs sneak in.
+    set(TENSORSTORE_CMAKE_DEPS_MACOS ${TENSORSTORE_CMAKE_DEPS})
+    list(FILTER TENSORSTORE_CMAKE_DEPS_MACOS EXCLUDE REGEX "libabsl_")
+
+    # Collect all bundled absl static libs (built alongside tensorstore)
+    file(GLOB_RECURSE TENSORSTORE_BUNDLED_ABSL_LIBS
+        "${TENSORSTORE_BUILD_ROOT}/_deps/absl-build/**/*.a")
+
     target_link_libraries(carta_backend
         PRIVATE
             protobuf
             /opt/homebrew/lib/libuv.dylib
             ${LINK_LIBS}
             -Wl,-force_load,${TENSORSTORE_MAIN_LIB}
-            ${FORCE_LOAD_ARGS})
+            ${TENSORSTORE_ALL_LIBS_FILES}
+            ${TENSORSTORE_CMAKE_DEPS_MACOS}
+            ${TENSORSTORE_BUNDLED_ABSL_LIBS}
+            # System absl dylibs (for carta-protobuf compiled with lts_20250814 namespace)
+            ${ABSL_STATUS_LIB}
+            ${ABSL_STATUSOR_LIB}
+            ${ABSL_HASH_LIB}
+            ${ABSL_BASE_LIB}
+            ${ABSL_STRINGS_LIB}
+            ${ABSL_STRINGS_INTERNAL_LIB}
+            ${ABSL_SYNCHRONIZATION_LIB}
+            ${ABSL_TIME_LIB}
+            ${ABSL_CORD_LIB}
+            ${ABSL_CORD_INTERNAL_LIB}
+            ${ABSL_RAW_HASH_SET_LIB}
+            ${ABSL_HASHTABLEZ_SAMPLER_LIB}
+            # CoreFoundation needed by absl_time_zone on macOS
+            "-framework CoreFoundation")
             
 endif (${CMAKE_SYSTEM_NAME} MATCHES "Darwin")
 if (${CMAKE_SYSTEM_NAME} MATCHES "Linux")
