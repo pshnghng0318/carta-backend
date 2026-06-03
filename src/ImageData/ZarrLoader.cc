@@ -5,7 +5,7 @@
 */
 
 #include "ZarrLoader.h"
-
+#include <omp.h>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -14,7 +14,6 @@
 #include <limits>
 #include <queue>
 #include <thread>
-
 #include <spdlog/spdlog.h>
 #include <Main/ProgramSettings.h>
 #include "Util/Image.h"
@@ -370,9 +369,10 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         return false;
     }
 
+    // Look up or create the per-region cumulative stats entry
+    // If the region origin or mask shape changed, the old entry is invalid and reset it
     double beam_area = CalculateBeamArea();
     bool has_flux = !std::isnan(beam_area);
-
     std::shared_ptr<FileInfo::RegionSpectralStats> stats_ptr;
     if (_region_stats.find(region_stats_id) == _region_stats.end()) {
         stats_ptr = std::make_shared<FileInfo::RegionSpectralStats>(origin, mask_shape, depth, has_flux);
@@ -385,6 +385,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         }
     }
 
+    // Bind references to each stat vector
     auto& region_stats = *stats_ptr;
     auto& stats = region_stats.stats;
     auto& num_pixels = stats[CARTA::StatsType::NumPixels];
@@ -399,6 +400,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     auto& extrema = stats[CARTA::StatsType::Extrema];
     double* flux = has_flux ? stats[CARTA::StatsType::FluxDensity].data() : nullptr;
 
+    // latest_z is the resume point
     size_t z_start = region_stats.latest_z;
     if (z_start >= static_cast<size_t>(depth)) {
         results = stats;
@@ -406,7 +408,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         return true;
     }
 
-    // Initialize all stats to NaN only on first batch
+    // Initialize stat arrays to neutral values
     if (z_start == 0) {
         for (size_t z = 0; z < static_cast<size_t>(depth); ++z) {
             num_pixels[z] = 0;
@@ -425,9 +427,9 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         }
     }
 
-    // constexpr size_t target_batch_bytes = 64 * 1024 * 1024;
+    // Determine batch size based on chunk size and target batch bytes
     size_t target_batch_bytes = carta::ProgramSettings::GetInstance().batch_MB * 1024 * 1024;
-    spdlog::debug("ZarrLoader::GetRegionSpectralData: target_batch_bytes={} MB", target_batch_bytes / (1024 * 1024));
+    spdlog::debug("ZL::GetRegionSpectralData: target_batch_bytes={} MB", target_batch_bytes / (1024 * 1024));
     size_t chunk_depth = 1;
     int freq_chunk = 0;
     // auto t_chunk_shape = std::chrono::high_resolution_clock::now();
@@ -445,6 +447,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         chunk_depth = static_cast<size_t>(freq_chunk);
     }
 
+    // Calculate how many channels per batch based on chunk depth and target batch size, then align to chunk boundaries
     size_t bytes_per_chunk_depth =
         static_cast<size_t>(width) * static_cast<size_t>(height) * chunk_depth * sizeof(float);
     size_t chunks_per_batch = bytes_per_chunk_depth > 0 ? target_batch_bytes / bytes_per_chunk_depth : 1;
@@ -461,7 +464,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         batch_depth = chunk_depth;
     }
     
-    // Cap batch to enable more frequent progress updates (aim for ~4-8 updates)
+    //// Cap batch to enable more frequent progress updates (aim for ~4-8 updates)
     // size_t max_batch_for_updates = std::max<size_t>(chunk_depth, static_cast<size_t>(depth) / 8);
     // batch_depth = std::min(batch_depth, max_batch_for_updates);
     size_t max_batch_for_updates = std::max<size_t>(chunk_depth, static_cast<size_t>(depth));
@@ -470,45 +473,27 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     batch_depth = max_z - z_start;
 
     // Prefetch depth declared here so read_depth formula can reference it.
-    // Four independent parameters (mirrors Python v3 CLI args):
-    //   file_io   → TensorStore file_io_concurrency   (set in ZarrDataReader context)
-    //   data_copy → TensorStore data_copy_concurrency (set in ZarrDataReader context)
-    //   queue_size  → BoundedQueue capacity (--queue-size in Python v3)
-    //   num_threads → stats computation threads (--num-threads in Python v3)
-    // TODO: expose queue_size and num_threads as ProgramSettings parameters.
-    const size_t queue_size  = 8;   // --queue-size
-    const int    num_threads = 16;  // --num-threads (stats parallelism)
+    const int    num_threads = std::max(1, omp_get_max_threads());  // --num-threads (stats parallelism)
+    const size_t queue_size  = static_cast<size_t>(num_threads) * 2; // keep all consumers fed
 
-    // ── Per-future read granularity (read_depth) ─────────────────────────────
-    // Mirrors test_tensorstore.py calc_batch_depth logic:
-    //   covered_chunks_spatial = spatial chunks touched by region (y * x directions)
-    //   chunk_mb = uncompressed size of one full 5D chunk
-    //   z_chunks_per_read = batch_mb / (chunk_mb * covered_chunks_spatial) / queue_size
-    //   read_depth = z_chunks_per_read * chunk_depth   (≥ chunk_depth)
-    //
-    // With queue_size futures in-flight each covering read_depth channels, TensorStore's
-    // file_io threads always have queue_size * covered_chunks_spatial chunks queued →
-    // disk I/O is fully saturated even during decompression of earlier batches.
-    //
-    // Note: chunk_shape is [T, F, S, L, M] in XRADIO 5D layout.
-    size_t read_depth = chunk_depth; // fallback: one z-chunk per future
+    // read_depth per queue_size for TensorStore I/O
+    size_t read_depth = chunk_depth; // default: one z-chunk per future
     if (chunk_shape.size() >= 5 && chunk_depth > 0 && bytes_per_chunk_depth > 0) {
-        // Spatial chunk sizes (L=chunk_shape[3], M=chunk_shape[4])
-        size_t chunk_l = static_cast<size_t>(chunk_shape[3]);
-        size_t chunk_m = static_cast<size_t>(chunk_shape[4]);
+        // chunk_shape is in raw TensorStore order [T, F, S, L, M].
+        size_t chunk_l = static_cast<size_t>(chunk_shape[3]); // L: horizontal
+        size_t chunk_m = static_cast<size_t>(chunk_shape[4]); // M: vertical
         if (chunk_l > 0 && chunk_m > 0) {
-            // How many spatial chunks does the region span in each direction?
+            // Number of spatial chunks the region spans (ceiling division).
             size_t covered_l = (static_cast<size_t>(width)  + chunk_l - 1) / chunk_l;
             size_t covered_m = (static_cast<size_t>(height) + chunk_m - 1) / chunk_m;
             size_t covered_spatial = std::max<size_t>(1, covered_l * covered_m);
 
-            // Uncompressed bytes per full 5D chunk (T=1 slice, S=1 slice assumed)
+            // Uncompressed bytes per 5D chunk (T=1, S=1 slices assumed).
             size_t chunk_bytes_5d = chunk_depth * chunk_l * chunk_m * sizeof(float);
-            // Bytes read per z-chunk step across the region
+            // Total bytes touched per z-chunk step across the whole region.
             size_t bytes_per_z_step = chunk_bytes_5d * covered_spatial;
 
-            // Target: each future reads target_batch_bytes / queue_size bytes.
-            // queue_size futures × read_depth channels ≈ batch_depth channels total.
+            // Solve for how many z-chunks to pack into one future.
             size_t target_per_future = target_batch_bytes / std::max<size_t>(1, queue_size);
             size_t z_chunks_per_future = target_per_future / std::max<size_t>(1, bytes_per_z_step);
             z_chunks_per_future = std::max<size_t>(1, z_chunks_per_future);
@@ -519,7 +504,10 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     spdlog::debug("ZL:: read granularity: read_depth={} ch (chunk_depth={} ch, queue_size={})",
         read_depth, chunk_depth, queue_size);
 
-    // Pre-cache mask before the parallel section (casacore API is not thread-safe)
+    // Cache mask
+    // casacore::ArrayLattice::getAt() is not thread-safe. Convert the mask to a
+    // flat vector<char> here (single-threaded) so consumer threads can read it
+    // without locks during the parallel stats phase.
     size_t w = static_cast<size_t>(width);
     size_t h = static_cast<size_t>(height);
     auto& mask_cache = region_stats.mask_cache;
@@ -538,24 +526,15 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     }
     size_t plane_stride = w * h;
 
-    // ── Async prefetch producer-consumer pipeline (v3) ────────────────────────
-    // Mirrors test_tensorstore_all_stats_v3.py:
-    //
+    // Async prefetch producer-consumer pipeline
     //   producer_thread:
     //     buf = make_shared<Array>()
-    //     result = reader->SubmitRead(buf, slicer)   // non-blocking: issues I/O immediately
-    //     queue.put({buf, result, z_local, z_depth}) // blocks only if queue full (back-pressure)
-    //
-    //   consumer_threads[0..N-1]  (v3: N threads = numba prange(N) equivalent)
-    //     {buf, result, z_local, z_depth} = queue.get()
-    //     result()                                    // blocks until TensorStore completes
-    //     serial stats(*buf, z_local, z_depth)        // each thread handles its own Z range
-    //
-    // Each consumer thread independently pops one future, waits for it, then runs
-    // serial stats — exactly like each numba prange worker calling _numba_stats().
-    // Items cover non-overlapping z_local ranges → no write contention between threads.
-    // ──────────────────────────────────────────────────────────────────────────
-    // queue_size / num_threads declared above (before read_depth formula).
+    //     result = reader->SubmitRead(buf, slicer)        // non-blocking: issues I/O immediately
+    //     pkt_queue.push({buf, result, z_local, z_depth}) // blocks I/O if queue full (back-pressure)
+    //   consumer_threads[0..N-1]  (N = num_threads)
+    //     pkt_queue.pop(item)                             // pop item
+    //     item.result()                                   // tensorstore read results
+    //     serial stats(*item.buf, item.z_local_start, item.z_depth) // write to stats
 
     struct InFlightRead {
         std::shared_ptr<casacore::Array<float>> buf;  // heap-stable buffer (never moves)
@@ -642,12 +621,11 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         pkt_queue.close();
     });
 
-    // ── Consumer threads (v3): N threads, each pops → waits → serial stats ────
-    // One consumer thread per prange worker in Python v3's numba_stats_2d.
-    // Each thread pops its own item from the queue, calls result() to block until
-    // TensorStore delivers the data, then runs serial stats over its Z range —
-    // identical to _numba_stats() iterating over a flat pixel array per slice.
-    // Items cover non-overlapping z_local ranges → no write contention.
+    // ── Consumer threads (N = num_threads) ─────────────────────────────────────
+    // Loop: pkt_queue.pop(item) [blocks if empty] → item.result() [blocks until TensorStore
+    // completes I/O + decompression] → iterate z in [z_local_start, z_local_start + z_depth)
+    // and write stats[z_start + z_local_start + z]. Each item has a unique z_local_start
+    // → writes go to disjoint indices → no mutex needed.
     auto consumer_fn = [&]() {
         while (true) {
             InFlightRead item;
@@ -737,7 +715,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         consumer_threads.emplace_back(consumer_fn);
     }
 
-    // ── Main thread: wait for producer and all consumers (v3) ─────────────────
+    // Main thread: wait for producer and all consumers
     producer_thread.join();
     for (auto& ct : consumer_threads) ct.join();
 
