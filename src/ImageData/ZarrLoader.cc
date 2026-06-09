@@ -74,13 +74,13 @@ bool ZarrLoader::GetChunk(std::vector<float>& data, int& data_width, int& data_h
     
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
-        spdlog::error("ZarrLoader::GetChunk: No valid ZARR image");
+        spdlog::error("ZL::GetChunk: No valid ZARR image");
         return false;
     }
     
     auto reader = zarr_image->GetReader();
     if (!reader || !reader->IsInitialized()) {
-        spdlog::error("ZarrLoader::GetChunk: Reader not initialized");
+        spdlog::error("ZL::GetChunk: Reader not initialized");
         return false;
     }
     
@@ -95,13 +95,13 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
 
     auto* zarr_image_cursor = GetZarrImage();
     if (!zarr_image_cursor) {
-        spdlog::error("ZarrLoader::GetCursorSpectralData: No valid ZARR image");
+        spdlog::error("ZL::GetCursorSpectralData: No valid ZARR image");
         return false;
     }
     std::shared_ptr<ZarrDataReader> reader = zarr_image_cursor->GetReader();
 
     if (!reader || !reader->IsInitialized()) {
-        spdlog::error("ZarrLoader::GetCursorSpectralData: Reader not initialized");
+        spdlog::error("ZL::GetCursorSpectralData: Reader not initialized");
         return false;
     }
 
@@ -213,7 +213,7 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
     }
 
     z_batch = std::min<size_t>(z_batch, requested_depth - z_start_in_data);
-    spdlog::debug("ZarrLoader::GetCursorSpectralData: z_batch={}, freq_chunk={}, requested_depth={}, z_start_in_data={}",
+    spdlog::debug("ZL::GetCursorSpectralData: z_batch={}, freq_chunk={}, requested_depth={}, z_start_in_data={}",
         z_batch, freq_chunk, requested_depth, z_start_in_data);
 
     casacore::IPosition start(_num_dims, 0);
@@ -233,7 +233,7 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
     auto t_batch_start = std::chrono::high_resolution_clock::now();
     {
         if (!reader->ReadSlice(batch_data, casacore::Slicer(start, length))) {
-            spdlog::error("ZarrLoader::GetCursorSpectralData: ReadSlice failed");
+            spdlog::error("ZL::GetCursorSpectralData: ReadSlice failed");
             return false;
         }
     }
@@ -241,7 +241,7 @@ bool ZarrLoader::GetCursorSpectralData(std::vector<float>& data, const AxisRange
     bool delete_data_ptr(false);
     const float* data_ptr = batch_data.getStorage(delete_data_ptr);
     if (!data_ptr) {
-        spdlog::error("ZarrLoader::GetCursorSpectralData: batch_data storage is null");
+        spdlog::error("ZL::GetCursorSpectralData: batch_data storage is null");
         return false;
     }
 
@@ -473,8 +473,8 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
     batch_depth = max_z - z_start;
 
     // Prefetch depth declared here so read_depth formula can reference it.
-    const int    num_threads = std::max(1, omp_get_max_threads());  // --num-threads (stats parallelism)
-    const size_t queue_size  = static_cast<size_t>(num_threads) * 2; // keep all consumers fed
+    const int    num_threads = std::max(1, omp_get_max_threads());  // consumer thread count
+    const size_t queue_size  = static_cast<size_t>(std::max(1, (num_threads) / 2)); // producer queue size
 
     // read_depth per queue_size for TensorStore I/O
     size_t read_depth = chunk_depth; // default: one z-chunk per future
@@ -747,7 +747,7 @@ bool ZarrLoader::GetRegionSpectralData(int region_id, const AxisRange& z_range, 
         }
     }
 
-    // spdlog::debug("ZarrLoader::GetRegionSpectralData: batch complete in {:.3f} ms total, progress={:.3f}",
+    // spdlog::debug("ZL::GetRegionSpectralData: batch complete in {:.3f} ms total, progress={:.3f}",
     //     std::chrono::duration<double, std::milli>(std::chrono::high_resolution_clock::now() - t_grsd_start).count(), progress);
     return true;
 }
@@ -774,13 +774,13 @@ bool ZarrLoader::GetSpatialProfileX(std::vector<float>& profile, int start_x, in
                                      std::mutex& /*image_mutex*/) {
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
-        spdlog::error("ZarrLoader::GetSpatialProfileX: No valid ZARR image");
+        spdlog::error("ZL::GetSpatialProfileX: No valid ZARR image");
         return false;
     }
     
     auto reader = zarr_image->GetReader();
     if (!reader || !reader->IsInitialized()) {
-        spdlog::error("ZarrLoader::GetSpatialProfileX: Reader not initialized");
+        spdlog::error("ZL::GetSpatialProfileX: Reader not initialized");
         return false;
     }
     
@@ -793,7 +793,7 @@ bool ZarrLoader::GetSpatialProfileX(std::vector<float>& profile, int start_x, in
         
         casacore::Array<float> line_data;
         if (!reader->ReadSlice(line_data, section)) {
-            spdlog::error("ZarrLoader::GetSpatialProfileX: ReadSlice failed");
+            spdlog::error("ZL::GetSpatialProfileX: ReadSlice failed");
             return false;
         }
         
@@ -804,7 +804,7 @@ bool ZarrLoader::GetSpatialProfileX(std::vector<float>& profile, int start_x, in
         return true;
         
     } catch (const std::exception& ex) {
-        spdlog::error("ZarrLoader::GetSpatialProfileX exception: {}", ex.what());
+        spdlog::error("ZL::GetSpatialProfileX exception: {}", ex.what());
         return false;
     }
 }
@@ -814,13 +814,13 @@ bool ZarrLoader::GetSpatialProfileY(std::vector<float>& profile, int cursor_x,
                                      std::mutex& /*image_mutex*/) {
     auto* zarr_image = GetZarrImage();
     if (!zarr_image) {
-        spdlog::error("ZarrLoader::GetSpatialProfileY: No valid ZARR image");
+        spdlog::error("ZL::GetSpatialProfileY: No valid ZARR image");
         return false;
     }
     
     auto reader = zarr_image->GetReader();
     if (!reader || !reader->IsInitialized()) {
-        spdlog::error("ZarrLoader::GetSpatialProfileY: Reader not initialized");
+        spdlog::error("ZL::GetSpatialProfileY: Reader not initialized");
         return false;
     }
     
@@ -833,7 +833,7 @@ bool ZarrLoader::GetSpatialProfileY(std::vector<float>& profile, int cursor_x,
         
         casacore::Array<float> line_data;
         if (!reader->ReadSlice(line_data, section)) {
-            spdlog::error("ZarrLoader::GetSpatialProfileY: ReadSlice failed");
+            spdlog::error("ZL::GetSpatialProfileY: ReadSlice failed");
             return false;
         }
         
@@ -844,7 +844,7 @@ bool ZarrLoader::GetSpatialProfileY(std::vector<float>& profile, int cursor_x,
         return true;
         
     } catch (const std::exception& ex) {
-        spdlog::error("ZarrLoader::GetSpatialProfileY exception: {}", ex.what());
+        spdlog::error("ZL::GetSpatialProfileY exception: {}", ex.what());
         return false;
     }
 }

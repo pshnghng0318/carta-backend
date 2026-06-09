@@ -369,19 +369,19 @@ bool ZarrDataReader::Initialize() {
                     chunk_shape_vec.push_back(static_cast<int>(chunk_dim_size));
                 }
                 _chunk_shape = casacore::IPosition(chunk_shape_vec);
-                spdlog::debug("ZarrDataReader chunk shape (read): {}", _chunk_shape.toString());
+                spdlog::debug("ZDR:: chunk shape (read): {}", _chunk_shape.toString());
             }
         } else {
-            spdlog::debug("ZarrDataReader: chunk_layout unavailable: {}", chunk_layout_result.status().ToString());
+            spdlog::debug("ZDR:: chunk_layout unavailable: {}", chunk_layout_result.status().ToString());
         }
 
         _initialized = true;
-        spdlog::debug("ZarrDataReader initialized: ZARR shape={}, CARTA shape={}", _original_shape.toString(), _shape.toString());
+        spdlog::debug("ZDR:: initialized: ZARR shape={}, CARTA shape={}", _original_shape.toString(), _shape.toString());
 
         return true;
 
     } catch (const std::exception& ex) {
-        spdlog::error("Exception initializing ZarrDataReader: {}", ex.what());
+        spdlog::error("ZDR:: Exception initializing ZarrDataReader: {}", ex.what());
         return false;
     }
 }
@@ -482,7 +482,7 @@ std::function<bool()> ZarrDataReader::SubmitRead(
 
 bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& data_height, int min_x, int min_y, int channel, int stokes) {
     if (!_initialized) {
-        spdlog::error("ZarrDataReader not initialized");
+        spdlog::error("ZDR::GetChunk: not initialized");
         return false;
     }
 
@@ -564,14 +564,14 @@ bool ZarrDataReader::GetChunk(std::vector<float>& data, int& data_width, int& da
 
 bool ZarrDataReader::ReadSpectralProfile(int x, int y, int stokes, std::vector<float>& data) {
     if (!_initialized) {
-        spdlog::error("ZarrDataReader not initialized");
+        spdlog::error("ZDR::ReadSpectralProfile: not initialized");
         return false;
     }
 
     try {
         int num_channels = _shape[2]; // Frequency axis in CARTA shape [X, Y, F, S]
 
-        spdlog::debug("ReadSpectralProfile: x={}, y={}, stokes={}, channels={}", x, y, stokes, num_channels);
+        spdlog::debug("ZDR::ReadSpectralProfile: x={}, y={}, stokes={}, channels={}", x, y, stokes, num_channels);
 
         // XRADIO schema: always 5D [T, F, S, L, M]
         // Read ALL channels at once (entire F axis)

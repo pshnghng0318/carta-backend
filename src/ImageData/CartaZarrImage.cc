@@ -619,7 +619,7 @@ Bool CartaZarrImage::doGetSlice(Array<float>& buffer, const Slicer& section) {
 }
 
 void CartaZarrImage::doPutSlice(const Array<float>& buffer, const IPosition& where, const IPosition& stride) {
-    throw AipsError("CartaZarrImage::doPutSlice - image is not writable");
+    throw AipsError("CZI::doPutSlice - image is not writable");
 }
 
 const LatticeRegion* CartaZarrImage::getRegionPtr() const {
@@ -631,7 +631,7 @@ ImageInterface<float>* CartaZarrImage::cloneII() const {
 }
 
 void CartaZarrImage::resize(const TiledShape& newShape) {
-    throw AipsError("CartaZarrImage::resize - image is not writable");
+    throw AipsError("CZI::resize - image is not writable");
 }
 
 uInt CartaZarrImage::advisedMaxPixels() const {
@@ -655,11 +655,11 @@ Bool CartaZarrImage::hasPixelMask() const {
 }
 
 const Lattice<Bool>& CartaZarrImage::pixelMask() const {
-    throw AipsError("CartaZarrImage::pixelMask - no pixel mask");
+    throw AipsError("CZI::pixelMask - no pixel mask");
 }
 
 Lattice<Bool>& CartaZarrImage::pixelMask() {
-    throw AipsError("CartaZarrImage::pixelMask - no pixel mask");
+    throw AipsError("CZI::pixelMask - no pixel mask");
 }
 
 Bool CartaZarrImage::doGetMaskSlice(Array<Bool>& buffer, const Slicer& section) {
@@ -791,13 +791,13 @@ void CartaZarrImage::CreateDefaultCoordinateSystem() {
 
 void CartaZarrImage::SetBeams() {
     if (_is_single_beam) {
-        spdlog::debug("CartaZarrImage::SetBeams - Setting single beam from _beam: {} x {} @ {}", _beam.getMajor().getValue("arcsec"),
+        spdlog::debug("CZI::SetBeams - Setting single beam from _beam: {} x {} @ {}", _beam.getMajor().getValue("arcsec"),
             _beam.getMinor().getValue("arcsec"), _beam.getPA().getValue("deg"));
         ImageInfo info = imageInfo();
         info.setRestoringBeam(_beam);
         setImageInfo(info);
     } else {
-        spdlog::debug("CartaZarrImage::SetBeams - Setting multiple beams from Zarr BEAM array");
+        spdlog::debug("CZI::SetBeams - Setting multiple beams from Zarr BEAM array");
         std::vector<double> beam_data = _reader->ReadFlattenedVector("BEAM");
         if (beam_data.size() < 3) {
             return;
@@ -813,7 +813,7 @@ void CartaZarrImage::SetBeams() {
         const size_t usable_groups = usable / 3;
 
         spdlog::debug(
-            "CartaZarrImage::SetBeams - Processing {} beam entries for shape {}x{} (chan x stokes)", usable_groups, n_chan, n_stokes);
+            "CZI::SetBeams - Processing {} beam entries for shape {}x{} (chan x stokes)", usable_groups, n_chan, n_stokes);
 
         for (size_t beam_group = 0; beam_group < usable_groups; ++beam_group) {
             const int chan = static_cast<int>(beam_group / static_cast<size_t>(n_stokes));
