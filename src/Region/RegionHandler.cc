@@ -8,8 +8,14 @@
 
 #include "RegionHandler.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+#include <thread>
+#include <vector>
 
 #include <casacore/casa/math.h>
 
@@ -1892,109 +1898,211 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
         cache_results[stat] = init_spectral;
     }
 
-    // Calculate and cache profiles
-    size_t start_z(z_range.from), count(0), end_z(0), profile_start(0);
-    int delta_z = INIT_DELTA_Z;        // the increment of z for each step
-    int dt_target = TARGET_DELTA_TIME; // the target time elapse for each step, in the unit of milliseconds
-    auto t_partial_profile_start = std::chrono::high_resolution_clock::now();
-
-    if (Stokes::IsComputed(stokes_index)) { // Need to re-calculate the lattice coordinate region for computed stokes index
+    // Reset lc_region for computed stokes (must recalculate per constituent stokes index)
+    if (Stokes::IsComputed(stokes_index)) {
         lc_region = nullptr;
     }
 
-    // Get per-z stats data for spectral profiles
-    while (progress < 1.0) {
-        // start the timer
-        auto t_start = std::chrono::high_resolution_clock::now();
+    if (Stokes::IsComputed(stokes_index)) {
+        // ── Sequential path for computed stokes ──────────────────────────────────
+        // get_profiles_data must call GetImageRegion per constituent stokes; not safe
+        // to parallelise across slabs, so keep the original adaptive while loop.
+        size_t start_z(z_range.from), count(0), end_z(0), profile_start(0);
+        int delta_z = INIT_DELTA_Z;
+        int dt_target = TARGET_DELTA_TIME;
+        auto t_partial_profile_start = std::chrono::high_resolution_clock::now();
 
-        end_z = (start_z + delta_z > profile_end ? profile_end : start_z + delta_z - 1);
-        count = end_z - start_z + 1;
+        while (progress < 1.0) {
+            auto t_start = std::chrono::high_resolution_clock::now();
+            end_z = (start_z + delta_z > profile_end ? profile_end : start_z + delta_z - 1);
+            count = end_z - start_z + 1;
+            AxisRange partial_z_range(start_z, end_z);
 
-        // Get 3D region for z range and stokes_index
-        AxisRange partial_z_range(start_z, end_z);
+            auto get_stokes_profiles_data = [&](ProfilesMap& tmp_partial_profiles, int tmp_stokes_index) {
+                casacore::ImageRegion image_region;
+                bool per_z(true);
+                if (GetImageRegion(region, frame, partial_z_range, tmp_stokes_index, lc_region, image_region)) {
+                    StokesSource stokes_source(tmp_stokes_index, partial_z_range);
+                    StokesRegion stokes_region(stokes_source, image_region);
+                    return frame->GetRegionStats(stokes_region, _spectral_stats, per_z, tmp_partial_profiles);
+                }
+                return false;
+            };
 
-        auto get_stokes_profiles_data = [&](ProfilesMap& tmp_partial_profiles, int tmp_stokes_index) {
-            casacore::ImageRegion image_region;
-            bool per_z(true); // Get per-z stats data for region for all stats (for cache)
-            if (GetImageRegion(region, frame, partial_z_range, tmp_stokes_index, lc_region, image_region)) {
-                StokesSource stokes_source(tmp_stokes_index, partial_z_range);
-                StokesRegion stokes_region(stokes_source, image_region);
-                return frame->GetRegionStats(stokes_region, _spectral_stats, per_z, tmp_partial_profiles);
-            }
-            return false;
-        };
+            auto get_profiles_data = [&](ProfilesMap& tmp_partial_profiles, std::string tmp_coordinate) {
+                int tmp_stokes_index;
+                return (frame->GetStokesTypeIndex(tmp_coordinate, tmp_stokes_index) &&
+                        get_stokes_profiles_data(tmp_partial_profiles, tmp_stokes_index));
+            };
 
-        auto get_profiles_data = [&](ProfilesMap& tmp_partial_profiles, std::string tmp_coordinate) {
-            int tmp_stokes_index;
-            return (frame->GetStokesTypeIndex(tmp_coordinate, tmp_stokes_index) &&
-                    get_stokes_profiles_data(tmp_partial_profiles, tmp_stokes_index));
-        };
-
-        ProfilesMap partial_profiles;
-        if (Stokes::IsComputed(stokes_index)) { // For computed stokes
+            ProfilesMap partial_profiles;
             if (!GetComputedStokesProfiles(partial_profiles, stokes_index, get_profiles_data)) {
                 return false;
             }
-        } else { // For regular stokes I, Q, U, or V
-            if (!get_stokes_profiles_data(partial_profiles, stokes_index)) {
-                return false;
+
+            for (const auto& profile : partial_profiles) {
+                auto stats_type = profile.first;
+                const std::vector<double>& stats_data = profile.second;
+                if (results.count(stats_type)) {
+                    memcpy(&results[stats_type][profile_start], &stats_data[0], stats_data.size() * sizeof(double));
+                }
+                memcpy(&cache_results[stats_type][profile_start], &stats_data[0], stats_data.size() * sizeof(double));
+            }
+
+            start_z += count;
+            profile_start += count;
+            progress = (float)profile_start / profile_size;
+
+            auto t_end = std::chrono::high_resolution_clock::now();
+            auto dt = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+            auto dt_partial_profile = std::chrono::duration<double, std::milli>(t_end - t_partial_profile_start).count();
+
+            delta_z *= dt_target / dt;
+            if (delta_z < 1) delta_z = 1;
+            if (delta_z > (int)profile_size) delta_z = (int)profile_size;
+
+            if (!RegionFileIdsValid(region_id, file_id)) return false;
+            if (region->GetRegionState() != initial_region_state) return false;
+            if (use_current_stokes && (stokes_index != _frames.at(file_id)->CurrentStokes())) return false;
+            if (!HasSpectralRequirements(region_id, file_id, coordinate, required_stats)) return false;
+
+            if (dt_partial_profile > TARGET_PARTIAL_REGION_TIME || progress >= 1.0) {
+                t_partial_profile_start = std::chrono::high_resolution_clock::now();
+                partial_results_callback(results, progress);
+                if (progress >= 1.0) {
+                    _spectral_cache[cache_id] = SpectralCache(cache_results);
+                }
             }
         }
+    } else {
+        // ── Producer + 2-consumer pipeline for regular stokes ────────────────────
+        // Producer builds StokesRegion descriptors; N_CONSUMERS threads call
+        // GetRegionStats.  Consumers serialise on _image_mutex (inside GetRegionStats)
+        // but their GetRegionSubImage calls (no lock) overlap with another consumer's
+        // CalcStatsValues, pipelining I/O with computation.
+        // Slab size is large enough for casacore's OMP to parallelise effectively.
 
-        // Copy partial profile to results and cache_results (all stats)
-        for (const auto& profile : partial_profiles) {
-            auto stats_type = profile.first;
-            const std::vector<double>& stats_data = profile.second;
-            if (results.count(stats_type)) {
-                memcpy(&results[stats_type][profile_start], &stats_data[0], stats_data.size() * sizeof(double));
+        struct InFlightRead {
+            StokesRegion stokes_region;
+            size_t       profile_start;
+            size_t       count;
+        };
+
+        struct BoundedQueue {
+            std::queue<InFlightRead> q;
+            std::mutex               mtx;
+            std::condition_variable  cv_push, cv_pop;
+            size_t                   cap;
+            bool                     done = false;
+            explicit BoundedQueue(size_t cap_) : cap(cap_) {}
+            void push(InFlightRead&& item) {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv_push.wait(lk, [&] { return q.size() < cap || done; });
+                if (done) return;
+                q.push(std::move(item));
+                cv_pop.notify_one();
             }
-            memcpy(&cache_results[stats_type][profile_start], &stats_data[0], stats_data.size() * sizeof(double));
-        }
-
-        start_z += count;
-        profile_start += count;
-        progress = (float)profile_start / profile_size;
-
-        // get the time elapse for this step
-        auto t_end = std::chrono::high_resolution_clock::now();
-        auto dt = std::chrono::duration<double, std::milli>(t_end - t_start).count();
-        auto dt_partial_profile = std::chrono::duration<double, std::milli>(t_end - t_partial_profile_start).count();
-
-        // adjust the increment of z according to the time elapse
-        delta_z *= dt_target / dt;
-        if (delta_z < 1) {
-            delta_z = 1;
-        }
-        if (delta_z > profile_size) {
-            delta_z = profile_size;
-        }
-
-        // Cancel if region or frame is closing
-        if (!RegionFileIdsValid(region_id, file_id)) {
-            return false;
-        }
-
-        // Cancel if region, current stokes, or spectral requirements changed
-        if (region->GetRegionState() != initial_region_state) {
-            return false;
-        }
-        if (use_current_stokes && (stokes_index != _frames.at(file_id)->CurrentStokes())) {
-            return false;
-        }
-        if (!HasSpectralRequirements(region_id, file_id, coordinate, required_stats)) {
-            return false;
-        }
-
-        // send partial result by the callback function
-        if (dt_partial_profile > TARGET_PARTIAL_REGION_TIME || progress >= 1.0) {
-            t_partial_profile_start = std::chrono::high_resolution_clock::now();
-            partial_results_callback(results, progress);
-            if (progress >= 1.0) {
-                // cache results for all stats types
-                // TODO: cache and load partial profiles
-                _spectral_cache[cache_id] = SpectralCache(cache_results);
+            bool pop(InFlightRead& item) {
+                std::unique_lock<std::mutex> lk(mtx);
+                cv_pop.wait(lk, [&] { return !q.empty() || done; });
+                if (q.empty()) return false;
+                item = std::move(q.front());
+                q.pop();
+                cv_push.notify_one();
+                return true;
             }
+            void close() {
+                { std::lock_guard<std::mutex> lk(mtx); done = true; }
+                cv_push.notify_all();
+                cv_pop.notify_all();
+            }
+        };
+
+        constexpr size_t N_CONSUMERS = 2;
+        constexpr size_t QUEUE_SIZE  = 4;  // 2 × 4 (original single-consumer size)
+        // Slab large enough for OMP: at least INIT_DELTA_Z, but divide profile
+        // into QUEUE_SIZE pieces so there is enough work to fill the queue.
+        const size_t slab_size = std::max(static_cast<size_t>(INIT_DELTA_Z),
+                                          profile_size / QUEUE_SIZE);
+
+        BoundedQueue         pkt_queue(QUEUE_SIZE);
+        std::atomic<bool>    ok{true};
+        std::atomic<bool>    cancelled{false};
+        std::mutex           write_mutex; // guards result/cache writes across consumers
+
+        // Producer: build one StokesRegion per slab and enqueue
+        std::thread producer_thread([&]() {
+            size_t prod_start_z = z_range.from, prod_profile_start = 0;
+            while (prod_start_z <= profile_end && ok.load() && !cancelled.load()) {
+                size_t prod_end_z = std::min(prod_start_z + slab_size - 1, profile_end);
+                size_t prod_count = prod_end_z - prod_start_z + 1;
+                AxisRange partial_z_range(prod_start_z, prod_end_z);
+
+                casacore::ImageRegion image_region;
+                if (!GetImageRegion(region, frame, partial_z_range, stokes_index, lc_region, image_region)) {
+                    ok.store(false);
+                    break;
+                }
+                StokesSource stokes_source(stokes_index, partial_z_range);
+                pkt_queue.push({StokesRegion(stokes_source, image_region), prod_profile_start, prod_count});
+
+                prod_start_z       += prod_count;
+                prod_profile_start += prod_count;
+            }
+            pkt_queue.close();
+        });
+
+        // N_CONSUMERS consumer threads.
+        // GetRegionSubImage (no lock) can overlap across consumers; CalcStatsValues
+        // serialises on _image_mutex inside GetRegionStats.
+        std::vector<std::thread> consumer_threads;
+        consumer_threads.reserve(N_CONSUMERS);
+        for (size_t ci = 0; ci < N_CONSUMERS; ++ci) {
+            consumer_threads.emplace_back([&]() {
+                InFlightRead item;
+                while (pkt_queue.pop(item)) {
+                    if (!RegionFileIdsValid(region_id, file_id) ||
+                        region->GetRegionState() != initial_region_state ||
+                        (use_current_stokes && stokes_index != _frames.at(file_id)->CurrentStokes()) ||
+                        !HasSpectralRequirements(region_id, file_id, coordinate, required_stats)) {
+                        cancelled.store(true);
+                        pkt_queue.close();
+                        break;
+                    }
+
+                    ProfilesMap partial_profiles;
+                    if (!frame->GetRegionStats(item.stokes_region, _spectral_stats, true, partial_profiles)) {
+                        ok.store(false);
+                        pkt_queue.close();
+                        break;
+                    }
+
+                    // Writes are to non-overlapping profile_start positions.
+                    // Use write_mutex for strict thread-safety of the map lookups.
+                    std::lock_guard<std::mutex> wlk(write_mutex);
+                    for (const auto& profile : partial_profiles) {
+                        auto stats_type = profile.first;
+                        const std::vector<double>& stats_data = profile.second;
+                        if (results.count(stats_type)) {
+                            memcpy(&results[stats_type][item.profile_start], stats_data.data(),
+                                   stats_data.size() * sizeof(double));
+                        }
+                        memcpy(&cache_results[stats_type][item.profile_start], stats_data.data(),
+                               stats_data.size() * sizeof(double));
+                    }
+                }
+            });
         }
+
+        producer_thread.join();
+        for (auto& t : consumer_threads) t.join();
+
+        if (cancelled.load()) return false;
+        if (!ok.load())        return false;
+
+        progress = 1.0;
+        partial_results_callback(results, progress);
+        _spectral_cache[cache_id] = SpectralCache(cache_results);
     }
 
     spdlog::performance("Fill spectral profile in {:.3f} ms", t.Elapsed().ms());
