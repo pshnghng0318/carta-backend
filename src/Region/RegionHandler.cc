@@ -2019,7 +2019,10 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
         };
 
         constexpr size_t N_CONSUMERS = 2;
-        constexpr size_t QUEUE_SIZE  = 4;  // 2 × 4 (original single-consumer size)
+
+        // constexpr size_t QUEUE_SIZE  = 8;  // 2 × 4 (original single-consumer size)
+        constexpr size_t QUEUE_SIZE = omp_get_max_threads(); // one slab per consumer thread; auto-tune to number of threads
+        spdlog::info("Using producer-consumer pipeline with {} consumer threads and queue size {}", N_CONSUMERS, QUEUE_SIZE);
         // Slab large enough for OMP: at least INIT_DELTA_Z, but divide profile
         // into QUEUE_SIZE pieces so there is enough work to fill the queue.
         const size_t slab_size = std::max(static_cast<size_t>(INIT_DELTA_Z),
