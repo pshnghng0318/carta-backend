@@ -8,14 +8,9 @@
 
 #include "RegionHandler.h"
 
-#include <atomic>
 #include <chrono>
 #include <cmath>
-#include <condition_variable>
 #include <mutex>
-#include <queue>
-#include <thread>
-#include <vector>
 
 #include <omp.h>
 
@@ -1977,135 +1972,65 @@ bool RegionHandler::GetRegionSpectralData(int region_id, int file_id, const Axis
             }
         }
     } else {
-        // ── Producer + 2-consumer pipeline for regular stokes ────────────────────
-        // Producer builds StokesRegion descriptors; N_CONSUMERS threads call
-        // GetRegionStats.  Consumers serialise on _image_mutex (inside GetRegionStats)
-        // but their GetRegionSubImage calls (no lock) overlap with another consumer's
-        // CalcStatsValues, pipelining I/O with computation.
-        // Slab size is large enough for casacore's OMP to parallelise effectively.
+        // ── Sequential large-slab loop for regular stokes ────────────────────────
+        // GetRegionStats locks _image_mutex for both GetRegionSubImage and
+        // CalcStatsValues, so multiple threads would serialize completely.
+        // Instead use a few large slabs so casacore's OMP CalcStatsValues gets
+        // enough contiguous 3D data to utilise all cores efficiently, while
+        // still sending incremental partial results to the UI.
+        const size_t N_SLABS  = static_cast<size_t>(std::max(1, omp_get_max_threads()));
+        const size_t slab_size = std::max(static_cast<size_t>(INIT_DELTA_Z), profile_size / N_SLABS);
 
-        struct InFlightRead {
-            StokesRegion stokes_region;
-            size_t       profile_start;
-            size_t       count;
-        };
+        size_t start_z = z_range.from, profile_start = 0;
+        auto t_partial_profile_start = std::chrono::high_resolution_clock::now();
 
-        struct BoundedQueue {
-            std::queue<InFlightRead> q;
-            std::mutex               mtx;
-            std::condition_variable  cv_push, cv_pop;
-            size_t                   cap;
-            bool                     done = false;
-            explicit BoundedQueue(size_t cap_) : cap(cap_) {}
-            void push(InFlightRead&& item) {
-                std::unique_lock<std::mutex> lk(mtx);
-                cv_push.wait(lk, [&] { return q.size() < cap || done; });
-                if (done) return;
-                q.push(std::move(item));
-                cv_pop.notify_one();
+        while (start_z <= profile_end) {
+            size_t end_z  = std::min(start_z + slab_size - 1, profile_end);
+            size_t count  = end_z - start_z + 1;
+            AxisRange partial_z_range(start_z, end_z);
+
+            casacore::ImageRegion image_region;
+            if (!GetImageRegion(region, frame, partial_z_range, stokes_index, lc_region, image_region)) {
+                return false;
             }
-            bool pop(InFlightRead& item) {
-                std::unique_lock<std::mutex> lk(mtx);
-                cv_pop.wait(lk, [&] { return !q.empty() || done; });
-                if (q.empty()) return false;
-                item = std::move(q.front());
-                q.pop();
-                cv_push.notify_one();
-                return true;
+            StokesSource stokes_source(stokes_index, partial_z_range);
+            StokesRegion stokes_region(stokes_source, image_region);
+
+            ProfilesMap partial_profiles;
+            if (!frame->GetRegionStats(stokes_region, _spectral_stats, true, partial_profiles)) {
+                return false;
             }
-            void close() {
-                { std::lock_guard<std::mutex> lk(mtx); done = true; }
-                cv_push.notify_all();
-                cv_pop.notify_all();
-            }
-        };
 
-        const size_t N_CONSUMERS = 4;
-        const size_t QUEUE_SIZE  = static_cast<size_t>(std::max<size_t>(1, N_CONSUMERS));
-        spdlog::info("Using producer-consumer pipeline with {} consumer threads and queue size {}", N_CONSUMERS, QUEUE_SIZE);
-        // Slab large enough for OMP: at least INIT_DELTA_Z, but divide profile
-        // into QUEUE_SIZE pieces so there is enough work to fill the queue.
-        const size_t slab_size = std::max(static_cast<size_t>(INIT_DELTA_Z),
-                                          profile_size / QUEUE_SIZE);
-
-        BoundedQueue         pkt_queue(QUEUE_SIZE);
-        std::atomic<bool>    ok{true};
-        std::atomic<bool>    cancelled{false};
-        std::mutex           write_mutex; // guards result/cache writes across consumers
-
-        // Producer: build one StokesRegion per slab and enqueue
-        std::thread producer_thread([&]() {
-            size_t prod_start_z = z_range.from, prod_profile_start = 0;
-            while (prod_start_z <= profile_end && ok.load() && !cancelled.load()) {
-                size_t prod_end_z = std::min(prod_start_z + slab_size - 1, profile_end);
-                size_t prod_count = prod_end_z - prod_start_z + 1;
-                AxisRange partial_z_range(prod_start_z, prod_end_z);
-
-                casacore::ImageRegion image_region;
-                if (!GetImageRegion(region, frame, partial_z_range, stokes_index, lc_region, image_region)) {
-                    ok.store(false);
-                    break;
+            for (const auto& profile : partial_profiles) {
+                auto stats_type = profile.first;
+                const std::vector<double>& stats_data = profile.second;
+                if (results.count(stats_type)) {
+                    memcpy(&results[stats_type][profile_start], stats_data.data(), stats_data.size() * sizeof(double));
                 }
-                StokesSource stokes_source(stokes_index, partial_z_range);
-                pkt_queue.push({StokesRegion(stokes_source, image_region), prod_profile_start, prod_count});
-
-                prod_start_z       += prod_count;
-                prod_profile_start += prod_count;
+                memcpy(&cache_results[stats_type][profile_start], stats_data.data(), stats_data.size() * sizeof(double));
             }
-            pkt_queue.close();
-        });
 
-        // N_CONSUMERS consumer threads.
-        // GetRegionSubImage (no lock) can overlap across consumers; CalcStatsValues
-        // serialises on _image_mutex inside GetRegionStats.
-        std::vector<std::thread> consumer_threads;
-        consumer_threads.reserve(N_CONSUMERS);
-        for (size_t ci = 0; ci < N_CONSUMERS; ++ci) {
-            consumer_threads.emplace_back([&]() {
-                InFlightRead item;
-                while (pkt_queue.pop(item)) {
-                    if (!RegionFileIdsValid(region_id, file_id) ||
-                        region->GetRegionState() != initial_region_state ||
-                        (use_current_stokes && stokes_index != _frames.at(file_id)->CurrentStokes()) ||
-                        !HasSpectralRequirements(region_id, file_id, coordinate, required_stats)) {
-                        cancelled.store(true);
-                        pkt_queue.close();
-                        break;
-                    }
+            start_z       += count;
+            profile_start += count;
+            progress = (float)profile_start / profile_size;
 
-                    ProfilesMap partial_profiles;
-                    if (!frame->GetRegionStats(item.stokes_region, _spectral_stats, true, partial_profiles)) {
-                        ok.store(false);
-                        pkt_queue.close();
-                        break;
-                    }
+            // Cancellation checks
+            if (!RegionFileIdsValid(region_id, file_id)) return false;
+            if (region->GetRegionState() != initial_region_state) return false;
+            if (use_current_stokes && (stokes_index != _frames.at(file_id)->CurrentStokes())) return false;
+            if (!HasSpectralRequirements(region_id, file_id, coordinate, required_stats)) return false;
 
-                    // Writes are to non-overlapping profile_start positions.
-                    // Use write_mutex for strict thread-safety of the map lookups.
-                    std::lock_guard<std::mutex> wlk(write_mutex);
-                    for (const auto& profile : partial_profiles) {
-                        auto stats_type = profile.first;
-                        const std::vector<double>& stats_data = profile.second;
-                        if (results.count(stats_type)) {
-                            memcpy(&results[stats_type][item.profile_start], stats_data.data(),
-                                   stats_data.size() * sizeof(double));
-                        }
-                        memcpy(&cache_results[stats_type][item.profile_start], stats_data.data(),
-                               stats_data.size() * sizeof(double));
-                    }
+            // Send incremental partial results
+            auto t_now = std::chrono::high_resolution_clock::now();
+            auto dt_partial = std::chrono::duration<double, std::milli>(t_now - t_partial_profile_start).count();
+            if (dt_partial > TARGET_PARTIAL_REGION_TIME || progress >= 1.0) {
+                t_partial_profile_start = t_now;
+                partial_results_callback(results, progress);
+                if (progress >= 1.0) {
+                    _spectral_cache[cache_id] = SpectralCache(cache_results);
                 }
-            });
+            }
         }
-
-        producer_thread.join();
-        for (auto& t : consumer_threads) t.join();
-
-        if (cancelled.load()) return false;
-        if (!ok.load())        return false;
-
-        progress = 1.0;
-        partial_results_callback(results, progress);
-        _spectral_cache[cache_id] = SpectralCache(cache_results);
     }
 
     spdlog::performance("Fill spectral profile in {:.3f} ms", t.Elapsed().ms());
