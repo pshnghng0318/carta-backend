@@ -284,8 +284,13 @@ namespace fs = std::filesystem;
 namespace {
 bool HasZarrMetadataFile(const fs::path& dir_path) {
     std::error_code err_code;
-    return fs::exists(dir_path / ".zattr", err_code) || fs::exists(dir_path / ".zgroup", err_code) ||
-           fs::exists(dir_path / ".zmetadata", err_code);
+    // Zarr v2 metadata files
+    if (fs::exists(dir_path / ".zattr", err_code) || fs::exists(dir_path / ".zgroup", err_code) ||
+        fs::exists(dir_path / ".zmetadata", err_code)) {
+        return true;
+    }
+    // Zarr v3 metadata file
+    return fs::exists(dir_path / "zarr.json", err_code);
 }
 } // namespace
 

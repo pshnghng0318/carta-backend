@@ -221,7 +221,7 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
         }
     }
 
-    // 3. Direction Information (.zattrs)
+    // 3. Direction Information (zarr v2: root .zattrs/direction; zarr v3: root zarr.json/attributes/coordinate_system_info)
     {
         nlohmann::json zattrs;
         bool zattrs_valid = false;
@@ -234,7 +234,8 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
 
         if (zattrs_valid) {
             const auto* direction = get_ptr(zattrs, "/direction");
-            if (direction && direction->is_object()) {
+            const auto* csi = get_ptr(zattrs, "/coordinate_system_info");
+            if ((direction && direction->is_object()) || (csi && csi->is_object())) {
                 // Shared state for CTYPE/RADESYS
                 std::string ctype1_prefix = "RA";
                 std::string ctype2_prefix = "DEC";
@@ -242,6 +243,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 // CRVAL
                 safe_exec([&]() {
                     const auto* ref_data = get_ptr(zattrs, "/direction/reference/data");
+                    if (!ref_data) {
+                        ref_data = get_ptr(zattrs, "/coordinate_system_info/reference_direction/data");
+                    }
                     if (ref_data && ref_data->is_array() && ref_data->size() >= 2) {
                         add_double_header("CRVAL1", (*ref_data)[0].get<double>() * kRadToDeg);
                         add_double_header("CRVAL2", (*ref_data)[1].get<double>() * kRadToDeg);
@@ -251,6 +255,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 // RADESYS & Prefix
                 safe_exec([&]() {
                     const auto* frame = get_ptr(zattrs, "/direction/reference/attrs/frame");
+                    if (!frame) {
+                        frame = get_ptr(zattrs, "/coordinate_system_info/reference_direction/attrs/frame");
+                    }
                     if (frame && frame->is_string()) {
                         std::string frame_str = frame->get<std::string>();
                         to_upper_ascii(frame_str);
@@ -272,6 +279,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 // EQUINOX
                 safe_exec([&]() {
                     const auto* equinox = get_ptr(zattrs, "/direction/reference/attrs/equinox");
+                    if (!equinox) {
+                        equinox = get_ptr(zattrs, "/coordinate_system_info/reference_direction/attrs/equinox");
+                    }
                     if (equinox) {
                         if (equinox->is_number()) {
                             add_double_header("EQUINOX", equinox->get<double>());
@@ -297,6 +307,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 safe_exec([&]() {
                     std::string projection_str;
                     const auto* projection = get_ptr(zattrs, "/direction/projection");
+                    if (!projection) {
+                        projection = get_ptr(zattrs, "/coordinate_system_info/projection");
+                    }
                     if (projection && projection->is_string()) {
                         projection_str = projection->get<std::string>();
                     }
@@ -307,10 +320,16 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 // LATPOLE/LONPOLE
                 safe_exec([&]() {
                     const auto* lat_data = get_ptr(zattrs, "/direction/latpole/data");
+                    if (!lat_data) {
+                        lat_data = get_ptr(zattrs, "/coordinate_system_info/native_pole_direction/data/1");
+                    }
                     if (lat_data && lat_data->is_number()) {
                         add_double_header("LATPOLE", lat_data->get<double>() * kRadToDeg);
                     }
                     const auto* lon_data = get_ptr(zattrs, "/direction/lonpole/data");
+                    if (!lon_data) {
+                        lon_data = get_ptr(zattrs, "/coordinate_system_info/native_pole_direction/data/0");
+                    }
                     if (lon_data && lon_data->is_number()) {
                         add_double_header("LONPOLE", lon_data->get<double>() * kRadToDeg);
                     }
@@ -321,6 +340,9 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 // PC Matrix
                 safe_exec([&]() {
                     const auto* pc_val = get_ptr(zattrs, "/direction/pc/_value");
+                    if (!pc_val) {
+                        pc_val = get_ptr(zattrs, "/coordinate_system_info/pixel_coordinate_transformation_matrix");
+                    }
                     if (pc_val && pc_val->is_array() && pc_val->size() >= 2 && (*pc_val)[0].is_array() && (*pc_val)[0].size() >= 2) {
                         add_double_header("PC1_1", (*pc_val)[0][0].get<double>());
                         add_double_header("PC1_2", (*pc_val)[0][1].get<double>());
@@ -463,9 +485,12 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                 }
             }, "BUNIT");
 
-            // BTYPE
+            // BTYPE: zarr v2 uses image_type, zarr v3 uses type
             safe_exec([&]() {
                 const auto* image_type = get_ptr(zattrs_sky, "/image_type");
+                if (!image_type) {
+                    image_type = get_ptr(zattrs_sky, "/type");
+                }
                 if (image_type && image_type->is_string()) {
                     add_string_header("BTYPE", image_type->get<std::string>());
                 }
@@ -511,7 +536,13 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
                     add_string_header("TELESCOP", telescope_name->get<std::string>());
                 }
                 const auto* telescope_dir = get_ptr(zattrs_sky, "/telescope/direction/data/_value");
+                if (!telescope_dir) {
+                    telescope_dir = get_ptr(zattrs_sky, "/telescope/direction/data");
+                }
                 const auto* telescope_dist = get_ptr(zattrs_sky, "/telescope/distance/data/_value");
+                if (!telescope_dist) {
+                    telescope_dist = get_ptr(zattrs_sky, "/telescope/distance/data");
+                }
                 if (telescope_dir && telescope_dist && telescope_dir->is_array() && telescope_dir->size() >= 2 && telescope_dist->is_array() &&
                     !telescope_dist->empty()) {
                     double lon = (*telescope_dir)[0].get<double>();
@@ -549,7 +580,8 @@ Vector<String> CartaZarrImage::FitsHeaderStrings() {
 
     // 8. Beam Parameters
     safe_exec([&]() {
-        std::vector<double> beam_data = _reader->ReadFlattenedVector("BEAM");
+        const std::string beam_array_name = _reader->IsZarr3() ? "BEAM_FIT_PARAMS_SKY" : "BEAM";
+        std::vector<double> beam_data = _reader->ReadFlattenedVector(beam_array_name);
         if (beam_data.size() >= 3) {
             static constexpr size_t kBeamParamCount = 3;
             static constexpr double kBeamCompareEpsilon = 1e-12;
@@ -797,8 +829,9 @@ void CartaZarrImage::SetBeams() {
         info.setRestoringBeam(_beam);
         setImageInfo(info);
     } else {
-        spdlog::debug("CZI::SetBeams - Setting multiple beams from Zarr BEAM array");
-        std::vector<double> beam_data = _reader->ReadFlattenedVector("BEAM");
+        const std::string beam_array_name = _reader->IsZarr3() ? "BEAM_FIT_PARAMS_SKY" : "BEAM";
+        spdlog::debug("CZI::SetBeams - Setting multiple beams from Zarr {} array", beam_array_name);
+        std::vector<double> beam_data = _reader->ReadFlattenedVector(beam_array_name);
         if (beam_data.size() < 3) {
             return;
         }

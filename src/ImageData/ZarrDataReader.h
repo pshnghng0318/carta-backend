@@ -133,6 +133,7 @@ public:
 
     // Accessors
     bool IsInitialized() const;
+    bool IsZarr3() const;
     const casacore::IPosition& GetShape() const;
     const casacore::IPosition& GetOriginalZarrShape() const;
     const casacore::IPosition& GetChunkShape() const;
@@ -149,6 +150,7 @@ private:
     casacore::IPosition _chunk_shape;
     std::string _filename;
     bool _initialized = false;
+    bool _is_zarr3 = false;
 
     mutable std::mutex _read_mutex;
 

@@ -140,25 +140,45 @@ struct ZarrDataReader::Impl {
     // Early dimension validation before creating expensive TensorStore context
     // Returns: 0 = success/skip, -1 = failed (wrong dimension)
     static int ValidateEarlyDimension(const std::string& array_path) {
+        // Try zarr v2 .zarray first
         std::filesystem::path zarray_path = std::filesystem::path(array_path) / ".zarray";
-        if (!std::filesystem::exists(zarray_path)) {
-            return 0; // Skip check if file doesn't exist
-        }
-        try {
-            std::ifstream zarray_file(zarray_path);
-            nlohmann::json zarray;
-            zarray_file >> zarray;
-            if (zarray.contains("shape")) {
-                size_t ndim = zarray["shape"].size();
-                if (ndim != kDimSize5D) {
-                    spdlog::error("XRADIO schema requires 5D array, got {}D (early check)", ndim);
-                    return -1;
+        if (std::filesystem::exists(zarray_path)) {
+            try {
+                std::ifstream zarray_file(zarray_path);
+                nlohmann::json zarray;
+                zarray_file >> zarray;
+                if (zarray.contains("shape")) {
+                    size_t ndim = zarray["shape"].size();
+                    if (ndim != kDimSize5D) {
+                        spdlog::error("XRADIO schema requires 5D array, got {}D (early check, zarr v2)", ndim);
+                        return -1;
+                    }
                 }
+            } catch (const std::exception& ex) {
+                spdlog::debug("Early dimension check (zarr v2) skipped: {}", ex.what());
             }
-        } catch (const std::exception& ex) {
-            spdlog::debug("Early dimension check skipped: {}", ex.what());
+            return 0;
         }
-        return 0;
+        // Try zarr v3 zarr.json
+        std::filesystem::path zarr_json_path = std::filesystem::path(array_path) / "zarr.json";
+        if (std::filesystem::exists(zarr_json_path)) {
+            try {
+                std::ifstream zarr_json_file(zarr_json_path);
+                nlohmann::json zarr_json;
+                zarr_json_file >> zarr_json;
+                if (zarr_json.contains("shape")) {
+                    size_t ndim = zarr_json["shape"].size();
+                    if (ndim != kDimSize5D) {
+                        spdlog::error("XRADIO schema requires 5D array, got {}D (early check, zarr v3)", ndim);
+                        return -1;
+                    }
+                }
+            } catch (const std::exception& ex) {
+                spdlog::debug("Early dimension check (zarr v3) skipped: {}", ex.what());
+            }
+            return 0;
+        }
+        return 0; // Skip check if no metadata file found
     }
 
     // Load .zmetadata file if present
@@ -251,6 +271,9 @@ ZarrDataReader::~ZarrDataReader() = default;
 bool ZarrDataReader::IsInitialized() const {
     return _initialized;
 }
+bool ZarrDataReader::IsZarr3() const {
+    return _is_zarr3;
+}
 const casacore::IPosition& ZarrDataReader::GetShape() const {
     return _shape;
 }
@@ -273,17 +296,19 @@ std::string ZarrDataReader::FindArrayPath() const {
     std::vector<std::string> common_array_names = {"SKY", "APERTURE"};
     for (const auto& array_name : common_array_names) {
         auto potential_path = base_path / array_name;
-        if (std::filesystem::exists(potential_path / ".zarray")) {
+        if (std::filesystem::exists(potential_path / ".zarray") ||
+            std::filesystem::exists(potential_path / "zarr.json")) {
             spdlog::debug("Found Zarr array in subdirectory: {}", potential_path.string());
             return potential_path.string();
         }
     }
 
-    if (std::filesystem::exists(base_path / ".zarray")) {
+    if (std::filesystem::exists(base_path / ".zarray") ||
+        std::filesystem::exists(base_path / "zarr.json")) {
         return _filename;
     }
 
-    spdlog::error("No .zarray file found in {} or its subdirectories", _filename);
+    spdlog::error("No .zarray or zarr.json file found in {} or its subdirectories", _filename);
     return "";
 }
 
@@ -306,7 +331,13 @@ bool ZarrDataReader::Initialize() {
         // Try to read .zmetadata
         _impl->LoadZmetadata(_filename);
 
-        nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", array_path}}}};
+        // Auto-detect zarr version: zarr v3 uses zarr.json, zarr v2 uses .zarray
+        bool is_zarr3 = std::filesystem::exists(std::filesystem::path(array_path) / "zarr.json");
+        _is_zarr3 = is_zarr3;
+        std::string zarr_driver = is_zarr3 ? "zarr3" : "zarr";
+        spdlog::info("ZDR:: Using TensorStore driver: {} for {}", zarr_driver, array_path);
+
+        nlohmann::json spec_json = {{"driver", zarr_driver}, {"kvstore", {{"driver", "file"}, {"path", array_path}}}};
 
         auto spec_result = tensorstore::Spec::FromJson(spec_json);
         if (!spec_result.ok()) {
@@ -654,8 +685,10 @@ std::vector<double> ZarrDataReader::ReadVector(const std::string& array_name) {
         std::filesystem::path base_path(_filename);
         std::filesystem::path target_path = base_path / array_name;
 
-        // Open the array using TensorStore
-        nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", target_path.string()}}}};
+        // Auto-detect driver per array path
+        bool is_zarr3_arr = std::filesystem::exists(target_path / "zarr.json");
+        std::string driver = is_zarr3_arr ? "zarr3" : "zarr";
+        nlohmann::json spec_json = {{"driver", driver}, {"kvstore", {{"driver", "file"}, {"path", target_path.string()}}}};
 
         // Reuse main context to share cache and reduce memory allocations
         auto spec_result = tensorstore::Spec::FromJson(spec_json);
@@ -718,7 +751,9 @@ std::vector<std::string> ZarrDataReader::ReadStringVector(const std::string& arr
         std::filesystem::path base_path(_filename);
         std::filesystem::path target_path = base_path / array_name;
 
-        nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", target_path.string()}}}};
+        bool is_zarr3_arr = std::filesystem::exists(target_path / "zarr.json");
+        std::string driver = is_zarr3_arr ? "zarr3" : "zarr";
+        nlohmann::json spec_json = {{"driver", driver}, {"kvstore", {{"driver", "file"}, {"path", target_path.string()}}}};
 
         auto spec_result = tensorstore::Spec::FromJson(spec_json);
         if (!spec_result.ok()) {
@@ -784,8 +819,10 @@ std::vector<double> ZarrDataReader::ReadFlattenedVector(const std::string& array
         std::filesystem::path base_path(_filename);
         std::filesystem::path target_path = base_path / array_name;
 
-        // Open the array using TensorStore
-        nlohmann::json spec_json = {{"driver", "zarr"}, {"kvstore", {{"driver", "file"}, {"path", target_path.string()}}}};
+        // Open the array using TensorStore — auto-detect driver
+        bool is_zarr3_arr = std::filesystem::exists(target_path / "zarr.json");
+        std::string driver = is_zarr3_arr ? "zarr3" : "zarr";
+        nlohmann::json spec_json = {{"driver", driver}, {"kvstore", {{"driver", "file"}, {"path", target_path.string()}}}};
 
         // Reuse main context to share cache and reduce memory allocations
         auto spec_result = tensorstore::Spec::FromJson(spec_json);
@@ -849,29 +886,19 @@ std::string ZarrDataReader::GetAttributeString(const std::string& array_name, co
         return "";
     }
 
-    // Read .zattrs for the array
-    std::filesystem::path base_path(_filename);
-    std::filesystem::path attrs_path = base_path / array_name / ".zattrs";
-
-    if (!std::filesystem::exists(attrs_path)) {
-        return "";
-    }
-
+    // GetZattrsString already handles both zarr v2 (.zattrs) and zarr v3 (zarr.json attributes)
     try {
-        std::ifstream fstr(attrs_path);
-        nlohmann::json json_obj;
-        fstr >> json_obj;
-
+        std::string json_str = GetZattrsString(array_name);
+        nlohmann::json json_obj = nlohmann::json::parse(json_str);
         if (json_obj.contains(attr_name)) {
             if (json_obj[attr_name].is_string()) {
                 return json_obj[attr_name].get<std::string>();
             }
             if (json_obj[attr_name].is_array() && !json_obj[attr_name].empty() && json_obj[attr_name][0].is_string()) {
-                return json_obj[attr_name][0].get<std::string>(); // e.g. units: ["rad"]
+                return json_obj[attr_name][0].get<std::string>();
             }
         }
-    } catch (...) {
-    }
+    } catch (...) {}
 
     return "";
 }
@@ -892,7 +919,7 @@ std::string ZarrDataReader::GetZattrsString(const std::string& array_name) {
         base_path /= array_name;
     }
 
-    // Check for .zattrs in the resolved path
+    // Zarr v2: read .zattrs
     std::filesystem::path zattrs_path = base_path / ".zattrs";
     if (std::filesystem::exists(zattrs_path)) {
         std::ifstream file(zattrs_path);
@@ -900,6 +927,60 @@ std::string ZarrDataReader::GetZattrsString(const std::string& array_name) {
         buffer << file.rdbuf();
         return buffer.str();
     }
+
+    // Zarr v3: read zarr.json and extract "attributes" field.
+    // For the root store (array_name empty), check root zarr.json first,
+    // then fall back to consolidated_metadata if available.
+    std::filesystem::path zarr_json_path = base_path / "zarr.json";
+    if (std::filesystem::exists(zarr_json_path)) {
+        try {
+            std::ifstream file(zarr_json_path);
+            nlohmann::json zarr_json;
+            file >> zarr_json;
+
+            // Array-level: attributes are embedded directly
+            if (zarr_json.contains("attributes") && zarr_json["attributes"].is_object()) {
+                return zarr_json["attributes"].dump();
+            }
+
+            // Root store level: look inside consolidated_metadata for the array
+            if (!array_name.empty() && zarr_json.contains("consolidated_metadata")) {
+                const auto& cm = zarr_json["consolidated_metadata"];
+                if (cm.contains("metadata") && cm["metadata"].contains(array_name)) {
+                    const auto& arr_meta = cm["metadata"][array_name];
+                    if (arr_meta.contains("attributes") && arr_meta["attributes"].is_object()) {
+                        return arr_meta["attributes"].dump();
+                    }
+                }
+            }
+
+            return "{}";
+        } catch (...) {
+            return "{}";
+        }
+    }
+
+    // Zarr v3 root store: root zarr.json may be at _filename level (not base_path)
+    if (!array_name.empty()) {
+        std::filesystem::path root_zarr_json = std::filesystem::path(_filename) / "zarr.json";
+        if (std::filesystem::exists(root_zarr_json)) {
+            try {
+                std::ifstream file(root_zarr_json);
+                nlohmann::json zarr_json;
+                file >> zarr_json;
+                if (zarr_json.contains("consolidated_metadata")) {
+                    const auto& cm = zarr_json["consolidated_metadata"];
+                    if (cm.contains("metadata") && cm["metadata"].contains(array_name)) {
+                        const auto& arr_meta = cm["metadata"][array_name];
+                        if (arr_meta.contains("attributes") && arr_meta["attributes"].is_object()) {
+                            return arr_meta["attributes"].dump();
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
     return "{}";
 }
 
@@ -919,15 +1000,86 @@ std::string ZarrDataReader::GetZarrayString(const std::string& array_name) {
         base_path /= array_name;
     }
 
+    // Zarr v2: read .zarray
     std::filesystem::path zarray_path = base_path / ".zarray";
-    if (!std::filesystem::exists(zarray_path)) {
-        return "{}";
+    if (std::filesystem::exists(zarray_path)) {
+        std::ifstream file(zarray_path);
+        std::stringstream buffer;
+        buffer << file.rdbuf();
+        return buffer.str();
     }
 
-    std::ifstream file(zarray_path);
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    return buffer.str();
+    // Zarr v3: read zarr.json and synthesize zarr v2-compatible JSON for callers.
+    // Try array-level zarr.json first, then consolidated_metadata in root zarr.json.
+    auto normalize_zarr3_to_v2 = [](const nlohmann::json& z3) -> std::string {
+        nlohmann::json z2 = nlohmann::json::object();
+        if (z3.contains("shape")) z2["shape"] = z3["shape"];
+        if (z3.contains("data_type") && z3["data_type"].is_string()) {
+            std::string dt = z3["data_type"].get<std::string>();
+            if (dt == "float32") z2["dtype"] = "<f4";
+            else if (dt == "float64") z2["dtype"] = "<f8";
+            else z2["dtype"] = dt;
+        }
+        try {
+            z2["chunks"] = z3.at("chunk_grid").at("configuration").at("chunk_shape");
+        } catch (...) {}
+        if (z3.contains("codecs") && z3["codecs"].is_array()) {
+            for (const auto& codec : z3["codecs"]) {
+                if (codec.contains("name") && codec["name"] == "blosc") {
+                    nlohmann::json comp = {{"id", "blosc"}};
+                    if (codec.contains("configuration")) {
+                        const auto& cfg = codec["configuration"];
+                        if (cfg.contains("cname")) comp["cname"] = cfg["cname"];
+                        if (cfg.contains("clevel")) comp["clevel"] = cfg["clevel"];
+                        if (cfg.contains("blocksize")) comp["blocksize"] = cfg["blocksize"];
+                    }
+                    z2["compressor"] = comp;
+                    break;
+                }
+                if (codec.contains("name") && codec["name"] == "zstd") {
+                    nlohmann::json comp = {{"id", "blosc"}, {"cname", "zstd"}};
+                    if (codec.contains("configuration") && codec["configuration"].contains("level")) {
+                        comp["clevel"] = codec["configuration"]["level"];
+                    }
+                    z2["compressor"] = comp;
+                    break;
+                }
+            }
+        }
+        z2["zarr_format"] = 3;
+        return z2.dump();
+    };
+
+    std::filesystem::path zarr_json_path = base_path / "zarr.json";
+    if (std::filesystem::exists(zarr_json_path)) {
+        try {
+            std::ifstream file(zarr_json_path);
+            nlohmann::json zarr_json;
+            file >> zarr_json;
+            if (zarr_json.contains("shape")) {
+                return normalize_zarr3_to_v2(zarr_json);
+            }
+        } catch (...) {}
+    }
+
+    if (!array_name.empty()) {
+        std::filesystem::path root_zarr_json = std::filesystem::path(_filename) / "zarr.json";
+        if (std::filesystem::exists(root_zarr_json)) {
+            try {
+                std::ifstream file(root_zarr_json);
+                nlohmann::json zarr_json;
+                file >> zarr_json;
+                if (zarr_json.contains("consolidated_metadata")) {
+                    const auto& cm = zarr_json["consolidated_metadata"];
+                    if (cm.contains("metadata") && cm["metadata"].contains(array_name)) {
+                        return normalize_zarr3_to_v2(cm["metadata"][array_name]);
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+
+    return "{}";
 }
 
 std::map<std::string, std::string> ZarrDataReader::GetZattrMap(const std::string& array_name) {
